@@ -466,5 +466,79 @@ class TransientRetryTests(unittest.TestCase):
         self.assertNotIn(' · ', line)
 
 
+@unittest.skipUnless(PRESENT, 'Engine is not implemented')
+class RepeatedFailureTests(unittest.TestCase):
+    """2026-10-04 现场：Clash 全局模式把学校流量送到境外，TLS 握手连续 58 次被切断。
+
+    一晚 58 行一模一样的记录挤掉了有用历史，通知也只弹过第一条 —— 那次是用户自己
+    手动打卡才补上的。连续同类失败要折叠、计数，并在第 5 次把处置建议写进文案。
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = Store(Path(self.temp.name), protector=Mock(
+            protect=lambda b: b[::-1], unprotect=lambda b: b[::-1]))
+        self.store.save_settings(Settings(enabled=True, start='21:00', end='23:30',
+                                          interval=300, location_source='simulation'))
+        self.store.save_token('private-token')
+        self.now = dt.datetime(2026, 10, 4, 22, 0, tzinfo=SHANGHAI)
+        self.api = Mock()
+        self.api.user.side_effect = CheckinError(
+            'network_error', '与学校接口的 TLS 握手被切断（链路中间有设备没让它谈完），请稍后重试',
+            detail='TLS 握手被切断 5.3s／直连')
+        self.api.today.return_value = None
+        self.engine = Engine(self.store, self.api, Mock(return_value={}),
+                             clock=lambda: self.now)
+
+    def failing_runs(self, times):
+        results = []
+        for _ in range(times):
+            results.append(self.engine.run(automatic=True, submit=True))
+        return results
+
+    def test_repeats_collapse_into_one_line_with_a_counter(self):
+        self.failing_runs(4)
+        lines = [line for line in self.store.history().splitlines() if 'network_error' in line]
+        self.assertEqual(len(lines), 1, f'应折叠成一行，实际 {len(lines)} 行')
+        self.assertIn('连续第 4 次', lines[0])
+        self.assertIn('TLS 握手被切断 5.3s／直连', lines[0])
+
+    def test_the_escalated_text_is_its_own_line_and_then_also_collapses(self):
+        self.failing_runs(7)
+        lines = [line for line in self.store.history().splitlines() if 'network_error' in line]
+        self.assertEqual(len(lines), 2, f'升级前后各一行，实际 {len(lines)} 行')
+        self.assertNotIn('规则', lines[0])
+        self.assertIn('「规则」模式', lines[1])
+        self.assertIn('连续第 7 次', lines[1])
+
+    def test_a_streak_that_changes_gets_its_own_line(self):
+        self.failing_runs(2)
+        self.api.user.side_effect = CheckinError(
+            'network_error', '学校接口响应超时（20 秒未回应），请稍后重试', detail='响应超时 20.0s／直连')
+        self.failing_runs(1)
+        lines = [line for line in self.store.history().splitlines() if 'network_error' in line]
+        self.assertEqual(len(lines), 2)
+
+    def test_the_fifth_failure_adds_the_thing_to_actually_check(self):
+        results = self.failing_runs(5)
+        self.assertNotIn('连续失败', results[0].message)
+        self.assertIn('已连续多次失败', results[4].message)
+        self.assertIn('「规则」模式', results[4].message)
+        self.assertIn('连续第 5 次', results[4].detail)
+        # 第 6 次仍然是升级后的文案（通知去重键才不会再变来变去）
+        self.assertIn('「规则」模式', self.failing_runs(1)[0].message)
+
+    def test_a_success_clears_the_streak(self):
+        self.failing_runs(4)
+        self.api.user.side_effect = None
+        self.api.user.return_value = 'student'
+        signed = self.engine.run(automatic=True, submit=True)
+        self.assertNotEqual(signed.state, 'network_error')
+        self.assertEqual(self.engine.transient_streak, 0)
+        self.api.user.side_effect = CheckinError('network_error', '无法连接学校接口，请检查网络后重试')
+        self.assertNotIn('连续失败', self.failing_runs(1)[0].message)
+
+
 if __name__ == '__main__':
     unittest.main()

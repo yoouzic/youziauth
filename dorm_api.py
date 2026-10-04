@@ -91,6 +91,10 @@ def failure_kind(exc: BaseException) -> str:
                            http.client.RemoteDisconnected, http.client.BadStatusLine,
                            http.client.IncompleteRead)):
         return '连接被中断'
+    if isinstance(reason, ssl.SSLEOFError):
+        # 2026-10-04 实测：TLS 握手被对端/中间设备在完成前切断（学校流量被代理送到
+        # 境外节点时就是这个签名：连得上、握手谈不完、每次约 5 秒）。
+        return 'TLS 握手被切断'
     if isinstance(reason, ssl.SSLError):
         return 'TLS 握手失败'
     # Windows 的 WSA 错误码不走 errno 子类，只能查表（实测 Clash/校园网都会给这些）。
@@ -108,6 +112,7 @@ def transport_message(kind: str) -> str:
         '域名解析失败': '无法解析学校接口域名，请检查网络或代理后重试',
         '连接被拒绝': '学校接口拒绝连接，请稍后重试',
         '连接被中断': '与学校接口的连接被中断，请稍后重试',
+        'TLS 握手被切断': '与学校接口的 TLS 握手被切断（链路中间有设备没让它谈完），请稍后重试',
         'TLS 握手失败': '与学校接口的加密连接失败，请稍后重试',
     }.get(kind, '无法连接学校接口，请检查网络后重试')
 

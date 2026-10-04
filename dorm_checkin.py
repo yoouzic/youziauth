@@ -32,6 +32,20 @@ SUBMIT_EXHAUSTED_MESSAGE = (f'提交未生效，自动重试已达 {SUBMIT_MAX_A
 # 之后白等了 4.5 分钟才重试成功（interval=300，而冷却 21:06:30 就允许了）。
 # 只对瞬时失败生效：login_required / location_required 要等人，不能靠加密节奏解决。
 TRANSIENT_RETRY_SECONDS = SUBMIT_COOLDOWN_SECONDS + 10
+# 连续同类瞬时失败到第几次时，把「该去动什么」写进文案并再提醒一次。
+#
+# 2026-10-04 实测：Clash 处于「全局」模式时学校流量被送到境外节点，TLS 握手连续 58 次
+# 被切断（21:04–22:30 整晚），界面与通知只有一句「与学校接口的加密连接失败」，
+# 人无从判断要去改代理 —— 当晚是用户自己手动打卡才补上的。
+TRANSIENT_ESCALATE_AT = 5
+# 文案里**不带次数**：次数已经写在 detail 的「连续第 N 次」里，而文案必须稳定 ——
+# 它既决定 history.log 的折叠（同一段连续失败只占一行），也参与通知去重键。
+TRANSIENT_ESCALATE_HINT = ('已连续多次失败；若本机开着代理（Clash 等），请确认它处于'
+                           '「规则」模式而不是「全局」模式 —— 全局模式会把学校流量送到境外节点，'
+                           '被学校入口直接切断')
+# 连续失败在 history.log 里折叠成一行（次数写在 detail 的「连续第 N 次」里），
+# 免得一晚几十条一模一样的记录把有用的历史挤掉。
+STREAK_MARK = '／连续第 '
 
 
 def now() -> dt.datetime:
@@ -52,6 +66,20 @@ def parse_time(value: str) -> dt.time:
     if not isinstance(value, str) or not re.fullmatch(r'\d{2}:\d{2}', value):
         raise ValueError('时间请填写 HH:MM，例如 21:00')
     return dt.time.fromisoformat(value)
+
+
+def _failure_core(line: str) -> str:
+    """把一条历史折叠成可比对的部分：去掉时间戳与「连续第 N 次」计数。"""
+    body = line.split(' ', 1)[-1] if ' ' in line else line
+    index = body.rfind(STREAK_MARK)
+    if index == -1:
+        index = body.rfind(' · 连续第 ')
+    return body[:index] if index != -1 else body
+
+
+def _same_failure(previous: str, current: str) -> bool:
+    """两条记录是否属于同一次「连续失败」（只有时间戳和次数不同）。"""
+    return _failure_core(previous) == _failure_core(current)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -304,7 +332,11 @@ class Store:
         detail = getattr(result, 'detail', '')
         if detail:
             line += f' · {detail}'
-        old.append(line)
+        if old and _same_failure(old[-1], line):
+            # 同一类失败连续发生：折叠成一行，次数由 detail 的「连续第 N 次」递增。
+            old[-1] = line
+        else:
+            old.append(line)
         atomic_write_bytes(self.root / 'history.log', ('\n'.join(old) + '\n').encode('utf-8'))
 
     def history(self):
@@ -356,6 +388,9 @@ class Engine:
         self.lock = threading.Lock()
         self.cancel = threading.Event()
         self.next_tick = 0.0
+        # 连续同类瞬时失败：计数进诊断，第 TRANSIENT_ESCALATE_AT 次把处置建议写进文案。
+        self.transient_streak = 0
+        self._transient_key = ''
 
     def tick(self):
         if time.monotonic() < self.next_tick:
@@ -528,6 +563,7 @@ class Engine:
                             detail=detail, retry_soon=True)
 
     def _result(self, state, message, task=None, detail='', retry_soon=False):
+        message, detail = self._track_transient(state, message, detail)
         result = Result(state, message, task, self.clock().isoformat(timespec='seconds'),
                         detail, retry_soon)
         if state == 'signed':
@@ -538,6 +574,27 @@ class Engine:
             if state != 'signed':
                 return Result('error', '无法写入打卡状态，请检查本地目录权限', task)
         return result
+
+    def _track_transient(self, state, message, detail):
+        """连续同类瞬时失败：计数进诊断，到第 TRANSIENT_ESCALATE_AT 次升级文案。
+
+        升级只发生一次，而且只改文案（状态名不变）—— 这样界面的状态词表和按钮白名单
+        都不用动，而通知去重是按 (日期, 任务, 状态, 文案) 做的，所以它会**再弹一次**，
+        并且这次带着"该去改什么"的建议。只有网络类失败计数：等人的状态不适用。
+        """
+        if state != 'network_error':
+            self.transient_streak = 0
+            self._transient_key = ''
+            return message, detail
+        if message != self._transient_key:
+            self.transient_streak = 0
+            self._transient_key = message
+        self.transient_streak += 1
+        note = f'连续第 {self.transient_streak} 次'
+        detail = f'{detail}{STREAK_MARK}{note}' if detail else note
+        if self.transient_streak >= TRANSIENT_ESCALATE_AT and TRANSIENT_ESCALATE_HINT not in message:
+            message = f'{message}（{TRANSIENT_ESCALATE_HINT}）'
+        return message, detail
 
     def _mark_signed(self, task):
         """记下「今天已完成」，供当天后续的自动检查免重复判定。

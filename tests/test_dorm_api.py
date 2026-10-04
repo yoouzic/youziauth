@@ -2,9 +2,11 @@ import datetime as dt
 import importlib.util
 import json
 import os
+import ssl
 import threading
 import time
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -201,6 +203,24 @@ class FailureReportTests(unittest.TestCase):
 
     def test_a_working_answer_carries_no_diagnostic(self):
         self.assertEqual(self.call(), {'ok': True})
+
+
+@unittest.skipUnless(PRESENT, 'API adapter missing')
+class TlsFailureClassTests(unittest.TestCase):
+    """2026-10-04 现场：TLS 握手被对端/中间设备在完成前切断（SSLEOFError，每次约 5 秒）。"""
+
+    def test_a_cut_handshake_is_not_reported_as_a_plain_timeout(self):
+        exc = ssl.SSLEOFError(8, 'UNEXPECTED_EOF_WHILE_READING')
+        self.assertEqual(dorm_api.failure_kind(exc), 'TLS 握手被切断')
+        self.assertIn('TLS 握手被切断', dorm_api.transport_message('TLS 握手被切断'))
+
+    def test_the_same_classification_survives_being_wrapped_by_urllib(self):
+        wrapped = urllib.error.URLError(ssl.SSLEOFError(8, 'UNEXPECTED_EOF_WHILE_READING'))
+        self.assertEqual(dorm_api.failure_kind(wrapped), 'TLS 握手被切断')
+
+    def test_a_certificate_problem_stays_a_generic_tls_failure(self):
+        self.assertEqual(dorm_api.failure_kind(ssl.SSLCertVerificationError(1, 'bad cert')),
+                         'TLS 握手失败')
 
 
 @unittest.skipUnless(PRESENT, 'API adapter missing')

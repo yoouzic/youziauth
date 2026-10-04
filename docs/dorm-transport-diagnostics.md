@@ -73,3 +73,40 @@ node --test tests/test_desktop_ui.cjs
 
 现场只读诊断（不提交、不写任何状态）：`.scratch/route_probe.py`（看学校流量被判给哪条出站）、
 `.scratch/repro_transport_error.py`（对比"卡住"与"被重置"在界面上的差异）。
+
+## 2026-10-04 现场：代理「全局」模式杀掉了学校 TLS 握手（自动打卡整晚未完成）
+
+现象：21:04:13（开窗第一拍）到 22:30:41，**连续 58 次** `[network_error]`，每次都是
+`TLS 握手失败 5.3s／直连／本机系统代理 127.0.0.1:7897 已绕过／本轮已重试 2 次`；
+当晚最终是用户 22:32 自己手动打卡才补上（22:32:36 `signed`）。
+
+定位（全部只读）：
+
+| 证据 | 结果 |
+| --- | --- |
+| 直连 TLS 握手（`ssl.create_default_context`） | `SSLEOFError: UNEXPECTED_EOF_WHILE_READING`，5.23s（of.swu）/0.64s（idm.swu） |
+| 同一时刻 `www.baidu.com` | 正常（TLSv1.2，0.21s）→ 不是断网 |
+| Clash 生成的运行配置 `clash-verge.yaml`（21:53:53 订阅更新时重写） | **`mode: global`** |
+| Clash Verge 日志 | `[22:32:11] Switch Proxy Mode To: rule` |
+| 切模式前后同一分钟的探针 | 22:32:05–22:32:10 失败 → 22:32:12 起同一主机全部成功 |
+| 订阅配置本身 `profiles/REHaEEs67K9T.yaml` | `mode: rule`；合并模板 `mCF3il8OCVYp.yaml` 为空 → 全局模式来自 Verge 的运行状态 |
+
+结论：**Clash 处于「全局」模式时，学校流量（含本程序"直连"的请求 —— TUN 仍在接管出站）
+被送到境外节点，学校入口在 TLS 握手完成前直接切断**；切回「规则」模式后
+`DomainSuffix(cn) → DIRECT`，立刻恢复。程序侧无法自愈这种模式（用户态绕不过 TUN），
+所以这一轮的改善方向是"让人一眼看懂该去改什么"，外加日志卫生：
+
+| # | 改善 | 位置 |
+| --- | --- | --- |
+| 1 | `SSLEOFError` 单独归类为 `TLS 握手被切断`（对应文案：链路中间有设备没让它谈完），不再与证书错误混在一起 | `dorm_api.failure_kind` / `transport_message` |
+| 2 | 连续同类 `network_error` 计数进诊断（`连续第 N 次`）；到第 `TRANSIENT_ESCALATE_AT = 5` 次把处置建议写进文案：「若本机开着代理…请确认它处于「规则」模式而不是「全局」模式」 | `dorm_checkin.Engine._track_transient` |
+| 3 | 文案必须稳定（不带次数），否则每次都会当成"新消息" | 同上 |
+| 4 | 通知去重键加入文案：状态没变但文案升级时会**再弹一次**（原来一晚 58 次失败只弹过第一条） | `desktop_bridge._tick` |
+| 5 | 连续失败在 `history.log` 里折叠成一行、计数递增，不再用 58 行一模一样的记录挤掉有用历史 | `dorm_checkin.Store.record` / `_same_failure` |
+
+回归：`tests/test_dorm_checkin.py::RepeatedFailureTests`（折叠、换类别另起一行、第 5 次升级文案、
+成功后清零）、`tests/test_dorm_api.py::TlsFailureClassTests`（切断 vs 证书错误）。
+
+**给用户的处置建议**：把 Clash Verge 切回「规则」模式并保持（订阅更新不会把它改回 rule，
+但 Verge 会记住上次选择）；如果在全局模式下需要打卡，那就得先切回规则模式，
+或者接受当晚手动打卡。程序现在会在第 5 次失败时把这句话直接弹出来。

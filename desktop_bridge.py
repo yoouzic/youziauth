@@ -615,7 +615,11 @@ class DesktopBridge(LocationProbe):
     def _tick(self):
         self._dorm.poll()
         for result in self._dorm.drain():
-            notice = (result.at[:10], result.task.key if result.task else '', result.state)
+            # 文案也进去重键：状态没变但文案升级了（Engine._track_transient 在连续失败
+            # 第 5 次会把"该去改什么"写进去）时必须再提醒一次，否则一晚 58 次失败
+            # 只会弹第一条，人根本不知道要去动代理设置。
+            notice = (result.at[:10], result.task.key if result.task else '',
+                      result.state, result.message)
             if result.state in ('signed', 'login_required', 'location_required', 'uncertain', 'error', 'network_error') and notice != self._notice:
                 self._notice = notice
                 windows_notifications.show_toast(windows_notifications.build_dorm_toast(result.message))
