@@ -9,7 +9,7 @@
 提交前先确认文件来自已经通过签名审计的 Release。建议说明：
 
 ```text
-Repository: https://github.com/Cyzmmd/youziauth
+Repository: https://github.com/yoouzic/youziauth
 License: GPL-3.0-only
 Detection: Trojan:Win32/Wacatac.C!ml
 Product purpose: Windows campus-network authentication helper

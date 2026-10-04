@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = 'https://github.com/Cyzmmd/youziauth/releases/download/v1.5.0/'
+BASE = 'https://github.com/yoouzic/youziauth/releases/download/v1.5.0/'
 PACKAGE = b'fictional MSI bytes for offline tests'
 DIGEST = hashlib.sha256(PACKAGE).hexdigest()
 # Any 64-byte hex string: app_update only transports the signature, the Ed25519
@@ -20,7 +20,7 @@ SIGNATURE = 'ab' * 64
 
 
 def release(version='1.5.0'):
-    base = f'https://github.com/Cyzmmd/youziauth/releases/download/v{version}/'
+    base = f'https://github.com/yoouzic/youziauth/releases/download/v{version}/'
     return {'tag_name': 'v' + version, 'draft': False, 'prerelease': False,
             'assets': [{'name': 'youziauth.msi', 'browser_download_url': base + 'youziauth.msi',
                         'size': len(PACKAGE), 'state': 'uploaded'},
@@ -131,6 +131,23 @@ class UpdaterTests(unittest.TestCase):
             with self.subTest(key=key, value=value), patch('app_update.open_url', side_effect=self.open):
                 self.assertEqual(self.check()['state'], 'error')
                 self.assertEqual(len(self.requests), 1)
+
+    def test_a_renamed_github_account_does_not_break_installed_clients(self):
+        # 2026-10-04 实测：账号 Cyzmmd → yoouzic 之后，已装客户端内置的是旧名字，
+        # 而 API 返回的是新地址 —— 必须认 API 报告的仓库，否则所有人再也更新不了。
+        renamed = release()
+        renamed['html_url'] = 'https://github.com/yoouzic/youziauth/releases/tag/v1.5.0'
+        with patch.object(self.update, 'REPOSITORY', 'Cyzmmd/youziauth'):
+            assets = self.update.release_assets(renamed, '1.5.0')
+        self.assertEqual(set(assets), set(self.update.RELEASE_ASSETS))
+
+    def test_an_asset_from_another_repository_is_still_refused(self):
+        foreign = release()
+        foreign['html_url'] = 'https://github.com/yoouzic/youziauth/releases/tag/v1.5.0'
+        foreign['assets'][0] = dict(foreign['assets'][0],
+                                    browser_download_url=BASE.replace('yoouzic', 'attacker') + 'youziauth.msi')
+        with self.assertRaises(RuntimeError):
+            self.update.release_assets(foreign, '1.5.0')
 
     def test_duplicate_assets_and_checksums_are_rejected(self):
         self.data['assets'].append(self.data['assets'][0].copy())

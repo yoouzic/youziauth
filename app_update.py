@@ -14,7 +14,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from windows_update import install_msi, verify_msi
 
 
-REPOSITORY = 'Cyzmmd/youziauth'
+REPOSITORY = 'yoouzic/youziauth'
 LATEST_RELEASE_URL = f'https://api.github.com/repos/{REPOSITORY}/releases/latest'
 MAX_PACKAGE_BYTES = 1024 * 1024 * 1024
 # Every release must carry the installer plus both detached authenticators; a
@@ -72,17 +72,36 @@ def read_small(url, limit):
     return value
 
 
+def release_origin(data) -> str:
+    """发布附件所在仓库的 URL 前缀（校验附件来源用）。
+
+    以 API 自己报的 `html_url` 为准，而不是写死的 REPOSITORY：GitHub 账号改名
+    （2026-10-04 实测 `Cyzmmd` → `yoouzic`）之后 API 返回新地址，而**已安装的客户端
+    内置的是旧名字** —— 实测旧客户端因此把合法发布判成「更新附件来源无效，已停止下载」，
+    彻底无法自助更新，只能手动装一次新包。认 API 报告的仓库，其余检查（主机、路径、
+    附件名、state、大小、SHA-256、Ed25519 签名）一项都不放松。
+    """
+    html = data.get('html_url')
+    if isinstance(html, str):
+        match = re.fullmatch(
+            r'https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/releases/tag/[^/]+', html)
+        if match:
+            return f'https://github.com/{match.group(1)}'
+    return f'https://github.com/{REPOSITORY}'
+
+
 def release_assets(data, version):
     assets = data.get('assets')
     if not isinstance(assets, list) or any(not isinstance(asset, dict) for asset in assets):
         raise ValueError('发布附件格式无效')
+    origin = release_origin(data)
     result = {}
     for name in RELEASE_ASSETS:
         matches = [asset for asset in assets if asset.get('name') == name]
         if len(matches) != 1:
             raise RuntimeError(f'最新版本缺少唯一的发布附件 {name}，请等待发布完成后重试。')
         asset = matches[0]
-        url = f'https://github.com/{REPOSITORY}/releases/download/v{version}/{name}'
+        url = f'{origin}/releases/download/v{version}/{name}'
         if asset.get('browser_download_url') != url or asset.get('state') != 'uploaded':
             raise RuntimeError('更新附件来源无效或尚未上传完成，已停止下载。')
         size = asset.get('size')

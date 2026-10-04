@@ -14,7 +14,7 @@
 | 项目 | 值 |
 |---|---|
 | Project | `youziauth` |
-| Repository | `https://github.com/Cyzmmd/youziauth` |
+| Repository | `https://github.com/yoouzic/youziauth` |
 | License | `GPL-3.0-only` |
 | Maintainer / publisher display name | `yoouzic` |
 | Release artifact | `youziauth.msi` |
@@ -24,7 +24,7 @@
 
 ## SignPath 项目配置
 
-1. 创建或获批项目 `youziauth`，仓库 URL 填写 `https://github.com/Cyzmmd/youziauth`。
+1. 创建或获批项目 `youziauth`，仓库 URL 填写 `https://github.com/yoouzic/youziauth`。
 2. 创建 artifact configuration，slug 使用 `windows-msi-deep-signing`，内容以仓库的 `.signpath/artifact-configuration.xml` 为准。
 3. 创建 signing policy，slug 使用 `release-signing`，开启 trusted build system verification 与 origin verification。
 4. 将预定义的 GitHub.com Trusted Build System 链接到项目。
