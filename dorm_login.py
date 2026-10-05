@@ -3,6 +3,7 @@ import contextlib
 import os
 import re
 import socket
+import threading
 from pathlib import Path
 import subprocess
 import tempfile
@@ -395,18 +396,61 @@ def adopt_idm_cookies(context, cookies):
         return False
 
 
-def resolve_idm_credentials(explicit=None):
+class LoginGate:
+    """一台电脑同时只允许跑一条学校登录链路（浏览器 + SSO）。
+
+    为什么必须串行（都是实测教训）：
+      * 认证成功后的那一跳 `idm.swu.edu.cn/am/oauth2/authorize` 会被站点动态防护判成重放
+        而回 400（见 adopt_idm_cookies 的注释）；同一台机器同时跑两条 SSO 链路、
+        两套 cookie 同时出现，正是最容易被判重放的形态。
+      * 2026-09-24 那次「整晚每 5 分钟拉起一个浏览器」的事故最终导致**本机账户被锁定**
+        （见 dorm_panel.MAX_DAILY_LOGIN_RENEWALS）。多账号之后，每个账号各有自己的上限，
+        所以还需要一层机器级的闸：同时只跑一条，其余账号等下一拍。
+
+    用法是**非阻塞**的：拿不到就立刻返回，由调用方决定是「稍后重试」还是「告诉用户排队」。
+    排队等待在这里没有意义 —— 一次交互式登录最长可以占用 5 分钟，等在闸后面的账号
+    既不会更快，反而会把当天的重试额度耗在等待上。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def acquire(self) -> bool:
+        return self._lock.acquire(blocking=False)
+
+    def release(self) -> None:
+        try:
+            self._lock.release()
+        except RuntimeError:
+            pass                      # 重复释放不该让调用方炸掉
+
+    def held(self) -> bool:
+        """仅供诊断/测试使用：判断闸是不是被占着。"""
+        if self._lock.acquire(blocking=False):
+            self._lock.release()
+            return False
+        return True
+
+
+LOGIN_GATE = LoginGate()
+
+
+def resolve_idm_credentials(explicit=None, idm_store=None):
     """获取 IDM 静默登录所需的凭据；未配置时返回 None（行为回退到纯人工登录）。
 
-    explicit 可传 IdmCredentials 直接指定；否则尝试从本机加密存储读取。
+    explicit 可传 IdmCredentials 直接指定；idm_store 可传账号自己的 IdmCredentialStore
+    （多账号：凭据跟着账号档案目录走，**不能**退回全局目录，否则会用错人的学号密码）；
+    两者都没有才读全局默认目录。
     任何异常都视为"没有可用凭据"，绝不让凭据问题破坏原有登录流程。
     """
     if explicit is not None:
         return explicit
     try:
-        from idm_credentials import IdmCredentialStore  # noqa: PLC0415
+        if idm_store is None:
+            from idm_credentials import IdmCredentialStore  # noqa: PLC0415
 
-        return IdmCredentialStore().load()
+            idm_store = IdmCredentialStore()
+        return idm_store.load()
     except Exception:
         return None
 
@@ -505,7 +549,8 @@ def attempt_log(store):
     return log
 
 
-def login(store, api, cancel, timeout=300, *, interactive=True, idm_credentials=None):
+def login(store, api, cancel, timeout=300, *, interactive=True, idm_credentials=None,
+          idm_store=None):
     check_cancel(cancel)
     try:
         session = store.browser_session(store.token())
@@ -514,8 +559,16 @@ def login(store, api, cancel, timeout=300, *, interactive=True, idm_credentials=
             raise
         session = None
     cookies = school_cookies(session['cookies']) if session else []
-    if not interactive and not cookies:
-        raise CheckinError('login_required', '没有可恢复的学校会话，请手动登录一次')
+    # 无人值守（后台自动打卡）有两条走得通的路：
+    #   1. 续期：手上还有没过期的学校 cookie，接着走 SSO 就行；
+    #   2. 全流程登录：没有会话，但**保存了统一认证凭据** —— headless 打开登录页、
+    #      用凭据自动填表 + 本地模型识别验证码（用户 2026-10-05 明确选择允许这条路）。
+    # 两条都不成立时连浏览器都不必开：开出来也只能干等，直接把该做什么告诉人。
+    # 凭据在这里先解析（本地 DPAPI 读取，不联网），下面浏览器里直接复用同一个值。
+    credentials = resolve_idm_credentials(idm_credentials, idm_store)
+    if not interactive and not cookies and credentials is None:
+        raise CheckinError(
+            'login_required', '没有可恢复的学校会话，也没有保存统一认证凭据：请手动登录一次')
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -557,7 +610,8 @@ def login(store, api, cancel, timeout=300, *, interactive=True, idm_credentials=
             if not interactive:
                 log('无人值守：headless 会话已按普通 Chrome 伪装（UA/视口/屏幕），'
                     '否则站点会把 uaaap CAS 那一跳判成 400（实测根因）')
-            credentials = resolve_idm_credentials(idm_credentials)
+                log('无人值守：' + (f'续用已有会话（{len(cookies)} 个 cookie）' if cookies else
+                                    '没有可恢复的会话，改用保存的统一认证凭据走完整登录流程'))
             silent_result = None
             open_login_page(page, cancel, authenticated=lambda: bool(token))
 
@@ -682,12 +736,19 @@ def login(store, api, cancel, timeout=300, *, interactive=True, idm_credentials=
                         message = '登录等待超时，请重试'
                     log(f'登录未完成：{message}')
                     raise CheckinError('login_required', message)
+                # 无人值守也一样要报「密码错」：这条路现在会用保存的凭据真的提交一次，
+                # 用户最需要知道的恰恰是「凭据不对」，而不是含糊的「需要验证码」。
+                if silent_result is not None and silent_result.reason == 'bad_credentials':
+                    message = '统一认证提示「用户名或密码错误」：请在面板中更新该账号已保存的凭据后重试'
+                    log(f'登录未完成：{message}')
+                    raise CheckinError('login_required', message)
                 challenge = page.locator('input[type="password"], input[autocomplete="one-time-code"], '
                                          'input[name*="captcha" i]').first.is_visible()
                 check_cancel(cancel)
                 if challenge:
-                    log('登录未完成：学校会话已过期或需要验证码')
-                    raise CheckinError('login_required', '学校会话已过期或需要验证码，请手动登录')
+                    log('登录未完成：需要人工完成登录（验证码或会话已过期）')
+                    raise CheckinError('login_required',
+                                       '无人值守登录未完成：需要人工输入验证码，或手动登录一次')
                 log('登录未完成：学校登录交换未完成（已保留会话）')
                 raise CheckinError('network_error', '学校登录交换未完成，已保留会话，请稍后重试')
             try:
@@ -698,7 +759,9 @@ def login(store, api, cancel, timeout=300, *, interactive=True, idm_credentials=
                 keep_session(store, token[0], context, session)
                 raise
             check_cancel(cancel)
-            if not interactive and student != session['student']:
+            # 「恢复的账号不一致」这条只在**续用已有会话**时才有意义：
+            # 从零登录（没有会话）时，这次登录本身就是身份的来源。
+            if not interactive and session is not None and student != session['student']:
                 raise CheckinError('login_required', '恢复的登录账号不一致，请手动登录')
             cookies = school_cookies(context.cookies())
             check_cancel(cancel)

@@ -49,6 +49,15 @@
 
       <section class="page" id="dorm" aria-labelledby="dorm-title" hidden>
         <div class="page-heading"><div><div class="eyebrow">一天的收尾，也从容一些</div><h1 id="dorm-title">寝室打卡</h1><p class="muted">查看学校今日安排，在有效时段内完成打卡。</p></div><button class="secondary" data-action="dorm_login"><i class="bi bi-person-check" aria-hidden="true"></i> 学校登录 / 重新登录</button></div>
+        <div class="account-bar" id="account-bar" hidden>
+          <label for="dorm-account">打卡账号</label>
+          <select id="dorm-account"></select>
+          <input id="account-name" type="text" maxlength="24" placeholder="留空自动命名" autocomplete="off">
+          <button type="button" class="secondary" id="account-add">新建账号</button>
+          <button type="button" class="secondary" id="account-rename">重命名</button>
+          <button type="button" class="secondary danger" id="account-delete">删除账号</button>
+          <span id="account-state" role="status"></span>
+        </div>
         <article class="paper-card task-card"><div class="card-label"><span><i class="bi bi-journal-check" aria-hidden="true"></i> 今日任务</span><span class="badge" id="task-badge">待查询</span></div><h2 id="task-title">先看看今天的安排</h2><p class="muted" id="task-message">查询今日任务，不会提交打卡。</p><div class="task-details" id="task-details" hidden><div><span>任务日期</span><strong id="task-date"></strong></div><div><span>学校时段</span><strong id="task-time"></strong></div><div><span>打卡地点</span><strong id="task-address"></strong></div></div><div class="task-actions"><button class="primary" id="submit-dorm">提交今日打卡 <i class="bi bi-arrow-right" aria-hidden="true"></i></button><button class="secondary" data-action="dorm_query">查询今日任务</button><button class="text-button" data-action="dorm_cancel" id="cancel-dorm">取消当前操作</button></div></article>
         <div class="detail-grid">
           <form class="paper-card form-card" id="dorm-form">

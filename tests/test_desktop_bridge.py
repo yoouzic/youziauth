@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import tempfile
 import threading
@@ -9,8 +10,53 @@ from unittest.mock import MagicMock, patch
 import dorm_points
 from desktop_bridge import DesktopBridge, PreviewBridge
 from campus_auth_gui import GuiSettings
+from dorm_accounts import DormAccounts
 from dorm_checkin import Result, Settings, Store, Task
 from dorm_location import map_pick_sample
+
+
+def _at(value):
+    return dt.datetime.fromisoformat(value)
+
+
+class FakeController:
+    """账号层里的控制器替身：只关心「哪个档案目录、错峰多少、是否在忙」，不碰学校接口。"""
+
+    def __init__(self, profile, stagger_seconds=0):
+        self.store = Store(Path(profile))
+        self.stagger_seconds = stagger_seconds
+        self.latest = Result('idle', '尚未查询今日任务')
+        self.busy = False
+        self.closed = False
+        self.cancelled = False
+        self.polled = 0
+        self.results = []
+
+    def poll(self):
+        self.polled += 1
+        return True
+
+    def start(self, action):
+        self.started.append(action)
+        return True
+
+    def save(self, settings):
+        self.store.save_settings(settings)
+
+    def cancel(self):
+        self.cancelled = True
+
+    def drain(self):
+        values, self.results = self.results, []
+        if values:
+            self.latest = values[-1]
+        return values
+
+    def schedule_text(self):
+        return '自动打卡：关闭'
+
+    def close(self):
+        self.closed = True
 
 
 class DesktopBridgeTests(unittest.TestCase):
@@ -658,6 +704,268 @@ class SimulationMapTests(unittest.TestCase):
         self.assertFalse(preview.simulation_map()['ok'] if
                          preview.dispatch('location_source_save', {'location_source': 'windows'})['ok']
                          else True)
+
+
+class AccountSwitchTests(unittest.TestCase):
+    """多账号在桥接层的接缝：快照、四个动作、交接副作用，以及「不许串账号」。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.accounts = DormAccounts(self.root / 'accounts', controller_factory=FakeController)
+        self.patches = [
+            patch('desktop_bridge.gui.ensure_user_config', side_effect=lambda p: p),
+            patch('desktop_bridge.gui.load_gui_settings', return_value=GuiSettings('student', '', 60)),
+            patch('desktop_bridge.gui.is_startup_enabled', return_value=False),
+        ]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.bridge = DesktopBridge(self.root / 'config.ini', accounts=self.accounts)
+        self.addCleanup(self.bridge._close)
+
+    def test_an_injected_single_controller_has_no_account_layer(self):
+        """注入控制器的调用点（测试、旧工具）不进账号层，前端因此也不会显示切换器。"""
+        controller = MagicMock()
+        controller.latest = Result('idle', '尚未查询今日任务')
+        controller.busy = False
+        controller.store.settings.return_value = Settings()
+        controller.store.root = self.root / 'dorm'
+        controller.store.history.return_value = ''
+        controller.schedule_text.return_value = '自动打卡：关闭'
+        controller.drain.return_value = []
+        bridge = DesktopBridge(self.root / 'config.ini', dorm=controller)
+        self.addCleanup(bridge._close)
+        self.assertEqual(bridge.snapshot()['accounts'],
+                         {'error': '', 'max': 0, 'active': '', 'items': [], 'busy': False})
+        self.assertFalse(bridge.dispatch('account_add', {'name': 'x'})['ok'])
+        controller.start.assert_not_called()
+
+    def test_the_snapshot_carries_each_accounts_today_status(self):
+        first = self.accounts.registry().active_id()
+        self.accounts.controller.store.save_settings(Settings(enabled=True))
+        self.accounts.controller.store.mark_signed('2026-10-04', '2023000001')
+        self.accounts.add('张三')
+        with patch('dorm_accounts.now', return_value=_at('2026-10-04T21:30:00+08:00')):
+            block = self.bridge.snapshot()['accounts']
+        rows = {item['id']: item for item in block['items']}
+        self.assertTrue(rows[first]['enabled'])
+        self.assertTrue(rows[first]['signed_today'])
+        self.assertFalse(rows[first]['busy'])
+        self.assertIsInstance(rows[first]['message'], str)
+        second = self.accounts.registry().accounts()[1].id
+        self.assertFalse(rows[second]['enabled'])
+        self.assertFalse(rows[second]['signed_today'])
+        self.assertFalse(block['busy'])
+        self.assertNotIn(self.tmp.name, json.dumps(block))
+
+    def test_every_account_reports_its_own_notification_with_its_name(self):
+        """两个账号的同一种失败文案一模一样时，通知不能被去重吞掉一个。"""
+        self.accounts.add('张三')
+        accounts = self.accounts.registry().accounts()
+        for account in accounts:
+            controller = self.accounts._controller_for(account)
+            controller.results = [Result('signed', '今日打卡已完成，当天不再重复检查',
+                                         at='2026-10-04T21:05:00+08:00')]
+        with patch('desktop_bridge.windows_notifications.show_toast') as toast:
+            self.bridge._tick()
+        messages = [call.args[0] for call in toast.call_args_list]
+        self.assertEqual(len(messages), 2, '每个账号各自的结果都要提醒一次')
+        self.assertIn('账号 1', messages[0])
+        self.assertIn('张三', messages[1])
+
+    def test_one_accounts_repeat_is_still_suppressed(self):
+        controller = self.accounts.controller
+        result = Result('signed', '今日打卡已完成，当天不再重复检查', at='2026-10-04T21:05:00+08:00')
+        controller.results = [result]
+        with patch('desktop_bridge.windows_notifications.show_toast') as toast:
+            self.bridge._tick()
+            controller.results = [result]
+            self.bridge._tick()
+        self.assertEqual(len(toast.call_args_list), 1)
+
+    def test_cancelling_from_the_ui_reaches_every_account(self):
+        self.accounts.add('张三')
+        accounts = self.accounts.registry().accounts()
+        controllers = [self.accounts._controller_for(account) for account in accounts]
+        result = self.bridge.dispatch('dorm_cancel')
+        self.assertTrue(result['ok'])
+        self.assertIn('所有账号', result['message'])
+        self.assertTrue(all(controller.cancelled for controller in controllers))
+
+    def test_update_install_waits_for_every_account_not_just_the_active_one(self):
+        self.accounts.add('张三')
+        other = self.accounts.registry().accounts()[1]
+        self.accounts._controller_for(other).busy = True
+        with patch.object(self.bridge._updates, 'install', return_value='打开安装向导') as install:
+            result = self.bridge.dispatch('update_install', {'confirmed': True, 'version': '9.9.9'})
+        self.assertFalse(result['ok'])
+        install.assert_not_called()
+
+    def test_the_snapshot_lists_accounts_without_exposing_paths(self):
+        self.bridge.dispatch('account_add', {'name': '张三'})
+        block = self.bridge.snapshot()['accounts']
+        self.assertEqual([item['name'] for item in block['items']], ['账号 1', '张三'])
+        self.assertEqual([item['active'] for item in block['items']], [False, True])
+        self.assertEqual(block['active'], block['items'][1]['id'])
+        self.assertNotIn(self.tmp.name, json.dumps(block))
+
+    def test_adding_an_account_switches_the_whole_dorm_view_to_it(self):
+        self.bridge.dispatch('dorm_save', {'enabled': True, 'start': '21:00', 'end': '23:30',
+                                           'interval': 600, 'location_source': 'windows'})
+        first = self.bridge.snapshot()['dorm']['settings']
+        self.assertEqual(first['interval'], 600)
+        self.assertTrue(self.bridge.dispatch('account_add', {'name': '张三'})['ok'])
+        second = self.bridge.snapshot()['dorm']
+        self.assertEqual(second['settings']['interval'], 300)      # 新账号是默认值
+        self.assertFalse(second['settings']['enabled'])
+        self.assertEqual(second['schedule'], '自动打卡：关闭')
+
+    def test_switching_back_restores_the_first_account_settings(self):
+        self.bridge.dispatch('dorm_save', {'enabled': True, 'start': '21:00', 'end': '23:30',
+                                           'interval': 600, 'location_source': 'windows'})
+        first_id = self.bridge.snapshot()['accounts']['active']
+        self.bridge.dispatch('account_add', {'name': '张三'})
+        result = self.bridge.dispatch('account_switch', {'id': first_id})
+        self.assertTrue(result['ok'])
+        self.assertIn('账号 1', result['message'])
+        self.assertEqual(self.bridge.snapshot()['dorm']['settings']['interval'], 600)
+        self.assertEqual(self.bridge.snapshot()['accounts']['active'], first_id)
+
+    def test_switching_resets_the_location_state_to_the_new_account_source(self):
+        self.accounts.add('模拟账号')
+        second_id = self.accounts.registry().active_id()
+        second = self.accounts.controller
+        second.store.save_settings(Settings(location_source='simulation'))
+        self.accounts.switch(self.accounts.registry().accounts()[0].id)
+        self.bridge._location_state = {'state': 'ready', 'message': '旧账号的定位结果',
+                                       'source': 'windows', 'accuracy': 12, 'checked': '刚刚'}
+        self.assertTrue(self.bridge.dispatch('account_switch', {'id': second_id})['ok'])
+        self.assertIn('模拟', self.bridge.snapshot()['location']['message'])
+        self.assertEqual(self.bridge.snapshot()['location']['state'], 'idle')
+
+    def test_switching_is_allowed_while_an_account_is_checking_in(self):
+        """第二阶段：切换只是换界面在看谁，后台账号的操作不受影响，也不再被拒绝。"""
+        self.accounts.add('张三')
+        second = self.accounts.registry().active_id()
+        self.accounts.switch(self.accounts.registry().accounts()[0].id)
+        busy = self.accounts.controller
+        busy.busy = True
+        result = self.bridge.dispatch('account_switch', {'id': second})
+        self.assertTrue(result['ok'])
+        self.assertIn('已切换', result['message'])
+        self.assertEqual(self.bridge.snapshot()['accounts']['active'], second)
+        self.assertTrue(busy.busy, '切走不影响后台账号正在进行的操作')
+        self.assertFalse(busy.closed)
+
+    def test_deleting_the_account_that_is_checking_in_is_refused_from_the_ui(self):
+        self.accounts.add('正在打卡的')
+        target = self.accounts.registry().active_id()
+        profile = self.root / 'accounts' / target
+        self.accounts.controller.busy = True
+        result = self.bridge.dispatch('account_delete', {'id': target, 'confirmed': True})
+        self.assertFalse(result['ok'])
+        self.assertIn('正在打卡', result['message'])
+        self.assertTrue(profile.is_dir())
+
+    def test_renaming_uses_the_backend_clean_name(self):
+        account_id = self.bridge.snapshot()['accounts']['active']
+        self.assertTrue(self.bridge.dispatch('account_rename',
+                                             {'id': account_id, 'name': '  张三\u0007  '})['ok'])
+        self.assertEqual(self.bridge.snapshot()['accounts']['items'][0]['name'], '张三')
+        self.assertFalse(self.bridge.dispatch('account_rename',
+                                              {'id': account_id, 'name': '  '})['ok'])
+
+    def test_deleting_requires_confirmation_and_removes_only_that_profile(self):
+        keep = self.bridge.snapshot()['accounts']['active']
+        self.bridge.dispatch('account_add', {'name': '要删的'})
+        target = self.bridge.snapshot()['accounts']['active']
+        profile = self.root / 'accounts' / target
+        self.assertTrue(profile.is_dir())
+        self.assertFalse(self.bridge.dispatch('account_delete', {'id': target})['ok'])
+        self.assertTrue(profile.is_dir())
+        self.assertFalse(self.bridge.dispatch('account_delete',
+                                              {'id': target, 'confirmed': 'yes'})['ok'])
+        self.assertTrue(profile.is_dir())
+        self.assertTrue(self.bridge.dispatch('account_delete',
+                                             {'id': target, 'confirmed': True})['ok'])
+        self.assertFalse(profile.exists())
+        self.assertEqual(self.bridge.snapshot()['accounts']['active'], keep)
+
+    def test_the_last_account_cannot_be_deleted(self):
+        only = self.bridge.snapshot()['accounts']['active']
+        result = self.bridge.dispatch('account_delete', {'id': only, 'confirmed': True})
+        self.assertFalse(result['ok'])
+        self.assertEqual(len(self.bridge.snapshot()['accounts']['items']), 1)
+
+    def test_unified_credentials_follow_the_active_account(self):
+        first_root = self.bridge._active_idm_store().root
+        self.bridge.dispatch('account_add', {'name': '张三'})
+        second_root = self.bridge._active_idm_store().root
+        self.assertNotEqual(first_root, second_root)
+        self.assertEqual(first_root.parent.parent, self.root / 'accounts')
+        self.assertEqual(second_root, self.root / 'accounts' / self.bridge.snapshot()['accounts']['active'] / 'idm')
+
+    def test_a_broken_registry_degrades_the_dorm_block_and_not_the_snapshot(self):
+        (self.root / 'accounts' / 'accounts.json').write_text('{', encoding='utf-8')
+        state = self.bridge.snapshot()
+        self.assertIn('损坏', state['accounts']['error'])
+        self.assertEqual(state['accounts']['items'], [])
+        self.assertIn('损坏', state['dorm']['message'])
+        self.assertIn('network', state)                     # 校园网区块不受影响
+        self.bridge._tick()                                 # 轮询安静跳过，不抛
+        self.assertTrue(self.bridge.dispatch('account_add', {'name': 'x'})['ok'] is False)
+        self.assertTrue(self.bridge.dispatch('dorm_query')['ok'] is False)
+        self.bridge._close()
+
+    def test_closing_the_bridge_closes_the_active_controller(self):
+        controller = self.accounts.controller
+        self.bridge._close()
+        self.assertTrue(controller.closed)
+
+
+    def test_the_preview_bridge_manages_demo_accounts_without_touching_disk(self):
+        """预览/演示 bridge 也要能完整演示切换器，且一个字节都不写。"""
+        with patch('desktop_bridge.DormAccounts') as real_accounts:
+            preview = PreviewBridge()
+            state = preview.snapshot()['accounts']
+            self.assertEqual([item['name'] for item in state['items']], ['演示账号一', '演示账号二'])
+            self.assertEqual(state['active'], 'demo1')
+            self.assertFalse(state['busy'])
+            self.assertTrue(state['items'][0]['signed_today'])
+            self.assertTrue(state['items'][0]['enabled'])
+            self.assertFalse(state['items'][1]['enabled'])
+            self.assertEqual(preview.snapshot()['dorm']['idm_username'], '2026000000')
+
+            self.assertTrue(preview.dispatch('account_switch', {'id': 'demo2'})['ok'])
+            switched = preview.snapshot()
+            self.assertEqual(switched['accounts']['active'], 'demo2')
+            self.assertEqual(switched['dorm']['idm_username'], '')
+            self.assertFalse(switched['dorm']['has_idm_credentials'])
+
+            self.assertTrue(preview.dispatch('account_add', {'name': '演示·实验室'})['ok'])
+            self.assertEqual(preview.snapshot()['accounts']['items'][-1]['name'], '演示·实验室')
+            self.assertTrue(preview.dispatch('account_rename',
+                                             {'id': 'demo2', 'name': '  改过的  '})['ok'])
+            self.assertEqual(preview.snapshot()['accounts']['items'][1]['name'], '改过的')
+            self.assertFalse(preview.dispatch('account_rename', {'id': 'demo2', 'name': ' '})['ok'])
+            self.assertFalse(preview.dispatch('account_delete', {'id': 'demo2'})['ok'])
+            self.assertTrue(preview.dispatch('account_delete',
+                                             {'id': 'demo2', 'confirmed': True})['ok'])
+            items = preview.snapshot()['accounts']['items']
+            self.assertEqual([item['id'] for item in items], ['demo1', 'demo3'])
+            self.assertEqual([item['active'] for item in items].count(True), 1,
+                             '演示账号列表也必须有且只有一个活动账号')
+            self.assertTrue(items[1]['active'], '删掉的是别的账号，活动账号不该换人')
+            real_accounts.assert_not_called()
+
+    def test_the_preview_bridge_cannot_delete_its_last_demo_account(self):
+        preview = PreviewBridge()
+        self.assertTrue(preview.dispatch('account_delete', {'id': 'demo2', 'confirmed': True})['ok'])
+        result = preview.dispatch('account_delete', {'id': 'demo1', 'confirmed': True})
+        self.assertFalse(result['ok'])
+        self.assertIn('至少保留一个账号', result['message'])
 
 
 if __name__ == '__main__':

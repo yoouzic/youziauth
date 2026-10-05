@@ -321,11 +321,55 @@ class SessionLoginTests(unittest.TestCase):
 
     def test_token_only_install_does_not_open_a_browser_for_renewal(self):
         self.store.save_token('old-token')
-        with self.assertRaises(CheckinError) as caught:
-            dorm_login.login(self.store, self.api, threading.Event(), interactive=False)
+        with patch.object(dorm_login, 'resolve_idm_credentials', return_value=None):
+            with self.assertRaises(CheckinError) as caught:
+                dorm_login.login(self.store, self.api, threading.Event(), interactive=False)
         self.assertEqual(caught.exception.state, 'login_required')
+        self.assertIn('统一认证凭据', str(caught.exception))
         self.owned.assert_not_called()
         self.assertEqual(self.store.token(), 'old-token')
+
+    def test_unattended_login_can_start_from_scratch_with_saved_credentials(self):
+        """用户选择：没有会话、但存了统一认证凭据时，允许 headless 自己登一次。
+
+        走的是既有的静默登录链路（自动填学号密码 + 本地模型识别验证码），
+        所以这里只需要证明：没有 cookie 时不再提前拒绝，而是真的开浏览器并保存新会话。
+        """
+        entries = []
+
+        def fake_enter(page, cancel, **kwargs):
+            entries.append(page)
+            self.capture(Mock(url='https://of.swu.edu.cn/gateway/auth/exchange-token',
+                              status=200, headers={'fighter-auth-token': 'fresh-token'}))
+            return True
+
+        self.issue_token = False        # 令牌只能来自「静默登录成功」这条路
+        credentials = Mock(username='u', password='p')
+        with patch.object(dorm_login, 'resolve_idm_credentials', return_value=credentials), \
+             patch.object(dorm_login, 'enter_idm_login', side_effect=fake_enter):
+            self.assertEqual(dorm_login.login(self.store, self.api, threading.Event(),
+                                              interactive=False), 'student')
+        self.assertEqual(entries, [self.page])
+        self.assertEqual(self.owned.call_args.kwargs, {'headless': True})
+        self.assertEqual(self.store.token(), 'fresh-token')
+        self.assertEqual(self.store.browser_session('fresh-token')['student'], 'student')
+        log = (self.store.root / 'login.log').read_text(encoding='utf-8')
+        self.assertIn('完整登录流程', log)
+        self.assertNotIn('登录凭据', log)          # 只记受控字段，绝不写凭据本身
+
+    def test_unattended_first_login_reports_bad_credentials(self):
+        """无人值守提交凭据后被判「密码错」时，必须把这句话报出来。"""
+        silent = Mock(ok=False, reason='bad_credentials', cookies={}, resume_url=None,
+                      accepted_by=None)
+        with patch.object(dorm_login, 'resolve_idm_credentials',
+                          return_value=Mock(username='u', password='p')), \
+             patch.object(dorm_login, 'enter_idm_login', return_value=True), \
+             patch('idm_login.attempt_silent_login', return_value=silent):
+            self.issue_token = False
+            with self.assertRaises(CheckinError) as caught:
+                dorm_login.login(self.store, self.api, threading.Event(), timeout=0,
+                                 interactive=False)
+        self.assertIn('用户名或密码错误', str(caught.exception))
 
     def test_captcha_timeout_discards_unusable_session_not_token(self):
         self.seed_session()
@@ -717,8 +761,11 @@ class SessionLoginTests(unittest.TestCase):
     def test_expired_cookies_do_not_start_renewal(self):
         self.store.save_token('old-token')
         self.store.save_browser_session('old-token', 'student', [dict(self.cookies[0], expires=1)])
-        with self.assertRaises(CheckinError):
-            dorm_login.login(self.store, self.api, threading.Event(), interactive=False)
+        # 没有凭据时：过期会话不能拿去续期，也不必开浏览器。
+        # （有凭据时的全流程登录是另一条路，见 test_unattended_login_can_start_from_scratch_…）
+        with patch.object(dorm_login, 'resolve_idm_credentials', return_value=None):
+            with self.assertRaises(CheckinError):
+                dorm_login.login(self.store, self.api, threading.Event(), interactive=False)
         self.owned.assert_not_called()
 
     def test_failed_session_save_preserves_previous_matching_credentials(self):

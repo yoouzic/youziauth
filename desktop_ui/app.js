@@ -7,7 +7,7 @@ const revisions = {network:0, dorm:0};
 let sourceDirty = false, sourceRevision = 0;
 let api;
 let mapState = null;
-let mapDrag = null, mapSuppressPick = false, mapNameFor = null;
+let mapDrag = null, mapSuppressPick = false, mapNameFor = null, accountNameFor = null;
 const MAP_TILE = 256, MAP_MIN_ZOOM = 13, MAP_MAX_ZOOM = 19;
 const MAP_TILE_TRIES = 3, MAP_TILE_BACKOFF = [1200, 4000];  // ms before each retry of one tile
 const MAP_TILE_STALL = 8000;   // ms with nothing drawn before the next provider takes the frame
@@ -104,7 +104,7 @@ function render() {
   document.querySelectorAll('[data-action="dorm_login"],[data-action="dorm_query"]').forEach(b=>b.disabled=pending||d.busy);
   $('submit-dorm').disabled=pending||syncedEpoch!==epoch||d.busy||!['ready','uncertain'].includes(d.state);
   $('submit-dorm').firstChild.textContent=d.state==='uncertain'?'回查提交结果 ':'提交今日打卡 ';
-  $('cancel-dorm').disabled=pending||!d.busy;
+  $('cancel-dorm').disabled=pending||!(d.busy||state.accounts?.busy);   // 别的账号在忙时也要能取消
   $('logout-dorm').disabled=pending||d.busy;
   $('idm-credential-state').textContent=d.has_idm_credentials
     ?`已保存统一认证凭据（学号 ${d.idm_username||'未知'}）：登录时会自动填写并识别验证码。`
@@ -112,6 +112,7 @@ function render() {
   $('idm-clear').disabled=!d.has_idm_credentials||pending||d.busy;
   $('idm-username').disabled=pending||d.busy;
   $('idm-password').disabled=pending||d.busy;
+  renderAccounts();
   if(!simulation&&mapState)closeMap();
   $('open-map-picker').hidden=!simulation||!!mapState;
   document.querySelectorAll('button[type="submit"]').forEach(b=>b.disabled=pending||(b.closest('form').id==='dorm-form'&&d.busy));
@@ -272,6 +273,116 @@ $('submit-dorm').onclick=()=>{
   });
 };
 $('logout-dorm').onclick=()=>confirmAction('清除学校登录凭据？','这会同时关闭自动打卡。校园网账号不受影响，下次打卡需要重新登录学校账号。',async()=>{if(await act('dorm_logout')){markDirty('dorm',false);render();}});
+
+/* 打卡账号 ---------------------------------------------------------------------------------
+   所有开启了自动打卡的账号都会在各自时段内自动打卡，但 state.dorm 仍然只描述活动账号，切换
+   后整页设置跟着换，所以前端不为每个账号留一份表单副本。账号栏因此要一眼看出每个账号今天的
+   状态：下拉框后缀和汇总文字都直接读快照。老快照可能完全没有 accounts 层，那时整条账号栏不
+   出现；也可能缺 busy/enabled/signed_today，一律按假值处理，其余功能照常。 */
+function accountItems(){return state?.accounts?.items||[];}
+function activeAccount(){
+  const items=accountItems();
+  return items.find(account=>account.active)||items.find(account=>account.id===state?.accounts?.active)||null;
+}
+function activeAccountId(){const active=activeAccount();return active?active.id:'';}
+// 后缀按优先级只取第一个命中的。顺序是有意的：没开自动打卡的账号，它上一次的状态只是历史，
+// 不该盖过「未开启自动打卡」这句更该让人知道的话。
+const accountSuffixState={login_required:' · 需要重新登录',location_required:' · 需要检查定位',error:' · 需要检查',network_error:' · 需要检查',ready:' · 今日待打卡',no_task:' · 今天暂无任务'};
+function accountLabel(account){
+  const suffix=account.missing?' · 档案缺失'
+    :account.busy?' · 处理中'
+    :account.signed_today?' · 今日已完成'
+    :!account.enabled?' · 未开启自动打卡'
+    :accountSuffixState[account.state]||' · 等待时段';
+  return account.name+(account.idm_username?` · ${account.idm_username}`:'')+suffix;
+}
+// 汇总只在多账号时出现：单个账号的自动打卡状态在下面的设置卡片里已经说清楚了。
+function accountSummary(items){
+  if(items.length<2)return '';
+  const enabledCount=items.filter(account=>account.enabled).length;
+  if(!enabledCount)return '';
+  return `自动打卡：${enabledCount} 个账号已开启 · ${items.filter(account=>account.signed_today).length} 个今日已完成`;
+}
+function requireAccountSync(){
+  if(!state||syncedEpoch!==epoch){notify('账号状态尚未同步，请稍后重试。',true);return false;}
+  // 清单读不出来时后端会拒绝每一个账号操作，这里先按它的原话说明，不让按钮白点。
+  if(state.accounts?.error){notify(state.accounts.error,true);return false;}
+  return true;
+}
+function renderAccounts(){
+  const bar=$('account-bar');
+  if(!bar)return;
+  const accounts=state.accounts||{},items=accounts.items||[],error=accounts.error||'';
+  bar.hidden=!(items.length||error);
+  const select=$('dorm-account');
+  select.replaceChildren(...items.map(account=>{
+    const option=document.createElement('option');
+    option.value=account.id;
+    option.textContent=accountLabel(account);
+    return option;
+  }));
+  const active=activeAccount(),activeId=active?active.id:'';
+  if(syncedEpoch===epoch)select.value=activeId;   // 状态没同步时不覆盖用户正在做的选择
+  // 切换账号只是界面行为：打卡中的账号可以照常选、照常删，后端会拒绝动作并给出原因。
+  const blocked=Boolean(pending||error),max=accounts.max||0,full=max>0&&items.length>=max;
+  select.disabled=blocked||!items.length;
+  $('account-name').disabled=blocked;
+  $('account-add').disabled=blocked||full;
+  $('account-rename').disabled=blocked||!items.length;
+  $('account-delete').disabled=blocked||!items.length;
+  $('account-state').textContent=error||(full?`最多 ${max} 个账号`:'')||accountSummary(items);
+  // 名字框只在真的换了活动账号时回写：它同时也是新建账号的输入框，不能被后台重绘冲掉。
+  if(accountNameFor!==activeId){
+    accountNameFor=activeId;
+    $('account-name').value=active?active.name:'';
+  }
+}
+$('dorm-account').addEventListener('change',()=>{
+  const id=$('dorm-account').value;
+  if(!id||id===activeAccountId())return;             // 选中的就是活动账号：什么都不做
+  const confirmedEpoch=syncedEpoch;
+  const switching=async()=>{
+    if(!requireAccountSync())return;
+    if(syncedEpoch!==confirmedEpoch){notify('账号状态已变化，请重新选择要切换的账号。',true);render();return;}
+    if(await act('account_switch',{id})){
+      closeMap();
+      $('account-name').value='';
+      accountNameFor=null;
+      markDirty('dorm',false);
+      sourceDirty=false;
+    }
+    render();
+  };
+  if(dirty.dorm||sourceDirty){
+    confirmAction('切换账号？','寝室打卡设置或定位来源还有未保存的修改，切换账号会放弃这些修改。',switching);
+    $('dorm-account').value=activeAccountId();       // 还没切换成功，下拉框先回到活动账号
+  }else switching();
+});
+$('account-add').onclick=async()=>{
+  if(!requireAccountSync())return;
+  if(await act('account_add',{name:$('account-name').value})){
+    $('account-name').value='';
+    markDirty('dorm',false);
+    sourceDirty=false;
+  }
+  render();
+};
+$('account-rename').onclick=async()=>{
+  const active=activeAccount();
+  if(!active||!requireAccountSync())return;
+  const name=$('account-name').value;
+  if(!name.trim()){notify('请填写账号名称，最多 24 个字。',true);return;}
+  if(await act('account_rename',{id:active.id,name}))accountNameFor=null;   // 按后端清洗后的名字回填
+  render();
+};
+$('account-delete').onclick=()=>{
+  const active=activeAccount();
+  if(!active||!requireAccountSync())return;
+  confirmAction(`删除账号「${active.name}」？`,'会同时删除这个账号在本机的打卡设置、已保存的打卡点、当日打卡记录和登录凭据；无法撤销。',async()=>{
+    await act('account_delete',{id:active.id,confirmed:true});
+    render();
+  });
+};
 $('quit').onclick=()=>confirmAction('退出 youziauth？','退出将停止本程序的后台检测和自动打卡。已启用的系统认证代理仍会运行。',()=>act('quit'));
 $('refresh-records').onclick=async()=>{await refresh();if($('connection-error').hidden)notify('运行记录已刷新');};
 document.querySelectorAll('[data-log]').forEach(button=>button.onclick=()=>{logType=button.dataset.log;document.querySelectorAll('[data-log]').forEach(b=>{b.classList.toggle('selected',b===button);b.setAttribute('aria-pressed',String(b===button));});renderLogs();});

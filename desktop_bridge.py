@@ -18,10 +18,13 @@ import campus_auth
 import campus_auth_gui as gui
 import dorm_points
 import windows_notifications
+from dorm_accounts import MAX_ACCOUNTS, AccountError, DormAccounts
 from dorm_checkin import Settings, now
 from dorm_location import (PICK_SOURCE, distance_metres, gcj02_to_wgs84, map_pick_sample,
                            probe_location, radius_metres)
-from dorm_panel import DormController
+# 默认控制器类型由 dorm_accounts 构造；这里保留导入是因为测试会用它断言
+# 「演示预览不得创建真实控制器」，并且它仍是本模块对外的控制器符号。
+from dorm_panel import DormController  # noqa: F401
 
 
 # The picker draws a real map, so tiles come from a third party. OpenStreetMap stays first because
@@ -197,10 +200,15 @@ class LocationProbe:
 
 
 class DesktopBridge(LocationProbe):
-    def __init__(self, config_path=None, dorm=None, startup_mode=False):
+    def __init__(self, config_path=None, dorm=None, startup_mode=False, accounts=None):
         self._init_location()
         self._config = gui.ensure_user_config(config_path or gui.DEFAULT_CONFIG_PATH)
-        self._dorm = dorm or DormController()
+        # 多账号：正式运行时由账号层提供「当前活动账号」的控制器（同一时刻只有一个活着，
+        # 只有它在自动打卡）。注入 dorm（测试与旧调用点）时不叠账号层，直接用注入的控制器。
+        self._dorm_override = dorm
+        self._accounts = accounts
+        if self._accounts is None and self._dorm_override is None:
+            self._accounts = DormAccounts()
         self._lock = threading.RLock()
         self._mutation = threading.Lock()
         self._network_gate = threading.Lock()
@@ -227,16 +235,61 @@ class DesktopBridge(LocationProbe):
         except RuntimeError:
             pass
 
-    @staticmethod
-    def _idm_credential_status():
+    @property
+    def _dorm(self):
+        """当前活动账号的控制器。
+
+        账号档案不可用时这里会抛 AccountError —— 调用方分别处置：轮询与退出安静跳过
+        （错误由快照呈现），界面操作用户会看到具体原因。绝不退回某个隐式默认账号。
+        """
+        if self._accounts is not None:
+            return self._accounts.controller
+        return self._dorm_override
+
+    def _dorm_busy(self) -> bool:
+        """是否有账号正在打卡（多账号下「忙」不再只等于当前账号忙）。"""
+        if self._accounts is not None:
+            return self._accounts.any_busy()
+        return bool(self._dorm.busy)
+
+    def _accounts_snapshot(self):
+        """账号列表：只给界面「谁、叫什么、当前用哪个、今天什么状态」，不含任何路径。"""
+        empty = {'error': '', 'max': 0, 'active': '', 'items': [], 'busy': False}
+        if self._accounts is None:
+            return empty
+        block = self._accounts.snapshot()
+        for item in block['items']:
+            try:
+                status = self._idm_credential_status(self._accounts.idm_store(item['id']))
+            except AccountError:
+                status = {'has_idm_credentials': False, 'idm_username': ''}
+            item.update(status)
+        return block
+
+    def _idm_status_for_active(self):
+        """当前账号的统一认证凭据状态。
+
+        账号层读不出来时只降级这一小块：**绝不能让整个快照失败** —— 那会让前端
+        显示「界面暂时无法连接后台」，把「账号文件坏了」误报成「后台连不上」。
+        """
+        try:
+            store = self._active_idm_store() if self._accounts is not None else None
+        except AccountError:
+            return {'has_idm_credentials': False, 'idm_username': ''}
+        return self._idm_credential_status(store)
+
+    def _idm_credential_status(self, store=None):
         """统一认证凭据状态：仅返回「是否已保存」与学号，绝不回传密码。
 
         任何异常都降级为「未保存」——凭据读取失败不应让整个界面快照出错。
+        store 为空时读全局默认目录（注入控制器的旧调用点）；
+        多账号下由调用方传入该账号自己的存储，避免把别人的学号显示给当前账号。
         """
         try:
-            from idm_credentials import IdmCredentialStore  # noqa: PLC0415
+            if store is None:
+                from idm_credentials import IdmCredentialStore  # noqa: PLC0415
 
-            store = IdmCredentialStore()
+                store = IdmCredentialStore()
             if not store.exists():
                 return {'has_idm_credentials': False, 'idm_username': ''}
             creds = store.load()
@@ -244,6 +297,14 @@ class DesktopBridge(LocationProbe):
                     'idm_username': (creds.username if creds else '')}
         except Exception:  # noqa: BLE001
             return {'has_idm_credentials': False, 'idm_username': ''}
+
+    def _active_idm_store(self, account_id=None):
+        """当前（或指定）账号的统一认证凭据存储；账号层缺席时退回全局目录。"""
+        if self._accounts is not None:
+            return self._accounts.idm_store(account_id)
+        from idm_credentials import IdmCredentialStore  # noqa: PLC0415
+
+        return IdmCredentialStore()
 
     def snapshot(self):
         """Read only. Never expose passwords, tokens, coordinates or raw school payloads."""
@@ -255,27 +316,39 @@ class DesktopBridge(LocationProbe):
             # 让人完全找不到方向（实测踩过：一个 BOM 就让整个面板断连）。
             # 注意这不改变 fail-closed 语义：Engine 仍会因读不动配置而拒绝执行。
             settings_error = ''
+            bus = False
+            result = None
             try:
-                ds = self._dorm.store.settings()
+                controller = self._dorm
+                ds = controller.store.settings()
                 location_source = ds.location_source
                 dorm_settings = dataclasses.asdict(ds)
-                schedule = self._dorm.schedule_text()
+                schedule = controller.schedule_text()
+                bus = bool(controller.busy)
+                result = controller.latest
+            except AccountError as exc:
+                # 账号档案出了问题：说的是「哪个文件怎么了」，不是含糊的「设置读不动」。
+                fallback = Settings()
+                location_source = fallback.location_source
+                dorm_settings = dataclasses.asdict(fallback)
+                schedule = settings_error = str(exc)
             except Exception:  # noqa: BLE001
                 fallback = Settings()
                 location_source = fallback.location_source
                 dorm_settings = dataclasses.asdict(fallback)
                 schedule = '打卡设置无法读取，请打开寝室打卡设置重新保存'
                 settings_error = schedule
-            result = self._dorm.latest
-            task = result.task
+            task = result.task if result is not None else None
             try:
                 dorm_log = self._dorm.store.history()
             except Exception:  # noqa: BLE001
                 dorm_log = ''
+            accounts_error = self._accounts.error if self._accounts is not None else ''
             return {
                 'preview': False,
                 'update': self._updates.snapshot(),
                 'location': self._location_snapshot(location_source),
+                'accounts': self._accounts_snapshot(),
                 'network': {
                     'username': '' if settings.username == 'YOUR_STUDENT_ID' else settings.username,
                     'interval': settings.check_interval_seconds, 'startup': self._agent,
@@ -285,13 +358,15 @@ class DesktopBridge(LocationProbe):
                     'has_password': (self._config.parent / 'credential.dat').exists(),
                 },
                 'dorm': {
-                    'state': result.state, 'message': settings_error or result.message,
-                    'busy': self._dorm.busy, 'settings': dorm_settings,
+                    'state': result.state if result is not None else 'error',
+                    'message': accounts_error or settings_error
+                               or (result.message if result is not None else '打卡状态无法读取'),
+                    'busy': bus, 'settings': dorm_settings,
                     'schedule': schedule,
                     'task': ({k: getattr(task, k) for k in
                               ('title', 'date', 'start', 'end', 'address', 'signed')} if task else None),
-                    # 只暴露「是否已保存」与学号，绝不回传密码
-                    **self._idm_credential_status(),
+                    # 只暴露「是否已保存」与学号，绝不回传密码；多账号下读的是当前账号那一份。
+                    **self._idm_status_for_active(),
                 },
                 'logs': {
                     'network': gui.tail_log(gui.resolve_log_path(self._config, settings.log_file)),
@@ -316,13 +391,49 @@ class DesktopBridge(LocationProbe):
                 # Do not send raw OS/network exceptions across the JS bridge.
                 return {'ok': False, 'message': '操作未完成，请检查本机权限、配置和网络后重试。'}
 
+    def _account_action(self, action, payload):
+        """账号管理：新建 / 切换 / 重命名 / 删除。
+
+        第二阶段每个账号都有自己的控制器在后台跑，所以「切换」只是换界面在看哪个账号：
+        不再需要等打卡结束，也不再交接控制器 —— 正在进行的打卡留在后台跑完（或由
+        「取消当前操作」取消）。只有「删除正在打卡的那个账号」会被账号层拒绝。
+        界面上「删除」与后端一样要显式确认，前端弹窗只是第一道，这里是第二道。
+        """
+        if self._accounts is None:
+            raise RuntimeError('当前运行方式不支持多账号。')
+        if self._location_gate.locked():
+            raise RuntimeError('请等待定位检测完成后再管理账号。')
+        if action == 'account_add':
+            return self._after_account_change(self._accounts.add(payload.get('name')))
+        if action == 'account_switch':
+            return self._after_account_change(
+                self._accounts.switch(str(payload.get('id') or '')))
+        if action == 'account_rename':
+            return self._accounts.rename(str(payload.get('id') or ''), payload.get('name'))
+        if payload.get('confirmed') is not True:
+            raise RuntimeError('请先确认删除该账号及其在本机的全部数据。')
+        return self._after_account_change(
+            self._accounts.remove(str(payload.get('id') or '')))
+
+    def _after_account_change(self, message):
+        """换人之后：定位状态与通知去重键都跟人走，否则界面会沿用上一个账号的判定。"""
+        self._notice = None
+        try:
+            source = self._dorm.store.settings().location_source
+        except Exception:  # noqa: BLE001 - 新账号设置读不动时，定位状态回到默认展示
+            source = 'windows'
+        self._reset_location(source)
+        return message
+
     def _dispatch(self, action, payload):
         if action == 'update_check':
             return self._updates.check()
         if action == 'update_install':
-            if self._dorm.busy or self._location_gate.locked() or self._network_gate.locked():
+            if self._dorm_busy() or self._location_gate.locked() or self._network_gate.locked():
                 raise RuntimeError('请先停止本地后台检测，并等待当前网络、打卡或定位操作完成后，再确认安装更新。')
             return self._updates.install(payload.get('confirmed'), payload.get('version'))
+        if action in ('account_add', 'account_switch', 'account_rename', 'account_delete'):
+            return self._account_action(action, payload)
         if action == 'location_authorize':
             source = self._dorm.store.settings().location_source
             return self._start_location_probe(source=source,
@@ -372,8 +483,13 @@ class DesktopBridge(LocationProbe):
                 raise RuntimeError('打卡操作正在进行，请等待完成或取消当前操作。')
             return '操作已开始，请查看任务状态'
         if action == 'dorm_cancel':
-            self._dorm.cancel()
-            return '已请求取消；已发出的提交不能撤回，自动打卡设置不会改变。'
+            # 多账号：每个账号都有自己的控制器在跑，「取消当前操作」必须能取消所有账号里
+            # 正在进行的那一个，否则用户看着 A 的页面就取消不了 B 的操作。
+            if self._accounts is not None:
+                self._accounts.cancel_all()
+            else:
+                self._dorm.cancel()
+            return '已请求取消所有账号正在进行的操作；已发出的提交不能撤回，自动打卡设置不会改变。'
         if action == 'dorm_save':
             if self._dorm.busy or self._location_gate.locked():
                 raise RuntimeError('请等待当前打卡或定位检测完成后再保存设置。')
@@ -399,17 +515,17 @@ class DesktopBridge(LocationProbe):
             username = str(payload.get('idm_username') or '').strip()
             password = str(payload.get('idm_password') or '')
             try:
-                from idm_credentials import IdmCredentialStore, IdmCredentials  # noqa: PLC0415
+                from idm_credentials import IdmCredentials  # noqa: PLC0415
 
-                IdmCredentialStore().save(IdmCredentials(username=username, password=password).validate())
+                # 存进当前账号自己的档案目录：多账号下学号密码绝不能互相串。
+                self._active_idm_store().save(
+                    IdmCredentials(username=username, password=password).validate())
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from None
             return '统一认证凭据已加密保存，登录时将自动填写并识别验证码'
         if action == 'idm_credentials_clear':
             try:
-                from idm_credentials import IdmCredentialStore  # noqa: PLC0415
-
-                IdmCredentialStore().clear()
+                self._active_idm_store().clear()
             except Exception:  # noqa: BLE001
                 raise RuntimeError('统一认证凭据清除失败，请检查本机权限后重试') from None
             return '统一认证凭据已清除，登录将需要人工输入账号密码和验证码'
@@ -612,17 +728,37 @@ class DesktopBridge(LocationProbe):
                     self._state, self._message = 'stopped', '后台检测已停止'
             self._network_gate.release()
 
-    def _tick(self):
-        self._dorm.poll()
-        for result in self._dorm.drain():
+    def _collect_dorm(self):
+        """所有账号各跑一拍 + 通知。账号档案读不出来时安静跳过：错误由快照呈现，
+        而不是每秒把同一句话抛进托盘状态里。"""
+        if self._accounts is not None:
+            if self._accounts.error:
+                return
+            try:
+                events = self._accounts.poll()
+            except AccountError:
+                return
+        else:
+            try:
+                self._dorm.poll()
+                events = [('', result) for result in self._dorm.drain()]
+            except AccountError:
+                return
+        for label, result in events:
             # 文案也进去重键：状态没变但文案升级了（Engine._track_transient 在连续失败
             # 第 5 次会把"该去改什么"写进去）时必须再提醒一次，否则一晚 58 次失败
             # 只会弹第一条，人根本不知道要去动代理设置。
-            notice = (result.at[:10], result.task.key if result.task else '',
+            # 账号名同样进去重键：多账号下两个账号的失败文案可能一模一样，
+            # 少了这一项，第二个账号的问题会被当成重复通知吞掉。
+            notice = (label, result.at[:10], result.task.key if result.task else '',
                       result.state, result.message)
             if result.state in ('signed', 'login_required', 'location_required', 'uncertain', 'error', 'network_error') and notice != self._notice:
                 self._notice = notice
-                windows_notifications.show_toast(windows_notifications.build_dorm_toast(result.message))
+                windows_notifications.show_toast(windows_notifications.build_dorm_toast(
+                    f'{label}：{result.message}' if label else result.message))
+
+    def _tick(self):
+        self._collect_dorm()
         if self._agent:
             try:
                 snapshot = agent_ipc.read_snapshot(self._config.parent / 'runtime.json')
@@ -641,7 +777,14 @@ class DesktopBridge(LocationProbe):
         self._closed.set()
         self._stop.set()
         self._updates.close()
-        self._dorm.close()
+        close = self._accounts.close if self._accounts is not None else None
+        try:
+            if close is not None:
+                close()
+            else:
+                self._dorm.close()
+        except AccountError:
+            pass  # 档案层已经不可用，退出流程照样要走完
 
 
 class PreviewBridge(LocationProbe):
@@ -660,7 +803,20 @@ class PreviewBridge(LocationProbe):
                         'monitoring':False, 'busy':False, 'state':'stopped',
                         'message':'尚未检测，点击即可查看连接状态', 'checked':'', 'has_password':True},
             'dorm': {'state':'idle', 'message':'查询今日任务，开始今晚的安排', 'busy':False,
-                     'settings':dataclasses.asdict(Settings()), 'schedule':'自动打卡：关闭', 'task':None},
+                     'settings':dataclasses.asdict(Settings()), 'schedule':'自动打卡：关闭', 'task':None,
+                     # 真实 bridge 会补上这两项；演示里也让它们跟着账号走，界面文案才自洽。
+                     'has_idm_credentials':True, 'idm_username':'2026000000'},
+            'accounts': {'error':'', 'max':MAX_ACCOUNTS, 'active':'demo1', 'busy':False,
+                         'items':[{'id':'demo1', 'name':'演示账号一', 'active':True,
+                                   'has_idm_credentials':True, 'idm_username':'2026000000',
+                                   'missing':False, 'enabled':True, 'state':'signed',
+                                   'message':'今日打卡已完成，当天不再重复检查',
+                                   'busy':False, 'signed_today':True},
+                                  {'id':'demo2', 'name':'演示账号二', 'active':False,
+                                   'has_idm_credentials':False, 'idm_username':'',
+                                   'missing':False, 'enabled':False, 'state':'idle',
+                                   'message':'尚未查询今日任务', 'busy':False,
+                                   'signed_today':False}]},
             'simulation': {'point': {'latitude': 29.823693, 'longitude': 106.422310},
                            'points': dorm_points.add(
                                dorm_points.empty(), name='演示·宿舍楼下',
@@ -845,6 +1001,8 @@ class PreviewBridge(LocationProbe):
                 d.update(state='login_required', message='请重新登录学校账号', task=None)
                 d['settings']['enabled'] = False
                 d['schedule'] = '自动打卡：关闭'
+            elif action in ('account_add', 'account_switch', 'account_rename', 'account_delete'):
+                return self._preview_account(action, payload)
             elif action in ('hide', 'quit'):
                 self._window_action(action)
             elif action not in ('dorm_cancel', 'location_settings'):
@@ -852,6 +1010,59 @@ class PreviewBridge(LocationProbe):
             return {'ok':True, 'message':'演示操作完成，未访问学校服务或修改真实设置'}
         except (ValueError, TypeError):
             return {'ok':False, 'message':'请检查账号、时间和间隔，结束时间须晚于开始时间。'}
+
+    def _preview_account(self, action, payload):
+        """演示账号：只改内存里这一份快照，不碰任何真实档案、凭据或目录。"""
+        accounts = self._data['accounts']
+        items = accounts['items']
+        active = next((item for item in items if item['active']), None)
+        if action == 'account_add':
+            if len(items) >= accounts['max']:
+                return {'ok': False, 'message': f"演示：最多 {accounts['max']} 个账号。"}
+            clean = dorm_points.clean_name(payload.get('name')) or f'演示账号{len(items)+1}'
+            for item in items:
+                item['active'] = False
+            items.append({'id': f'demo{len(items)+1}', 'name': clean, 'active': True,
+                          'has_idm_credentials': False, 'idm_username': '', 'missing': False,
+                          'enabled': False, 'state': 'idle', 'message': '尚未查询今日任务',
+                          'busy': False, 'signed_today': False})
+            accounts['active'] = items[-1]['id']
+            return {'ok': True, 'message': f'演示：已新建账号「{clean}」，未写入任何本机数据。'}
+        if action == 'account_switch':
+            target = next((item for item in items if item['id'] == payload.get('id')), None)
+            if target is None:
+                return {'ok': False, 'message': '演示：找不到这个账号。'}
+            for item in items:
+                item['active'] = item is target
+            accounts['active'] = target['id']
+            # 演示也要自洽：学号与「已保存凭据」跟着换人，否则切换后界面还在说上一个账号。
+            self._data['dorm']['has_idm_credentials'] = target['has_idm_credentials']
+            self._data['dorm']['idm_username'] = target['idm_username']
+            return {'ok': True, 'message': f"演示：已切换到账号「{target['name']}」。"
+                                           '未读取或写入真实档案。'}
+        if action == 'account_rename':
+            target = next((item for item in items if item['id'] == payload.get('id')), None)
+            if target is None:
+                return {'ok': False, 'message': '演示：找不到这个账号。'}
+            clean = dorm_points.clean_name(payload.get('name'))
+            if not clean:
+                return {'ok': False, 'message': '演示：账号名称不能为空。'}
+            target['name'] = clean
+            return {'ok': True, 'message': f'演示：账号已重命名为「{clean}」。'}
+        if payload.get('confirmed') is not True:
+            return {'ok': False, 'message': '演示：请先确认删除该账号。'}
+        if len(items) <= 1:
+            return {'ok': False, 'message': '演示：至少保留一个账号。'}
+        target = next((item for item in items if item['id'] == payload.get('id')), None)
+        if target is None:
+            return {'ok': False, 'message': '演示：找不到这个账号。'}
+        remaining = [item for item in items if item is not target]
+        if not any(item['active'] for item in remaining):
+            remaining[0]['active'] = True          # 删掉的是活动账号：顶上一个，且只能有一个
+        items.clear()
+        items.extend(remaining)
+        accounts['active'] = next(item['id'] for item in items if item['active'])
+        return {'ok': True, 'message': f"演示：已删除账号「{target['name']}」，未删除任何真实数据。"}
 
     def _tick(self):
         pass

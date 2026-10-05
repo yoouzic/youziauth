@@ -30,6 +30,10 @@ class LoginRenewalBreaker(unittest.TestCase):
         self.store = Store(Path(directory.name),
                            protector=Mock(protect=lambda b: b[::-1], unprotect=lambda b: b[::-1]))
         self.store.save_settings(Settings(enabled=True))
+        # 破的是「令牌失效、会话 cookie 还在」这条真实路径：没有可恢复会话时，
+        # 续期注定失败，控制器会先拦下来且不记账（见 DormController._renewal_blocker）。
+        self.store.save_browser_session('stale-token', 'student', [dict(
+            name='SSO', value='cookie', domain='idm.swu.edu.cn', path='/', expires=-1)])
         self.controller = dorm_panel.DormController(self.store)
         self.addCleanup(self.controller.close)
         self.controller.engine.clock = lambda: dt.datetime(2026, 9, 25, 21, 30, tzinfo=SHANGHAI)
@@ -40,11 +44,23 @@ class LoginRenewalBreaker(unittest.TestCase):
             return_value=Result('login_required', '登录已失效，请重新登录'))
         self.renewals = []
 
-    def renew(self, action='automatic'):
-        """跑一次并绕开 300 秒节流；返回本次是否真的发起了自动续期登录。"""
+    def renew(self, action='automatic', failure='network_error'):
+        """跑一次并绕开 300 秒节流；返回本次是否真的发起了自动续期登录。
+
+        替身模拟**瞬时失败**（2026-09-24 那次连续 2.5 小时的 TLS 失败）：登录没成功，
+        所以会话 cookie 还在，下一拍仍可再试 —— 这正是「每账号每天最多 3 次」要挡住的循环。
+        `failure=None` 表示这次登录成功（会换上新的会话）。
+        """
         self.controller._renew_at = 0.0
-        with patch.object(dorm_panel, 'login',
-                          side_effect=lambda *a, **k: self.renewals.append(1)):
+
+        def fake_login(store, api, cancel, *, interactive, idm_store=None):
+            self.renewals.append(1)
+            if failure:
+                raise CheckinError(failure, '暂时失败')
+            store.save_browser_session('renewed-token', 'student', [dict(
+                name='SSO', value='cookie', domain='idm.swu.edu.cn', path='/', expires=-1)])
+
+        with patch.object(dorm_panel, 'login', side_effect=fake_login):
             return self.controller._run(action)
 
     def test_renewal_is_capped_per_day(self):
@@ -91,10 +107,12 @@ class LoginRenewalBreaker(unittest.TestCase):
         self.assertEqual(calls, [], '重启后仍应处于熔断状态')
 
     def test_successful_renewal_path_still_runs(self):
-        """没到上限时行为不变：照常续期并重新判定。"""
-        result = self.renew()
+        """没到上限时行为不变：照常续期，并用换来的新会话重新判定。"""
+        self.controller.engine.run = Mock(return_value=Result('signed', '服务器已确认今日任务完成'))
+        result = self.renew(failure=None)
         self.assertEqual(len(self.renewals), 1)
-        self.assertIsNotNone(result)
+        self.assertEqual(result.state, 'signed')
+        self.assertNotEqual(self.store.token(), '')
 
     def test_unreadable_counter_file_does_not_break_login(self):
         (self.store.root / 'daily.json').write_text('{', encoding='utf-8')
@@ -116,6 +134,8 @@ class AutoLoginOnlyInsideWindow(unittest.TestCase):
         self.store = Store(Path(directory.name),
                            protector=Mock(protect=lambda b: b[::-1], unprotect=lambda b: b[::-1]))
         self.store.save_settings(Settings(enabled=True, start='21:00', end='23:15'))
+        self.store.save_browser_session('stale-token', 'student', [dict(
+            name='SSO', value='cookie', domain='idm.swu.edu.cn', path='/', expires=-1)])
         self.controller = dorm_panel.DormController(self.store)
         self.addCleanup(self.controller.close)
         self.controller.engine.tick = Mock(

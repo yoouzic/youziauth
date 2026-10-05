@@ -574,8 +574,14 @@ class CampusAuthGui:
         self.background_label = None
         self.panel_icon_source_image = None
         self.panel_icon_image = None
+        # 多账号：账号层持有「当前活动账号」的控制器。注入 dorm_store 的旧调用点
+        # （预览与自检）保持单控制器行为。账号档案读不出来时不在这里抛异常——
+        # 窗口必须能打开，把原因显示出来，并且所有打卡操作 fail-closed。
+        from dorm_accounts import DormAccounts
         from dorm_panel import DormController
-        self.dorm_controller = DormController(dorm_store)
+        self.dorm_accounts = None if dorm_store is not None else DormAccounts()
+        self.dorm_controller = (DormController(dorm_store) if dorm_store is not None
+                                else self.dorm_accounts.controller_or_none())
         self.dorm_panel = None
         self._dorm_notice = None
 
@@ -1258,8 +1264,10 @@ class CampusAuthGui:
         self.username_entry.focus_set()
 
     def quit_application(self) -> None:
-        if hasattr(self, "dorm_controller"):
+        if hasattr(self, "dorm_controller") and self.dorm_controller is not None:
             self.dorm_controller.close()
+        if getattr(self, "dorm_accounts", None) is not None:
+            self.dorm_accounts.close()
         self.stop_event.set()
         if self.tray_icon is not None:
             self.tray_icon.stop()
@@ -1271,21 +1279,36 @@ class CampusAuthGui:
 
     def open_dorm(self) -> None:
         from dorm_panel import DormPanel
+        if self.dorm_controller is None:
+            self._set_status("账号档案无法读取，寝室打卡暂不可用", windows_tray.TrayStatus.ERROR)
+            return
         if self.dorm_panel is None or not self.dorm_panel.window.winfo_exists():
             self.dorm_panel = DormPanel(self.root, self.dorm_controller)
         self.dorm_panel.show()
 
     def _poll_dorm(self) -> None:
-        self.dorm_controller.poll()
-        for result in self.dorm_controller.drain():
+        if self.dorm_accounts is not None:
+            # 多账号：调度必须覆盖所有账号，不能只跑面板正在显示的那一个。
+            self.dorm_controller = self.dorm_accounts.controller_or_none()
+            events = self.dorm_accounts.poll()
+        else:
+            if self.dorm_controller is None:
+                # 账号档案读不出来：不静默换一个默认账号，也不刷屏，只把调度继续挂着。
+                self.root.after(1000, self._poll_dorm)
+                return
+            self.dorm_controller.poll()
+            events = [('', result) for result in self.dorm_controller.drain()]
+        for label, result in events:
             if self.dorm_panel is not None and self.dorm_panel.window.winfo_exists():
                 self.dorm_panel.update(result)
-            notice = (result.at[:10] or __import__('datetime').date.today().isoformat(),
+            # 账号名进提醒去重键：多账号下两个账号的失败文案可能一模一样。
+            notice = (label, result.at[:10] or dt.date.today().isoformat(),
                       result.task.key if result.task else '', result.state)
             if result.state in ('signed', 'login_required', 'location_required', 'uncertain', 'error', 'network_error'):
                 if notice != self._dorm_notice:
                     self._dorm_notice = notice
-                    self._show_notification(windows_notifications.build_dorm_toast(result.message))
+                    self._show_notification(windows_notifications.build_dorm_toast(
+                        f'{label}：{result.message}' if label else result.message))
         if self.dorm_panel is not None and self.dorm_panel.window.winfo_exists():
             self.dorm_panel.refresh()
         self.root.after(1000, self._poll_dorm)

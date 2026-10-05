@@ -11,7 +11,7 @@ import time
 from dorm_api import SwuApi
 from dorm_checkin import CheckinError, Engine, Result, Settings, Store, now, parse_time
 from dorm_location import locate
-from dorm_login import login
+from dorm_login import LOGIN_GATE, login, school_cookies
 
 # 每天最多自动续期登录几次。超过就停手，等人工登录。
 #
@@ -19,14 +19,29 @@ from dorm_login import login
 # 每次都会走自动续期登录（拉起一个浏览器）。2026-09-24 实测过一次后果：
 # 21:02–23:27 连续 2.5 小时、每 5 分钟一次、成功率 0，还伴随大量 Windows 登录失败事件
 # 并导致本机账户被锁定。**自动行为必须有硬上限**，不能只靠"应该会成功"。
+#
+# 这是**每个账号**的上限；多账号还有两层：dorm_login.LoginGate（同时只跑一条登录链路）
+# 与 dorm_accounts.MachineLoginBudget（整机每天的自动登录总数）。
 MAX_DAILY_LOGIN_RENEWALS = 3
 
 
 class DormController:
-    def __init__(self, store=None, engine=None):
+    def __init__(self, store=None, engine=None, idm_store=None, login_gate=None,
+                 stagger_seconds=0, login_budget=None):
         self.store = store or Store()
         self.api = SwuApi()
         self.engine = engine or Engine(self.store, self.api, self._locate)
+        # 本账号的统一认证凭据存储。多账号下由 DormAccounts 注入「该账号自己的」存储；
+        # 没有注入时退回全局默认目录（旧工具、自检与测试用）。
+        self.idm_store = idm_store
+        # 机器级的登录闸：默认就是进程级单例，所以即使调用方什么都不传，
+        # 「同一台电脑同时只跑一条学校登录链路」这条也成立。
+        self.login_gate = login_gate if login_gate is not None else LOGIN_GATE
+        # 整机每天的自动登录预算（多账号时由 DormAccounts 注入；单账号为 None）。
+        self.login_budget = login_budget
+        # 错峰：本账号当天第一次自动检查要等窗口开始 + 这个偏移量。
+        # 多账号共用一个出口，同一秒一起打学校接口没有任何好处。
+        self.stagger_seconds = max(0, int(stagger_seconds or 0))
         self.events = queue.Queue()
         self.busy = False
         self.closed = False
@@ -34,6 +49,14 @@ class DormController:
         self._poll_at = 0.0
         self._renew_at = 0.0
         self.latest = Result('idle', '尚未查询今日任务')
+
+    def credential_store(self):
+        """本账号的统一认证凭据存储。"""
+        if self.idm_store is not None:
+            return self.idm_store
+        from idm_credentials import IdmCredentialStore  # noqa: PLC0415
+
+        return IdmCredentialStore()
 
     def _locate(self):
         return locate(self.store.settings().location_source, self.store.root / 'location-sample.json')
@@ -50,7 +73,13 @@ class DormController:
         def work():
             try:
                 if action == 'login':
-                    login(self.store, self.api, self.engine.cancel)
+                    if not self.login_gate.acquire():
+                        # 多账号：别的账号正在跑登录链路。人工操作不排队，直接说清楚。
+                        raise CheckinError('busy', '另一个账号正在登录，请等它结束后再试')
+                    try:
+                        login(self.store, self.api, self.engine.cancel, idm_store=self.idm_store)
+                    finally:
+                        self.login_gate.release()
                     self._renew_at = 0.0
                     result = Result('logged_in', '登录成功，凭据已在本机加密保存')
                 elif action == 'logout':
@@ -117,6 +146,13 @@ class DormController:
         # 时段外一律不偷偷开浏览器，直接告诉人手动登录。
         if not self._inside_check_window():
             return Result('login_required', self._outside_window_message())
+        # ★ 无人值守这条路走不通时（既没会话又没凭据）先说清楚：那一趟注定失败，
+        #   却照样会记账、花整机预算。2026-10-05 实测：一个从没登录过的账号 5 分钟内
+        #   空转两次，吃掉自己 3 次额度里的 2 次和整机 6 次里的 2 次，界面还只给一句
+        #   含糊的「没有可恢复的学校会话」。
+        blocker = self._unattended_login_blocker()
+        if blocker:
+            return self._skip_login(blocker, result)
         # 熔断：每天自动续期登录有硬上限。到顶就不再拉起浏览器，直接告诉人去手动登录。
         # 只对自动打卡生效 —— 人工点「登录 / 重新登录」永远不受限制。
         today = self.engine.clock().date().isoformat()
@@ -125,24 +161,109 @@ class DormController:
         except Exception:  # noqa: BLE001
             used = 0
         if automatic and used >= MAX_DAILY_LOGIN_RENEWALS:
-            return Result('login_required',
-                          f'今天已自动尝试登录 {used} 次仍未成功，已停止自动重试；'
-                          '请点「学校登录 / 重新登录」手动完成，或检查已保存的凭据')
+            return self._skip_login(
+                f'今天已自动尝试登录 {used} 次仍未成功，已停止自动重试；'
+                '请点「学校登录 / 重新登录」手动完成，或检查已保存的凭据', result)
+        # 整机预算：多账号共用一个出口，一台电脑每天自动拉起的浏览器总数必须有上限。
+        # 先查预算再记账，最后才过登录闸 —— 顺序很关键：**被挡下的那一拍不算一次尝试**，
+        # 否则额度会被排队白白烧光，真该重试的时候反而没机会了。
+        if automatic and self.login_budget is not None:
+            reason = self.login_budget.check(today)
+            if reason:
+                return self._skip_login(reason, result)
+        if not self.login_gate.acquire():
+            # 别的账号正在登录：不排队（一次登录最长 5 分钟，等在闸后既不会更快，
+            # 还会把当天的额度耗在等待上），这一拍直接跳过，_renew_at 到点自然会再试。
+            return Result('waiting', '等待其他账号完成登录')
         try:
-            self.store.bump_daily_attempts(today, 'login_renewal')
-        except Exception:  # noqa: BLE001
-            pass                      # 记不上也照常尝试，只是上限保护会失效一次
-        try:
-            login(self.store, self.api, self.engine.cancel, interactive=False)
-        except CheckinError as exc:
-            result = Result(exc.state, str(exc), result.task, now().isoformat(timespec='seconds'))
-            self.store.record(result)
-            return result
+            if automatic and self.login_budget is not None:
+                self.login_budget.spend(today)
+            try:
+                self.store.bump_daily_attempts(today, 'login_renewal')
+            except Exception:  # noqa: BLE001
+                pass                  # 记不上也照常尝试，只是上限保护会失效一次
+            try:
+                login(self.store, self.api, self.engine.cancel, interactive=False,
+                      idm_store=self.idm_store)
+            except CheckinError as exc:
+                result = Result(exc.state, str(exc), result.task, now().isoformat(timespec='seconds'))
+                self.store.record(result)
+                return result
+        finally:
+            self.login_gate.release()
         # A known task may already have been submitted; renewal must never replay that write.
         result = self.engine.run(automatic=automatic, submit=(automatic or action == 'submit') and result.task is None)
         if result.state == 'login_required':
             self.store.clear_browser_session()
         return result
+
+    def _skip_login(self, message, result):
+        """这一拍不动登录：把原因也写进状态与历史，再报给上层。
+
+        为什么不只是 return：history.log / status.json 是事后唯一的现场记录
+        （2026-10-05 实测：界面说「已停止自动重试」，磁盘上却只有引擎那句
+        「请先登录统一身份认证」，看不出到底为什么停）。连续同一条会被 history 折叠，
+        所以每 5 分钟重复一次也不会把记录刷满。
+        """
+        skipped = Result('login_required', message, result.task, now().isoformat(timespec='seconds'))
+        try:
+            self.store.record(skipped)
+        except Exception:  # noqa: BLE001 - 写不进记录也不能影响这一拍的结论
+            pass
+        return skipped
+
+    def _unattended_login_blocker(self):
+        """无人值守登录这条路走不走得通；走不通就返回一句「该让人做什么」的原因。
+
+        走得通的有两种（用户 2026-10-05 明确选择允许第二种）：
+          * 手上还有没过期的学校 cookie —— 续期，最省事也最稳；
+          * 没有会话但保存了统一认证凭据 —— headless 走完整登录流程
+            （自动填学号密码 + 本地模型识别验证码），仍然只在时段内、受同一套
+            登录闸与每天上限约束。
+        两种都不成立时必须先拦下来：那一趟注定失败，却照样会记账、花整机预算
+        （2026-10-05 实测：一个从没登录过的账号空转两次，吃掉自己 3 次额度里的 2 次
+        和整机 6 次里的 2 次，界面还只给一句含糊的「没有可恢复的学校会话」）。
+        这里只读本机状态，不碰网络、不开浏览器。
+        """
+        try:
+            token = self.store.token()
+            session = self.store.browser_session(token) if token else None
+        except CheckinError:
+            return '登录凭据无法解密：请点「学校登录 / 重新登录」重新登录一次'
+        if session and school_cookies(session.get('cookies') or []):
+            return ''
+        if self._has_idm_credentials():
+            return ''
+        if token:
+            return ('学校会话已过期，也没有可用的统一认证凭据：请点「学校登录 / 重新登录」重新登录一次，'
+                    '或先在面板里保存该账号的统一认证凭据')
+        return ('这个账号还没有登录过，也没有保存统一认证凭据：请点「学校登录 / 重新登录」完成一次登录，'
+                '或先在面板里保存该账号的统一认证凭据')
+
+    def _has_idm_credentials(self):
+        """本账号有没有可用的统一认证凭据。读不出来就当没有（fail-closed）。"""
+        try:
+            store = self.credential_store()
+            return bool(store.exists() and store.load())
+        except Exception:  # noqa: BLE001 - 凭据读不出来只影响「能不能无人值守」，不能影响打卡本身
+            return False
+
+    def _stagger_ready(self, settings):
+        """错峰：本账号当天第一次自动检查要等到「窗口开始 + 自己的偏移量」。
+
+        偏移量由 DormAccounts 按账号在清单里的顺序分配（0、90、180… 秒）。此时段本身
+        仍由 Engine 判定，这里只是把多账号的**第一拍**错开，避免同一秒一起打学校接口。
+        时段读不动时返回 True：那是 Engine 该 fail-closed 的事，不在这里替它做决定。
+        """
+        if not self.stagger_seconds:
+            return True
+        try:
+            start = parse_time(settings.start)
+        except ValueError:
+            return True
+        current = self.engine.clock()
+        due = dt.datetime.combine(current.date(), start) + dt.timedelta(seconds=self.stagger_seconds)
+        return current.time() >= due.time()      # datetime.time() 不带 tzinfo，两边同为本地时刻
 
     def poll(self):
         if self.closed or time.monotonic() < self._poll_at:
@@ -150,7 +271,7 @@ class DormController:
         self._poll_at = time.monotonic() + 5
         try:
             settings = self.store.settings()
-            if settings.enabled:
+            if settings.enabled and self._stagger_ready(settings):
                 self.start('automatic')
         except Exception:
             if self.latest.state != 'error':
@@ -319,8 +440,7 @@ class DormPanel:
     def refresh_idm_status(self):
         """显示统一认证凭据的存储状态（不显示密码本身）。"""
         try:
-            from idm_credentials import IdmCredentialStore
-            store = IdmCredentialStore()
+            store = self.controller.credential_store()
             if not store.exists():
                 self.idm_status.set('未保存统一认证凭据：每次登录需人工输入账号密码和验证码。')
                 self.idm_clear.state(['disabled'])
@@ -338,10 +458,10 @@ class DormPanel:
     def save_idm_credentials(self):
         from tkinter import messagebox
         try:
-            from idm_credentials import IdmCredentialStore, IdmCredentials
+            from idm_credentials import IdmCredentials
             creds = IdmCredentials(username=self.idm_user.get().strip(),
                                    password=self.idm_pass.get()).validate()
-            IdmCredentialStore().save(creds)
+            self.controller.credential_store().save(creds)
         except ValueError as exc:
             messagebox.showerror('无法保存', str(exc), parent=self.window)
             return
@@ -360,8 +480,7 @@ class DormPanel:
                                    parent=self.window):
             return
         try:
-            from idm_credentials import IdmCredentialStore
-            IdmCredentialStore().clear()
+            self.controller.credential_store().clear()
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror('无法清除', str(exc), parent=self.window)
             return

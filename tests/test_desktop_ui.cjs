@@ -8,6 +8,14 @@ const path=require('node:path');
 function updateFixture(overrides={}){
   return {state:'idle',current_version:'1.4.4',latest_version:'',progress:0,downloaded_bytes:0,total_bytes:0,checked:'',message:'等待后台检查更新。',busy:false,...overrides};
 }
+function accountsFixture(overrides={}){
+  return {max:5,active:'a1',busy:false,error:'',items:[
+    {id:'a1',name:'账号 1',active:true,has_idm_credentials:true,idm_username:'2023123456',missing:false,
+     enabled:true,state:'waiting',message:'等待学校时段',busy:false,signed_today:false},
+    {id:'a2',name:'账号 2',active:false,has_idm_credentials:false,idm_username:'',missing:false,
+     enabled:false,state:'no_task',message:'今天暂无任务',busy:false,signed_today:false}],
+    ...overrides};
+}
 function stubContext(){
   // The drawing path only issues canvas calls; a recorder-free stub lets the map tests run it.
   return {clearRect(){},fillRect(){},save(){},restore(){},beginPath(){},moveTo(){},lineTo(){},
@@ -54,6 +62,11 @@ function harness(source='windows',extras={}){
   if(canvas&&extras.canvasRect)canvas.getBoundingClientRect=()=>extras.canvasRect;
   const stop=actions.find(button=>button.dataset.action==='network_stop');
   const data={preview:true,update:updateFixture(),location:{state:'idle',message:'尚未检测',accuracy:null,checked:'',busy:false},network:{username:'saved',interval:60,startup:false,monitoring:true,busy:false,state:'online',message:'online',checked:'',has_password:true},dorm:{state:'idle',message:'pending',busy:false,task:null,settings:{enabled:false,start:'21:00',end:'23:30',interval:300,location_source:source},schedule:'off'},logs:{network:'',dorm:''}};
+  // 老快照没有账号层；accounts:false 就是那种机器，别的 extras 只覆盖清单里的字段。
+  if(extras.accounts!==false)data.accounts={...accountsFixture(),...(extras.accounts||{})};
+  // 每个账号在 state.dorm 里各有一份设置：切换后整份内容跟着换，测试靠这个差异证明表单真的换过来了。
+  const dormSettings={a1:{...data.dorm.settings},
+    a2:{enabled:true,start:'22:00',end:'23:00',interval:600,location_source:source}};
   const calls=[];
   const map={ok:true,point:{latitude:29.823693,longitude:106.422310,accuracy:100,source:'MAP_PICK',picked:true},
     reference:{latitude:29.823940,longitude:106.422470,address:'示例宿舍',radius_m:800},
@@ -104,6 +117,35 @@ function harness(source='windows',extras={}){
         if(chosen)map.point={latitude:chosen.latitude,longitude:chosen.longitude,accuracy:100,
                              source:chosen.source,picked:true};
       }
+    }
+    if(action==='account_add'){
+      const items=data.accounts.items,id='a'+(items.length+1);
+      items.forEach(item=>{item.active=false;});
+      items.push({id,name:payload.name||`账号 ${items.length+1}`,active:true,
+                  has_idm_credentials:false,idm_username:'',missing:false});
+      data.accounts.active=id;
+      data.dorm.settings={enabled:false,start:'21:00',end:'23:30',interval:300,
+                          location_source:data.dorm.settings.location_source};
+    }
+    if(action==='account_switch'){
+      const target=data.accounts.items.find(item=>item.id===payload.id);
+      if(!target)return {ok:false,message:'找不到这个账号，请刷新后重试。'};
+      if(target.missing)return {ok:false,message:`账号「${target.name}」的本机档案目录不存在，无法切换。`};
+      data.accounts.items.forEach(item=>{item.active=item.id===payload.id;});
+      data.accounts.active=payload.id;
+      data.dorm.settings={...(dormSettings[payload.id]||dormSettings.a1)};
+    }
+    if(action==='account_rename'){
+      if(!payload.name)return {ok:false,message:'请填写账号名称，最多 24 个字。'};
+      const clean=payload.name.trim().slice(0,24);
+      data.accounts.items.forEach(item=>{if(item.id===payload.id)item.name=clean;});
+    }
+    if(action==='account_delete'){
+      if(payload.confirmed!==true)return {ok:false,message:'删除账号需要确认。'};
+      data.accounts.items=data.accounts.items.filter(item=>item.id!==payload.id);
+      if(data.accounts.active===payload.id)data.accounts.active=data.accounts.items[0]?.id||'';
+      data.accounts.items.forEach(item=>{item.active=item.id===data.accounts.active;});
+      if(data.accounts.active)data.dorm.settings={...(dormSettings[data.accounts.active]||dormSettings.a1)};
     }
     return {ok:true,message:'操作完成'};
   },simulation_map:async()=>structuredClone(map)};
@@ -1361,4 +1403,275 @@ test('closing the map or leaving simulation mode hides the picker',async()=>{
   await h.refresh();
   assert.equal(h.el('map-dialog').open,false);
   assert.equal(h.el('open-map-picker').hidden,true);
+});
+
+/* 打卡账号切换器 -------------------------------------------------------------------------
+   所有已启用自动打卡的账号都在各自时段内打卡，state.dorm 仍然只描述活动账号，所以切换后整页
+   跟着换；账号栏要能从每个账号自己的字段看出它今天的状态。 */
+const ACCOUNT_CONTROLS=['dorm-account','account-name','account-add','account-rename','account-delete'];
+function pickAccount(h,id){h.el('dorm-account').value=id;h.el('dorm-account').listeners.change();}
+
+test('the account bar lists every account with its student id and selects the active one',async()=>{
+  const h=harness();await settle();
+  const select=h.el('dorm-account');
+  assert.equal(h.el('account-bar').hidden,false);
+  assert.deepEqual(select.options.map(option=>option.value),['a1','a2']);
+  assert.deepEqual(select.options.map(option=>option.textContent),
+                   ['账号 1 · 2023123456 · 等待时段','账号 2 · 未开启自动打卡']);
+  assert.equal(select.value,'a1');
+  assert.equal(select.disabled,false);
+  assert.equal(h.el('account-name').value,'账号 1','名字框回填的是活动账号');
+  assert.equal(h.el('account-state').textContent,'自动打卡：1 个账号已开启 · 0 个今日已完成');
+  for(const id of ACCOUNT_CONTROLS)assert.equal(h.el(id).disabled,false);
+});
+
+test('a missing profile is marked and a refused switch leaves the active account selected',async()=>{
+  const h=harness('windows',{accounts:{items:[
+    {id:'a1',name:'账号 1',active:true,has_idm_credentials:true,idm_username:'2023123456',missing:false},
+    {id:'a2',name:'账号 2',active:false,has_idm_credentials:false,idm_username:'',missing:true}]}});
+  await settle();
+  assert.match(h.el('dorm-account').options[1].textContent,/档案缺失/);
+  pickAccount(h,'a2');await settle();
+  assert.equal(h.el('confirm-dialog').open,false,'没有未保存的改动就不必再确认一次');
+  assert.deepEqual(h.calls.map(call=>call.action),['account_switch']);
+  assert.equal(h.calls[0].payload.id,'a2');
+  assert.equal(h.el('dorm-account').value,'a1','后端拒绝后下拉框必须回到活动账号');
+  assert.match(h.el('toast').textContent,/档案目录不存在/);
+});
+
+test('choosing the account that is already active does nothing at all',async()=>{
+  const h=harness();await settle();
+  h.el('auto-interval').value='900';h.el('dorm-form').listeners.input();
+  pickAccount(h,'a1');
+  assert.equal(h.el('confirm-dialog').open,false);
+  assert.equal(h.calls.length,0);
+  assert.equal(h.el('dorm-save-state').textContent,'有未保存的修改','未保存的改动不该被这个空操作丢掉');
+});
+
+test('switching with unsaved dorm edits asks first, then fills the form from the new account',async()=>{
+  const h=harness();await settle();
+  h.el('auto-interval').value='900';h.el('dorm-form').listeners.input();
+  pickAccount(h,'a2');
+  assert.equal(h.el('confirm-dialog').open,true);
+  assert.equal(h.el('confirm-title').textContent,'切换账号？');
+  assert.match(h.el('confirm-text').textContent,/未保存.*放弃/);
+  assert.equal(h.calls.length,0,'确认之前不能切换');
+  assert.equal(h.el('dorm-account').value,'a1','还没切换成功，下拉框先回到活动账号');
+  h.el('confirm-ok').onclick();await settle();await settle();
+  assert.deepEqual(h.calls.map(call=>call.action),['account_switch']);
+  assert.equal(h.calls[0].payload.id,'a2');
+  assert.equal(h.el('dorm-account').value,'a2');
+  assert.equal(String(h.el('auto-interval').value),'600','新账号的设置要灌进表单');
+  assert.equal(h.el('auto-enabled').checked,true);
+  assert.equal(h.el('location-source').value,'windows');
+  assert.equal(h.el('dorm-save-state').textContent,'设置已同步');
+});
+
+test('switching accounts closes the map picker and restores the new account location source',async()=>{
+  const h=harness('simulation');await settle();
+  await openMap(h);
+  assert.equal(h.el('map-dialog').open,true);
+  pickSource(h,'windows');
+  pickAccount(h,'a2');
+  assert.equal(h.el('confirm-dialog').open,true);
+  h.el('confirm-ok').onclick();await settle();await settle();
+  assert.equal(h.el('map-dialog').open,false,'旧账号的选点面板不能留给新账号');
+  assert.equal(h.el('location-source').value,'simulation','新账号保存的定位来源灌回表单');
+  assert.equal(h.el('dorm-save-state').textContent,'设置已同步');
+});
+
+test('a switch confirmed after the state moved on is refused instead of switching to a stale account',async()=>{
+  const h=harness();await settle();
+  h.el('auto-interval').value='900';h.el('dorm-form').listeners.input();
+  pickAccount(h,'a2');
+  assert.equal(h.el('confirm-dialog').open,true);
+  h.stop.listeners.click();await settle();          // 别的操作先落地，确认框里的选择已经过期
+  h.el('confirm-ok').onclick();await settle();await settle();
+  assert.deepEqual(h.calls.map(call=>call.action),['network_stop']);
+  assert.equal(h.el('dorm-account').value,'a1');
+  assert.match(h.el('toast').textContent,/重新选择/);
+});
+
+for(const name of ['','实验室二号']){
+  test(`a new account takes the typed name "${name}" and empties the box for the next one`,async()=>{
+    const h=harness();await settle();
+    h.el('account-name').value=name;
+    h.el('account-add').onclick();await settle();await settle();
+    assert.deepEqual(h.calls.map(call=>call.action),['account_add']);
+    assert.equal(h.calls[0].payload.name,name,'输入框里的名字原样交给后端，留空由后端自动命名');
+    assert.equal(h.el('account-name').value,'');
+    assert.deepEqual(h.el('dorm-account').options.map(option=>option.value),['a1','a2','a3']);
+    assert.equal(h.el('dorm-account').value,'a3','新建的账号成为活动账号');
+    assert.equal(String(h.el('auto-interval').value),'300','新账号的默认设置灌进表单');
+    assert.equal(h.el('dorm-save-state').textContent,'设置已同步');
+  });
+}
+
+test('renaming an account needs a name and then refills the box from the stored one',async()=>{
+  const h=harness();await settle();
+  h.el('account-name').value='';
+  h.el('account-rename').onclick();await settle();
+  assert.equal(h.calls.length,0,'空名字不发请求');
+  assert.equal(h.el('toast').textContent,'请填写账号名称，最多 24 个字。');
+  h.el('account-name').value='  杏园三舍  ';
+  h.el('account-rename').onclick();await settle();await settle();
+  const rename=h.calls.find(call=>call.action==='account_rename');
+  assert.equal(rename.payload.id,'a1','重命名的是当前活动账号');
+  assert.equal(rename.payload.name,'  杏园三舍  ','名字原样交给后端清洗');
+  assert.equal(h.el('account-name').value,'杏园三舍','回填的是后端清洗后的名字');
+  assert.equal(h.el('dorm-account').options[0].textContent,'杏园三舍 · 2023123456 · 等待时段');
+  assert.equal(h.el('dorm-account').options[0].value,'a1');
+});
+
+test('deleting an account names it, asks first and confirms it to the backend',async()=>{
+  const h=harness();await settle();
+  h.el('account-delete').onclick();
+  assert.equal(h.el('confirm-title').textContent,'删除账号「账号 1」？');
+  assert.match(h.el('confirm-text').textContent,/已保存的打卡点/);
+  assert.match(h.el('confirm-text').textContent,/无法撤销/);
+  assert.equal(h.calls.length,0,'确认之前不能删除');
+  h.el('confirm-cancel').onclick();await settle();
+  assert.equal(h.calls.length,0);
+  assert.deepEqual(h.el('dorm-account').options.map(option=>option.value),['a1','a2'],'取消后账号还在');
+  h.el('account-delete').onclick();h.el('confirm-ok').onclick();await settle();await settle();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls)),
+                   [{action:'account_delete',payload:{id:'a1',confirmed:true}}]);
+  assert.deepEqual(h.el('dorm-account').options.map(option=>option.value),['a2']);
+  assert.equal(h.el('dorm-account').value,'a2','剩下的账号成为活动账号');
+  assert.equal(h.el('account-name').value,'账号 2');
+});
+
+test('a snapshot without an account layer hides the bar and leaves the rest of the page working',async()=>{
+  const h=harness('windows',{accounts:false});await settle();
+  assert.equal(h.el('account-bar').hidden,true,'老后端没有账号层，整条栏不出现');
+  assert.equal(h.el('dorm-account').options.length,0);
+  h.data.dorm.state='ready';await h.refresh();
+  h.el('authorize-location').listeners.click();await settle();
+  await saveSchedule(h);
+  assert.deepEqual(h.calls.map(call=>call.action),['location_authorize','dorm_save']);
+  assert.equal(h.el('submit-dorm').disabled,false,'打卡按钮照常可用');
+});
+
+test('an unreadable account list shows its own message and disables every account control',async()=>{
+  const h=harness('windows',{accounts:{error:'账号清单读取失败：accounts.json 已损坏。',items:[]}});await settle();
+  assert.equal(h.el('account-bar').hidden,false,'读不出来也要说明原因，不能静默消失');
+  assert.equal(h.el('account-state').textContent,'账号清单读取失败：accounts.json 已损坏。');
+  for(const id of ACCOUNT_CONTROLS)assert.equal(h.el(id).disabled,true,id+' 在清单读不出来时必须禁用');
+  h.el('account-add').onclick();h.el('account-rename').onclick();h.el('account-delete').onclick();await settle();
+  assert.equal(h.calls.length,0,'清单读不出来时后端会拒绝每一个账号操作');
+});
+
+test('the account limit disables adding and says how many are allowed',async()=>{
+  const h=harness('windows',{accounts:{max:2}});await settle();
+  assert.equal(h.el('account-add').disabled,true);
+  assert.equal(h.el('account-state').textContent,'最多 2 个账号');
+  h.data.accounts.items.pop();await h.refresh();
+  assert.equal(h.el('account-add').disabled,false);
+  assert.equal(h.el('account-state').textContent,'');
+});
+
+test('account controls are disabled while an account action is in flight',async()=>{
+  const h=harness();await settle();
+  for(const id of ACCOUNT_CONTROLS)assert.equal(h.el(id).disabled,false);
+  h.api.dispatch=(action,payload)=>new Promise(resolve=>{
+    h.calls.push({action,payload});
+    h.complete=()=>resolve({ok:true,message:'操作完成'});
+  });
+  h.el('account-add').onclick();await settle();
+  for(const id of ACCOUNT_CONTROLS)assert.equal(h.el(id).disabled,true,'请求还没回来，不能再发一次账号操作');
+  h.complete();await settle();await settle();
+  assert.equal(h.el('account-add').disabled,false);
+});
+
+/* 每个账号各自的今日状态 ----------------------------------------------------------------- */
+function accountItem(overrides={}){
+  return {id:'a1',name:'账号 1',active:false,has_idm_credentials:false,idm_username:'',missing:false,
+          enabled:false,state:'idle',busy:false,signed_today:false,...overrides};
+}
+
+test('the account picker spells out each account with one status suffix',async()=>{
+  const h=harness('windows',{accounts:{max:11,items:[
+    accountItem({id:'a1',name:'账号 1',active:true,idm_username:'2023123456',enabled:true,state:'signed',signed_today:true}),
+    accountItem({id:'a2',name:'账号 2',enabled:true,state:'waiting'}),
+    accountItem({id:'a3',name:'账号 3'}),
+    accountItem({id:'a4',name:'账号 4',missing:true,enabled:true,state:'waiting'}),
+    accountItem({id:'a5',name:'账号 5',busy:true,enabled:true,state:'busy'}),
+    accountItem({id:'a6',name:'账号 6',enabled:true,state:'login_required'}),
+    accountItem({id:'a7',name:'账号 7',enabled:true,state:'location_required'}),
+    accountItem({id:'a8',name:'账号 8',enabled:true,state:'network_error'}),
+    accountItem({id:'a9',name:'账号 9',enabled:true,state:'error'}),
+    accountItem({id:'a10',name:'账号 10',enabled:true,state:'ready'}),
+    accountItem({id:'a11',name:'账号 11',enabled:true,state:'no_task'})]}});
+  await settle();
+  assert.deepEqual(h.el('dorm-account').options.map(option=>option.textContent),[
+    '账号 1 · 2023123456 · 今日已完成',
+    '账号 2 · 等待时段',
+    '账号 3 · 未开启自动打卡',
+    '账号 4 · 档案缺失',
+    '账号 5 · 处理中',
+    '账号 6 · 需要重新登录',
+    '账号 7 · 需要检查定位',
+    '账号 8 · 需要检查',
+    '账号 9 · 需要检查',
+    '账号 10 · 今日待打卡',
+    '账号 11 · 今天暂无任务'],'后缀按优先级只取第一个命中的');
+});
+
+test('the account bar summarises how many accounts auto check in and how many are done',async()=>{
+  const h=harness('windows',{accounts:{items:[
+    accountItem({id:'a1',name:'账号 1',active:true,enabled:true,signed_today:true}),
+    accountItem({id:'a2',name:'账号 2',enabled:true}),
+    accountItem({id:'a3',name:'账号 3',enabled:true}),
+    accountItem({id:'a4',name:'账号 4',signed_today:true})]}});
+  await settle();
+  assert.equal(h.el('account-state').textContent,'自动打卡：3 个账号已开启 · 2 个今日已完成',
+               '已完成的账号不必开启自动打卡也算数');
+  h.data.accounts.items[1].enabled=false;h.data.accounts.items[2].enabled=false;await h.refresh();
+  assert.equal(h.el('account-state').textContent,'自动打卡：1 个账号已开启 · 2 个今日已完成');
+});
+
+test('the summary stays empty without an enabled account and with a single account',async()=>{
+  const h=harness('windows',{accounts:{items:[
+    accountItem({id:'a1',name:'账号 1',active:true,signed_today:true}),
+    accountItem({id:'a2',name:'账号 2'})]}});
+  await settle();
+  assert.equal(h.el('account-state').textContent,'','没有账号开着自动打卡就不必汇总');
+  h.data.accounts.items=[accountItem({id:'a1',name:'账号 1',active:true,enabled:true,signed_today:true})];
+  await h.refresh();
+  assert.equal(h.el('account-state').textContent,'','单账号的自动打卡状态由下面的设置卡片说明');
+});
+
+test('a running check-in no longer disables the account controls',async()=>{
+  const h=harness();await settle();
+  h.data.dorm.busy=true;await h.refresh();
+  assert.equal(h.el('dorm-account').disabled,false,'本阶段换账号只是界面行为，不用等打卡结束');
+  h.data.accounts.busy=true;await h.refresh();
+  for(const id of ACCOUNT_CONTROLS)assert.equal(h.el(id).disabled,false,'别的账号在打卡也不拦着账号栏：'+id);
+  assert.equal(h.el('logout-dorm').disabled,true,'state.dorm.busy 的既有逻辑保持原样');
+  assert.equal(h.el('cancel-dorm').disabled,false);
+});
+
+test('cancelling reaches every account, so another account being busy enables the button',async()=>{
+  const h=harness();await settle();
+  assert.equal(h.el('cancel-dorm').disabled,true,'没有账号在忙时取消不可点');
+  h.data.accounts.busy=true;await h.refresh();
+  assert.equal(h.el('cancel-dorm').disabled,false,'当前账号闲着，忙着的是别的账号');
+  h.el('cancel-dorm').listeners.click();await settle();await settle();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls)),[{action:'dorm_cancel',payload:{}}]);
+  h.data.accounts.busy=false;h.data.dorm.busy=true;await h.refresh();
+  assert.equal(h.el('cancel-dorm').disabled,false,'当前账号自己在忙时同样可以取消');
+});
+
+test('a snapshot without the per-account status fields still renders the bar',async()=>{
+  const h=harness('windows',{accounts:{busy:undefined,items:[   // 老快照连 accounts.busy 都没有
+    {id:'a1',name:'账号 1',active:true,idm_username:'2023123456'},
+    {id:'a2',name:'账号 2',active:false,missing:true}]}});
+  await settle();
+  assert.deepEqual(h.el('dorm-account').options.map(option=>option.textContent),
+                   ['账号 1 · 2023123456 · 未开启自动打卡','账号 2 · 档案缺失'],'缺字段一律按假值处理');
+  assert.equal(h.el('account-state').textContent,'');
+  assert.equal(h.el('cancel-dorm').disabled,true,'没有 busy 字段就是没人忙');
+  for(const id of ACCOUNT_CONTROLS)assert.equal(h.el(id).disabled,false);
+  h.el('account-add').onclick();await settle();await settle();
+  assert.deepEqual(h.calls.map(call=>call.action),['account_add'],'账号栏照常能用');
 });

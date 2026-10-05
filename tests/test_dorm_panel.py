@@ -2,6 +2,7 @@ import datetime as dt
 import importlib.util
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ import windows_tray
 
 PRESENT = importlib.util.find_spec('dorm_panel') is not None
 if PRESENT:
+    from dorm_login import LoginGate
     from dorm_panel import DormController
 
 
@@ -212,12 +214,229 @@ class GlobalLocationTests(unittest.TestCase):
                 self.api.submit.assert_not_called()
 
 
+@unittest.skipUnless(PRESENT, 'Controller missing')
+class SchedulingConstraintTests(unittest.TestCase):
+    """多账号才需要、但每条都直接影响自动行为安全性的三道约束：错峰、登录闸、整机预算。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = Store(Path(self.temp.name),
+                           protector=Mock(protect=lambda b: b[::-1], unprotect=lambda b: b[::-1]))
+        # 有可恢复的会话，才轮得到预算与登录闸这些后面的约束（见 _renewal_blocker）。
+        self.store.save_browser_session('stale-token', 'student', [dict(
+            name='SSO', value='cookie', domain='idm.swu.edu.cn', path='/', expires=-1)])
+        self.engine = Mock()
+        self.engine.cancel = threading.Event()
+        self.engine.clock = lambda: dt.datetime(2026, 10, 4, 22, 0, tzinfo=SHANGHAI)
+        self.engine.tick.return_value = Result('ready', '待完成')
+
+    def build(self, **kwargs):
+        kwargs.setdefault('login_gate', LoginGate())
+        controller = DormController(self.store, engine=self.engine, **kwargs)
+        self.addCleanup(controller.close)
+        return controller
+
+    def wait(self, controller):
+        for _ in range(200):
+            if not controller.busy:
+                return
+            time.sleep(.01)
+        self.fail('Worker did not stop')
+
+    def at(self, hour, minute, second=0):
+        self.engine.clock = lambda: dt.datetime(2026, 10, 4, hour, minute, second, tzinfo=SHANGHAI)
+
+    # ---- 错峰 -----------------------------------------------------------------
+    def test_the_first_automatic_check_waits_for_this_accounts_offset(self):
+        self.store.save_settings(Settings(enabled=True, start='21:00', end='23:15'))
+        controller = self.build(stagger_seconds=90)
+
+        self.at(21, 0, 30)                     # 窗口已开，但还没轮到这个账号
+        controller.poll()
+        self.wait(controller)
+        self.engine.tick.assert_not_called()
+
+        self.at(21, 1, 30)                     # 窗口开始 + 90 秒
+        controller._poll_at = 0.0
+        controller.poll()
+        self.wait(controller)
+        self.engine.tick.assert_called_once_with()
+
+    def test_no_offset_and_a_broken_window_never_block_a_check(self):
+        self.assertTrue(self.build()._stagger_ready(Settings()))
+        controller = self.build(stagger_seconds=90)
+        # 时段读不出来时该由 Engine fail-closed，这里不替它做决定。
+        self.assertTrue(controller._stagger_ready(Mock(start='25:00')))
+
+    # ---- 机器级登录闸 ---------------------------------------------------------
+    def test_automatic_renewal_skips_while_another_account_is_logging_in(self):
+        self.store.save_settings(Settings(enabled=True, start='21:00', end='23:15'))
+        gate = LoginGate()
+        gate.acquire()                          # 另一个账号正拿着闸
+        try:
+            controller = self.build(login_gate=gate)
+            self.engine.tick.return_value = Result('login_required', '请先登录统一身份认证')
+            result = controller._run('automatic')
+        finally:
+            gate.release()
+        self.assertEqual(result.state, 'waiting')
+        self.assertIn('等待其他账号', result.message)
+        # 关键：被挡下的这一拍不记账，否则额度会被排队白白烧光。
+        self.assertEqual(self.store.daily_attempts('2026-10-04', 'login_renewal'), 0)
+
+    def test_a_manual_login_is_refused_with_a_clear_reason(self):
+        gate = LoginGate()
+        gate.acquire()
+        try:
+            controller = self.build(login_gate=gate)
+            controller.start('login')
+            self.wait(controller)
+        finally:
+            gate.release()
+        result = controller.drain()[-1]
+        self.assertEqual(result.state, 'busy')
+        self.assertIn('另一个账号正在登录', result.message)
+
+    def test_the_gate_is_released_even_when_the_login_fails(self):
+        gate = LoginGate()
+        controller = self.build(login_gate=gate)
+        with patch('dorm_panel.login', side_effect=CheckinError('error', '登录失败')):
+            controller.start('login')
+            self.wait(controller)
+        self.assertFalse(gate.held(), '登录失败也必须把闸放回去，否则后面所有账号都登不了')
+        self.assertEqual(controller.drain()[-1].state, 'error')
+
+    # ---- 注定失败的那一趟不许烧额度 -------------------------------------------
+    def test_an_account_with_no_session_and_no_credentials_is_told_so_without_burning_an_attempt(self):
+        """2026-10-05 实测的坑：没登录过、也没存凭据的账号空转两次，吃掉自己 3 次额度里的
+        2 次和整机预算 6 次里的 2 次，界面只有一句含糊的「没有可恢复的学校会话」。"""
+        self.store.save_settings(Settings(enabled=True, start='21:00', end='23:15'))
+        self.store.clear_browser_session()
+        self.store.clear_token()
+        budget = Mock()
+        budget.check.return_value = ''
+        controller = self.build(login_budget=budget,
+                                idm_store=Mock(exists=Mock(return_value=False)))
+        self.engine.tick.return_value = Result('login_required', '请先登录统一身份认证')
+        with patch('dorm_panel.login') as login:
+            automatic = controller._run('automatic')
+        self.assertEqual(automatic.state, 'login_required')
+        self.assertIn('还没有登录过', automatic.message)
+        self.assertIn('统一认证凭据', automatic.message)
+        self.assertIn('学校登录 / 重新登录', automatic.message)
+        login.assert_not_called()
+        budget.spend.assert_not_called()
+        self.assertEqual(self.store.daily_attempts('2026-10-04', 'login_renewal'), 0)
+
+    def test_an_expired_session_without_credentials_says_both(self):
+        self.store.save_settings(Settings(enabled=True, start='21:00', end='23:15'))
+        self.store.save_browser_session('stale-token', 'student', [dict(
+            name='SSO', value='dead', domain='idm.swu.edu.cn', path='/', expires=1)])
+        controller = self.build(idm_store=Mock(exists=Mock(return_value=False)))
+        self.engine.tick.return_value = Result('login_required', '请先登录统一身份认证')
+        result = controller._run('automatic')
+        self.assertIn('学校会话已过期', result.message)
+        self.assertIn('统一认证凭据', result.message)
+        self.assertEqual(self.store.daily_attempts('2026-10-04', 'login_renewal'), 0)
+
+    def test_saved_credentials_allow_an_unattended_first_login(self):
+        """用户选择：没有会话、但存了统一认证凭据时，允许 headless 自己登一次
+        （仍然只在时段内、受登录闸与每天上限约束）。"""
+        self.store.save_settings(Settings(enabled=True, start='21:00', end='23:15'))
+        self.store.clear_browser_session()
+        self.store.clear_token()
+        budget = Mock()
+        budget.check.return_value = ''
+        controller = self.build(login_budget=budget,
+                                idm_store=Mock(exists=Mock(return_value=True),
+                                               load=Mock(return_value=Mock())))
+        self.assertEqual(controller._unattended_login_blocker(), '')
+        self.engine.tick.return_value = Result('login_required', '请先登录统一身份认证')
+        with patch('dorm_panel.login') as login:
+            controller._run('automatic')
+        login.assert_called_once()
+        self.assertEqual(login.call_args.kwargs.get('interactive'), False)
+        budget.spend.assert_called_once_with('2026-10-04')
+        self.assertEqual(self.store.daily_attempts('2026-10-04', 'login_renewal'), 1)
+
+    def test_unreadable_credentials_fail_closed(self):
+        from idm_credentials import CredentialError
+        self.store.save_settings(Settings(enabled=True, start='21:00', end='23:15'))
+        self.store.clear_browser_session()
+        self.store.clear_token()
+        controller = self.build(idm_store=Mock(exists=Mock(return_value=True),
+                                               load=Mock(side_effect=CredentialError('坏了'))))
+        self.assertTrue(controller._unattended_login_blocker())
+        self.engine.tick.return_value = Result('login_required', '请先登录统一身份认证')
+        with patch('dorm_panel.login') as login:
+            controller._run('automatic')
+        login.assert_not_called()
+
+    def test_a_skipped_login_is_recorded_so_the_reason_survives_on_disk(self):
+        """2026-10-05 实测：界面说「已停止自动重试」，磁盘上却只有引擎那句
+        「请先登录统一身份认证」，事后看不出到底为什么停。"""
+        self.store.save_settings(Settings(enabled=True, start='21:00', end='23:15'))
+        self.store.clear_browser_session()
+        self.store.clear_token()
+        controller = self.build(idm_store=Mock(exists=Mock(return_value=False)))
+        self.engine.tick.return_value = Result('login_required', '请先登录统一身份认证')
+        controller._run('automatic')
+        history = (self.store.root / 'history.log').read_text(encoding='utf-8')
+        self.assertIn('还没有登录过', history)
+        status = (self.store.root / 'status.json').read_text(encoding='utf-8')
+        self.assertIn('还没有登录过', status)
+
+    def test_a_healthy_session_is_not_blocked(self):
+        self.store.save_settings(Settings(enabled=True, start='21:00', end='23:15'))
+        controller = self.build()
+        self.assertEqual(controller._unattended_login_blocker(), '')
+        self.engine.tick.return_value = Result('login_required', '请先登录统一身份认证')
+        with patch('dorm_panel.login'):
+            controller._run('automatic')
+        self.assertEqual(self.store.daily_attempts('2026-10-04', 'login_renewal'), 1)
+
+    # ---- 整机预算 -------------------------------------------------------------
+    def test_the_machine_budget_blocks_automatic_logins_but_not_manual_ones(self):
+        self.store.save_settings(Settings(enabled=True, start='21:00', end='23:15'))
+        budget = Mock()
+        budget.check.return_value = '本机今天已自动尝试登录 6 次（上限 6 次），已停止自动重试'
+        controller = self.build(login_budget=budget)
+        self.engine.tick.return_value = Result('login_required', '请先登录统一身份认证')
+
+        automatic = controller._run('automatic')
+        self.assertEqual(automatic.state, 'login_required')
+        self.assertIn('上限 6 次', automatic.message)
+        budget.spend.assert_not_called()
+
+        self.engine.run.return_value = Result('login_required', '请先登录统一身份认证')
+        controller._renew_at = 0.0              # 自动那一拍留下的续期冷却不影响人工操作
+        with patch('dorm_panel.login') as manual:
+            controller._run('submit')
+        manual.assert_called_once()
+        budget.spend.assert_not_called()        # 人工登录不受整机预算限制
+
+    def test_each_automatic_attempt_is_counted_against_the_machine_budget(self):
+        self.store.save_settings(Settings(enabled=True, start='21:00', end='23:15'))
+        budget = Mock()
+        budget.check.return_value = ''
+        controller = self.build(login_budget=budget)
+        self.engine.tick.return_value = Result('login_required', '请先登录统一身份认证')
+        with patch('dorm_panel.login'):
+            controller._run('automatic')
+        budget.spend.assert_called_once_with('2026-10-04')
+
+
 class RenewalTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.store = Store(Path(directory.name), protector=Mock(protect=lambda b: b[::-1], unprotect=lambda b: b[::-1]))
-        self.store.save_token('old-token')
+        # 真实前提：令牌还在、但已被学校判为失效，**会话 cookie 仍然可用**——
+        # 无人值守续期正是靠这批 cookie 接着走 SSO。只有令牌没有会话的状态下，
+        # login(interactive=False) 在真实实现里会立刻拒绝（见 _renewal_blocker）。
+        self.store.save_browser_session('old-token', 'student', [dict(
+            name='SSO', value='old-cookie', domain='idm.swu.edu.cn', path='/', expires=-1)])
         self.controller = DormController(self.store)
         self.addCleanup(self.controller.close)
         self.api = Mock()
@@ -242,7 +461,9 @@ class RenewalTests(unittest.TestCase):
             raise CheckinError('login_required', '登录已失效')
         return 'student'
 
-    def renew(self, store, api, cancel, *, interactive):
+    def renew(self, store, api, cancel, *, interactive, idm_store=None):
+        # 多账号：控制器会把「本账号自己的」统一认证凭据存储一并传下去（见 dorm_panel）。
+        self.assertIs(idm_store, self.controller.idm_store)
         self.assertFalse(interactive)
         self.renewals += 1
         store.save_browser_session('renewed-token', 'student', [dict(
@@ -314,7 +535,8 @@ class RenewalTests(unittest.TestCase):
         self.api.user.assert_not_called()
 
     def test_renewal_after_unknown_submission_only_reads_back(self):
-        self.store.save_token('valid-token')
+        self.store.save_browser_session('valid-token', 'student', [dict(
+            name='SSO', value='cookie', domain='idm.swu.edu.cn', path='/', expires=-1)])
         self.api.submit.side_effect = TimeoutError()
         self.api.is_signed.side_effect = [CheckinError('login_required', '登录已失效'), False]
         self.assertEqual(self.run_action('submit').state, 'ready')
@@ -323,7 +545,8 @@ class RenewalTests(unittest.TestCase):
         self.assertFalse(self.store.pending(self.task.key))
 
     def test_renewal_does_not_resubmit_a_rejected_write_in_same_action(self):
-        self.store.save_token('valid-token')
+        self.store.save_browser_session('valid-token', 'student', [dict(
+            name='SSO', value='cookie', domain='idm.swu.edu.cn', path='/', expires=-1)])
         self.api.submit.side_effect = CheckinError('login_required', '登录已失效')
         self.api.is_signed.return_value = False
         self.assertEqual(self.run_action('submit').state, 'ready')

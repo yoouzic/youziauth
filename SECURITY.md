@@ -9,7 +9,7 @@ youziauth 是面向西南大学校园网环境的非官方开源工具。项目�
 | 凭据 | 用途 | 存储位置 | 加密方式 |
 |---|---|---|---|
 | 校园网（ePortal）密码 | 自动保持网络在线 | `%PROGRAMDATA%\youziauth\config.ini` 同目录 `credential.dat` | Windows DPAPI（机器范围） |
-| 统一认证（IDM）学号与密码 | 寝室打卡自动登录（含自动识别验证码） | `%LOCALAPPDATA%\youziauth\idm\credential.dat` | Windows DPAPI（用户范围） |
+| 统一认证（IDM）学号与密码 | 寝室打卡自动登录（含自动识别验证码） | `%LOCALAPPDATA%\youziauth\accounts\<账号ID>\idm\credential.dat` | Windows DPAPI（用户范围） |
 
 关于统一认证凭据：
 
@@ -20,6 +20,10 @@ youziauth 是面向西南大学校园网环境的非官方开源工具。项目�
 - DPAPI 密文只能被本机同一 Windows 用户解密，复制到其他机器或用户下无法还原。
 - 但请注意：**本机被完全控制（例如恶意程序以你的身份运行）时，该凭据可被解密**。
   这与所有「记住密码」功能的固有风险相同。介意此风险请不要保存凭据。
+- **多账号**（最多 5 个）时每个账号各有一份凭据，分别放在自己的账号目录下；程序不会让某个账号读
+  另一个账号的凭据。但一台电脑上就因此存着多个人的学号密码，风险随之叠加，账号数量要自己克制。
+- 1.6.14 及更早版本把凭据放在 `%LOCALAPPDATA%\youziauth\idm\credential.dat`；新版首次启动时会把它
+  整体搬进第一个账号的目录（不复制、不删除）。
 
 ## 不要公开提交的信息
 

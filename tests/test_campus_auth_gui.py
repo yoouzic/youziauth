@@ -510,6 +510,53 @@ class MonitorRetryTests(unittest.TestCase):
         )
 
 
+class LegacyDormPollingTests(unittest.TestCase):
+    """旧版 Tk 界面也必须把调度跑在所有账号上，而不是只跑面板显示的那一个。"""
+
+    def app(self, accounts):
+        app = campus_auth_gui.CampusAuthGui.__new__(campus_auth_gui.CampusAuthGui)
+        app.dorm_accounts = accounts
+        app.dorm_controller = None
+        app.dorm_panel = None
+        app._dorm_notice = None
+        app.root = mock.Mock()
+        app._show_notification = mock.Mock()
+        return app
+
+    def test_every_account_is_polled_and_each_result_is_announced_with_its_name(self):
+        from dorm_checkin import Result
+        accounts = mock.Mock()
+        accounts.controller_or_none.return_value = mock.Mock()
+        accounts.poll.return_value = [('账号 1', Result('signed', '今日打卡已完成')),
+                                      ('张三', Result('login_required', '请先登录统一身份认证'))]
+        app = self.app(accounts)
+        app._poll_dorm()
+        accounts.poll.assert_called_once_with()
+        self.assertEqual(app._show_notification.call_count, 2, '两个账号各自的结果都要提醒')
+        self.assertIn('张三', app._show_notification.call_args_list[1].args[0])
+        app.root.after.assert_called_once_with(1000, app._poll_dorm)
+
+    def test_a_repeated_result_from_the_same_account_is_only_announced_once(self):
+        from dorm_checkin import Result
+        accounts = mock.Mock()
+        accounts.controller_or_none.return_value = mock.Mock()
+        accounts.poll.return_value = [('账号 1', Result('signed', '今日打卡已完成',
+                                                       at='2026-10-04T21:05:00+08:00'))]
+        app = self.app(accounts)
+        app._poll_dorm()
+        app._poll_dorm()
+        self.assertEqual(app._show_notification.call_count, 1)
+
+    def test_a_broken_account_layer_keeps_the_schedule_alive(self):
+        accounts = mock.Mock()
+        accounts.controller_or_none.return_value = None
+        accounts.poll.return_value = []
+        app = self.app(accounts)
+        app._poll_dorm()
+        app.root.after.assert_called_once_with(1000, app._poll_dorm)
+        self.assertIsNone(app.dorm_controller)
+
+
 class NotificationIntegrationTests(unittest.TestCase):
     def test_retry_action_marks_notification_tracker_before_running(self):
         app = campus_auth_gui.CampusAuthGui.__new__(campus_auth_gui.CampusAuthGui)

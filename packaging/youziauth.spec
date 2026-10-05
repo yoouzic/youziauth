@@ -31,7 +31,8 @@ gui_analysis = Analysis(
                    # 静态分析可能漏掉，显式声明以保证打进包里。
                    # idm_http 是纯 HTTP 提交登录（绕开站点 WAF 对浏览器 POST 的拦截），
                    # 由 idm_login 在函数内 import，同样需要显式声明。
-                   "captcha_ocr", "idm_login", "idm_http", "idm_credentials"],
+                   # dorm_accounts 由 CampusAuthGui 在函数内 import（账号档案目录 + 账号清单）。
+                   "captcha_ocr", "idm_login", "idm_http", "idm_credentials", "dorm_accounts"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
