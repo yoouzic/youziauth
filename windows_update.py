@@ -251,6 +251,22 @@ try {
     try { Publish-Status 'launch' @{ pid = $installer.Id } }
     finally { $installer.WaitForExit() }
     $final = @{ code = $installer.ExitCode }
+    # 装完把程序重新拉起来。MSI 在 InstallValidate 之前就 taskkill 掉了原来的进程（见
+    # packaging/youziauth.wxs），不重启的话用户装完只看到一片空白，还得自己去找快捷方式。
+    # 只在 0 时重启：3010 表示有文件要等重启才能落盘，这时启动会因缺文件直接挂掉；
+    # 1602 是用户取消了安装，当然也不该启动。
+    # 这个工作进程是以当前用户身份运行的（提权发生在 msiexec 自己弹的那个 UAC 上），
+    # 所以这里拉起的是普通权限的进程，不会把程序变成以管理员运行。
+    # 不带参数启动 = 不隐藏窗口（campus_auth_gui.should_start_hidden(False, "show") 为假）。
+    if ($installer.ExitCode -eq 0) {
+        try {
+            $target = $env:YOUZIAUTH_UPDATE_EXE
+            Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target) | Out-Null
+            $final.relaunched = $true
+        } catch {
+            $final.relaunched = $false
+        }
+    }
 } catch {
     $final = @{ error = $stage }
 } finally {
