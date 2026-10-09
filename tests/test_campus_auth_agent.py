@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 import campus_auth
+import network_probe
 from agent_ipc import RuntimeSnapshot, read_snapshot, write_snapshot
 from auth_runtime import AuthAttempt, AttemptKind
 from campus_auth_agent import Agent, build_arg_parser
@@ -24,9 +25,11 @@ class FakeAuthenticator:
     def __init__(self, attempts):
         self.attempts = list(attempts)
         self.calls = 0
+        self.force_flags = []
 
-    def __call__(self, config, logger):
+    def __call__(self, config, logger, force_login=False):
         self.calls += 1
+        self.force_flags.append(force_login)
         if len(self.attempts) > 1:
             return self.attempts.pop(0)
         return self.attempts[0]
@@ -54,6 +57,42 @@ class NetworkProbeTests(unittest.TestCase):
         observation = probe.observe(campus_auth.AuthConfig())
 
         self.assertEqual(observation, NetworkObservation(False, True))
+
+    def test_probe_is_plain_http_like_windows_ncsi(self):
+        # https://www.msftconnecttest.com/connecttest.txt is served by an Akamai
+        # edge whose certificate does not cover the hostname, so TLS verification
+        # always fails and internet_ok stayed False on a healthy network.
+        for url, body in network_probe.CONNECTIVITY_PROBES:
+            self.assertTrue(url.startswith("http://"), url)
+            self.assertFalse(url.startswith("https://"), url)
+            self.assertTrue(body)
+
+        self.assertEqual(
+            network_probe.CONNECTIVITY_URL,
+            "http://www.msftconnecttest.com/connecttest.txt",
+        )
+        self.assertEqual(network_probe.CONNECTIVITY_BODY, "Microsoft Connect Test")
+
+    def test_captive_portal_page_does_not_count_as_internet(self):
+        class FakeResponse:
+            status = 200
+            headers = {}
+
+            def read(self, size):
+                return b"<html>Please sign in to the campus network</html>"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        original = network_probe.urllib.request.urlopen
+        network_probe.urllib.request.urlopen = lambda request, timeout: FakeResponse()
+        try:
+            self.assertFalse(network_probe.check_external_internet(2))
+        finally:
+            network_probe.urllib.request.urlopen = original
 
 
 class AgentArgumentTests(unittest.TestCase):
@@ -138,6 +177,54 @@ class AgentLoopTests(unittest.TestCase):
 
         self.assertEqual(snapshot.state, "online_campus")
         self.assertEqual(authenticator.calls, 2)
+        # The user asking for a retry must actually re-authenticate instead of
+        # being short-circuited by the portal's "already authenticated" answer.
+        self.assertEqual(authenticator.force_flags, [False, True])
+
+    def test_unverified_already_online_is_reauthenticated(self):
+        authenticator = FakeAuthenticator(
+            [
+                AuthAttempt(AttemptKind.ALREADY_ONLINE, "already authenticated"),
+                AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, "success"),
+            ]
+        )
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+
+        result = agent.run_cycle()
+
+        # The portal claimed a live session but the Internet was unreachable, so
+        # the agent had to verify it with a real login instead of reporting it.
+        self.assertEqual(result.snapshot.state, "online_campus")
+        self.assertEqual(authenticator.calls, 2)
+        self.assertEqual(authenticator.force_flags, [False, True])
+
+    def test_unverified_session_is_not_reported_online_when_relogin_is_refused(self):
+        authenticator = FakeAuthenticator(
+            [
+                AuthAttempt(AttemptKind.ALREADY_ONLINE, "already authenticated"),
+                AuthAttempt(AttemptKind.REJECTED, "已在线，无需重复认证"),
+            ]
+        )
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+
+        result = agent.run_cycle()
+
+        # A refused duplicate login is not a credential failure, and it must not
+        # be dressed up as success either: the machine still has no Internet.
+        self.assertNotEqual(result.snapshot.state, "auth_failed")
+        self.assertNotEqual(result.snapshot.state, "online_campus")
+        self.assertEqual(result.snapshot.state, "waiting_for_network")
+        self.assertFalse(result.notification_required)
+
+    def test_verified_already_online_is_still_accepted_when_internet_works(self):
+        authenticator = FakeAuthenticator([AuthAttempt(AttemptKind.ALREADY_ONLINE, "already authenticated")])
+        agent = self.make_agent(FakeProbe([NetworkObservation(True, False)]), authenticator)
+
+        result = agent.run_cycle()
+
+        # internet_ok short-circuits before the portal is ever consulted.
+        self.assertEqual(result.snapshot.state, "online_external")
+        self.assertEqual(authenticator.calls, 0)
 
     def test_three_transient_failures_become_one_failure_incident(self):
         authenticator = FakeAuthenticator(
