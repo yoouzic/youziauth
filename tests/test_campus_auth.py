@@ -239,7 +239,7 @@ class StatusParsingTests(unittest.TestCase):
 
 
 class StatusFlowTests(unittest.TestCase):
-    def test_check_status_trusts_success_page_before_online_user_info_fail(self):
+    def test_success_page_still_wins_when_the_api_cannot_name_the_session(self):
         self.assertIsNotNone(campus_auth, import_error)
 
         class FakeClient(campus_auth.CampusAuthClient):
@@ -263,6 +263,156 @@ class StatusFlowTests(unittest.TestCase):
         status = FakeClient().check_status()
 
         self.assertEqual(status, campus_auth.AuthStatus.AUTHENTICATED)
+
+    def test_named_session_refused_by_api_beats_the_success_page(self):
+        self.assertIsNotNone(campus_auth, import_error)
+        user_index = "64323438356532646337343838356233353333323330323566656136613838345f31302e302e302e31"
+
+        class FakeClient(campus_auth.CampusAuthClient):
+            def __init__(self):
+                super().__init__(campus_auth.AuthConfig(username="student", password="pw"))
+
+            def request(self, url, data=None, allow_redirects=True, referer=None):
+                if url == self.config.portal_url:
+                    return campus_auth.HttpResponse(
+                        200,
+                        {},
+                        "<html><title>登录成功</title></html>",
+                        self.portal_url(f"/eportal/./success.jsp?userIndex={user_index}"),
+                    )
+                if "method=getOnlineUserInfo" in url:
+                    self.asked = url
+                    return campus_auth.HttpResponse(
+                        200,
+                        {},
+                        '{"result":"fail","message":"获取用户信息失败，用户可能已经下线"}',
+                        url,
+                    )
+                return campus_auth.HttpResponse(200, {}, "", url)
+
+        client = FakeClient()
+        status = client.check_status()
+
+        # This is the false-positive case: the portal serves success.jsp from a
+        # stale session record while its own API refuses the session we named.
+        self.assertEqual(status, campus_auth.AuthStatus.UNAUTHENTICATED)
+        self.assertIn(f"userIndex={user_index}", client.asked)
+
+
+class OnlineUserInfoTests(unittest.TestCase):
+    def test_user_index_is_read_out_of_the_success_redirect(self):
+        self.assertIsNotNone(campus_auth, import_error)
+
+        index = campus_auth.extract_user_index(
+            "http://portal/eportal/./success.jsp?userIndex=abc123",
+            "",
+        )
+
+        self.assertEqual(index, "abc123")
+
+    def test_user_index_is_read_from_a_configured_login_url(self):
+        self.assertIsNotNone(campus_auth, import_error)
+
+        index = campus_auth.extract_user_index(
+            "",
+            "http://portal/eportal/index.jsp?userIndex=deadbeef&wlanuserip=1.2.3.4",
+        )
+
+        self.assertEqual(index, "deadbeef")
+
+    def test_fail_without_a_named_session_stays_unknown(self):
+        self.assertIsNotNone(campus_auth, import_error)
+
+        status = campus_auth.parse_online_user_info(
+            '{"result":"fail","message":"not online"}', user_index_supplied=False
+        )
+
+        self.assertEqual(status, campus_auth.AuthStatus.UNKNOWN)
+
+    def test_wait_is_retried_because_the_portal_settles(self):
+        self.assertIsNotNone(campus_auth, import_error)
+
+        class FakeClient(campus_auth.CampusAuthClient):
+            def __init__(self):
+                super().__init__(campus_auth.AuthConfig(username="student", password="pw"))
+                self.responses = [
+                    '{"result":"wait","message":"用户信息不完整，请稍后重试"}',
+                    '{"result":"success","message":"获取用户信息成功"}',
+                ]
+
+            def request(self, url, data=None, allow_redirects=True, referer=None):
+                return campus_auth.HttpResponse(200, {}, self.responses.pop(0), url)
+
+        status = FakeClient().check_online_user_info()
+
+        self.assertEqual(status, campus_auth.AuthStatus.AUTHENTICATED)
+
+    def test_success_page_template_noise_is_not_authentication(self):
+        self.assertIsNotNone(campus_auth, import_error)
+
+        # The portal ships this CSS/JS on pages that are not the success page.
+        class FakeClient(campus_auth.CampusAuthClient):
+            def request(self, url, data=None, allow_redirects=True, referer=None):
+                return campus_auth.HttpResponse(
+                    200,
+                    {},
+                    "<style>.toLogOut_1{float:right}</style>"
+                    "<script>var userIndex = getQueryStringByName(\"userIndex\");</script>",
+                    self.portal_url("/eportal/index.jsp?wlanuserip=1.2.3.4&wlanacname=ac01"),
+                )
+
+        status = FakeClient(
+            campus_auth.AuthConfig(username="student", password="pw")
+        ).check_login_page_status()
+
+        self.assertEqual(status, campus_auth.AuthStatus.UNAUTHENTICATED)
+
+    def test_portal_requests_bypass_the_system_proxy(self):
+        self.assertIsNotNone(campus_auth, import_error)
+        import http.server
+        import threading
+        import urllib.request
+
+        received = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        port = server.server_address[1]
+        original = urllib.request.getproxies
+        # A dead proxy address: anything that still honours the system proxy
+        # (which on Windows means whatever Clash/v2ray left in the registry)
+        # cannot reach the portal at all.
+        urllib.request.getproxies = lambda: {"http": "http://127.0.0.1:1"}
+        try:
+            config = campus_auth.AuthConfig(portal_url=f"http://127.0.0.1:{port}")
+            client = campus_auth.CampusAuthClient(config)
+            self.assertEqual(
+                [
+                    handler
+                    for handler in client.opener.handlers
+                    if isinstance(handler, urllib.request.ProxyHandler)
+                ],
+                [],
+            )
+            response = client.request(config.portal_url)
+        finally:
+            urllib.request.getproxies = original
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(received, ["/"])
 
     def test_success_page_url_wins_over_non_login_jsp_query(self):
         self.assertIsNotNone(campus_auth, import_error)
@@ -518,6 +668,20 @@ class StructuredAttemptTests(unittest.TestCase):
 
         self.assertEqual(attempt.kind.value, "transient_error")
         self.assertEqual(attempt.message, "network unavailable")
+
+    def test_force_login_skips_the_already_authenticated_short_circuit(self):
+        class FakeClient:
+            def check_status(self):
+                return campus_auth.AuthStatus.AUTHENTICATED
+
+            def login(self):
+                return campus_auth.LoginResult(ok=True, message="success")
+
+        attempt = campus_auth.attempt_authentication(
+            FakeClient(), logging.getLogger("test"), force_login=True
+        )
+
+        self.assertEqual(attempt.kind.value, "login_succeeded")
 
 
 if __name__ == "__main__":

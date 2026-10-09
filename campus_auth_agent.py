@@ -59,7 +59,7 @@ class Agent:
         self,
         config_loader: Callable[[], campus_auth.AuthConfig],
         probe: NetworkProbe,
-        authenticator: Callable[[campus_auth.AuthConfig, logging.Logger], AuthAttempt],
+        authenticator: Callable[..., AuthAttempt],
         snapshot_path: Path,
         logger: logging.Logger,
         boot_id: Optional[str] = None,
@@ -149,7 +149,34 @@ class Agent:
                 not snapshot.notifications_suppressed,
             )
 
-        attempt = self.authenticator(self.config, self.logger)
+        attempt = self.authenticator(self.config, self.logger, force_login=force_login)
+
+        if attempt.kind is AttemptKind.ALREADY_ONLINE and not observation.internet_ok:
+            # The portal served its success page, but this very cycle already
+            # proved the machine cannot reach the Internet. A Ruijie session
+            # record can outlive the gateway authorization that actually carries
+            # traffic, so the record on its own is not evidence of a working
+            # session -- trusting it is what reported "already authenticated"
+            # for hours and stopped the agent from ever logging in again. Verify
+            # it by authenticating for real: a healthy session just answers
+            # success again, a stale one gets repaired.
+            self.logger.info(
+                "portal claims an existing session while the Internet is "
+                "unreachable; re-authenticating"
+            )
+            verified = self.authenticator(self.config, self.logger, force_login=True)
+            if verified.kind is AttemptKind.REJECTED:
+                # The portal still asserts a live session, so a refused
+                # duplicate login is not a credential problem and must not be
+                # reported as one. Stay honest instead: there is still no
+                # Internet, so the session stays unverified.
+                snapshot = self._publish(
+                    AgentState.WAITING_FOR_NETWORK,
+                    "门户声称已在线，但上网仍不通",
+                )
+                return CycleResult(snapshot, self.config.check_interval_seconds, False)
+            attempt = verified
+
         if attempt.kind in (AttemptKind.ALREADY_ONLINE, AttemptKind.LOGIN_SUCCEEDED):
             self.transient_failures = 0
             self.automatic_login_blocked = False
@@ -293,8 +320,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     agent = Agent(
         config_loader=lambda: load_agent_config(args.config),
         probe=NetworkProbe(),
-        authenticator=lambda loaded, active_logger: campus_auth.attempt_authentication(
-            campus_auth.CampusAuthClient(loaded, active_logger), active_logger
+        authenticator=lambda loaded, active_logger, force_login=False: (
+            campus_auth.attempt_authentication(
+                campus_auth.CampusAuthClient(loaded, active_logger),
+                active_logger,
+                force_login=force_login,
+            )
         ),
         snapshot_path=program_data_root(args.config.parent.parent) / "runtime.json"
         if args.config == machine_config_path(args.config.parent.parent)

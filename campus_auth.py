@@ -166,6 +166,8 @@ LOGIN_QUERY_KEYS = (
     "ssid",
 )
 
+USER_INDEX_PATTERN = re.compile(r"[?&]userIndex=([^&'\"]+)", re.IGNORECASE)
+
 
 def looks_like_login_query_string(query: str) -> bool:
     lowered = urllib.parse.unquote_plus(query or "").lower()
@@ -211,7 +213,9 @@ def parse_login_result(response_text: str) -> LoginResult:
     return LoginResult(ok=ok, message=message, raw=raw)
 
 
-def parse_online_user_info(response_text: str) -> AuthStatus:
+def parse_online_user_info(
+    response_text: str, user_index_supplied: bool = True
+) -> AuthStatus:
     try:
         data = json.loads((response_text or "").strip())
     except json.JSONDecodeError:
@@ -224,8 +228,35 @@ def parse_online_user_info(response_text: str) -> AuthStatus:
     if result == "success":
         return AuthStatus.AUTHENTICATED
     if result == "fail":
-        return AuthStatus.UNAUTHENTICATED
+        # Without a userIndex the portal answers this endpoint from whatever it
+        # can infer about the caller and reports "fail" for plenty of healthy
+        # sessions, so only a refusal for a session we named is conclusive.
+        return AuthStatus.UNAUTHENTICATED if user_index_supplied else AuthStatus.UNKNOWN
     return AuthStatus.UNKNOWN
+
+
+def online_user_result_code(response_text: str) -> str:
+    """Return the portal's raw ``result`` field, or "" when it is not JSON."""
+    try:
+        data = json.loads((response_text or "").strip())
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("result", "")).lower()
+
+
+def extract_user_index(*urls: str) -> str:
+    """Pick the ePortal ``userIndex`` out of any URL that carries one.
+
+    The portal hands it out hex-encoded inside the success.jsp redirect; that
+    is the form ``InterFace.do?method=getOnlineUserInfo`` expects back.
+    """
+    for url in urls:
+        match = USER_INDEX_PATTERN.search(url or "")
+        if match:
+            return urllib.parse.unquote_plus(match.group(1))
+    return ""
 
 
 def extract_rsa_public_key(page_info: Mapping[str, object]) -> tuple[str, str]:
@@ -309,8 +340,14 @@ class CampusAuthClient:
     def __init__(self, config: AuthConfig, logger: Optional[logging.Logger] = None):
         self.config = config
         self.logger = logger or logging.getLogger("campus_auth")
-        self.opener = urllib.request.build_opener()
-        self.no_redirect_opener = urllib.request.build_opener(NoRedirectHandler)
+        # The ePortal binds a session to the client's campus IP, so these
+        # requests must not travel through the WinINET/system proxy (Clash,
+        # v2ray, ...) that urllib picks up from the registry: that would make
+        # every check depend on the proxy being up and would let a rule change
+        # move the session onto a foreign exit IP.
+        direct = urllib.request.ProxyHandler({})
+        self.opener = urllib.request.build_opener(direct)
+        self.no_redirect_opener = urllib.request.build_opener(direct, NoRedirectHandler)
 
     def portal_url(self, path: str) -> str:
         if not path.startswith("/"):
@@ -375,24 +412,71 @@ class CampusAuthClient:
             return raw.decode("utf-8", errors="replace")
 
     def check_status(self) -> AuthStatus:
-        for checker in (
-            self.check_login_page_status,
-            self.check_online_user_info,
-            self.check_redirect_status,
-        ):
-            status = checker()
-            if status is not AuthStatus.UNKNOWN:
-                return status
-        return AuthStatus.UNKNOWN
+        home = self.fetch_portal_home()
+        online_info = self.check_online_user_info(home)
+        if online_info is AuthStatus.AUTHENTICATED:
+            return online_info
 
-    def check_online_user_info(self) -> AuthStatus:
-        url = self.portal_url("/eportal/InterFace.do?method=getOnlineUserInfo")
+        page_status = self.check_login_page_status(home)
+        if page_status is AuthStatus.AUTHENTICATED:
+            if online_info is AuthStatus.UNAUTHENTICATED:
+                # The portal served its success page while its own online-user
+                # API refused the session we named. A Ruijie session record can
+                # outlive the gateway authorization that actually carries
+                # traffic, which is exactly what produced "already
+                # authenticated" reports on machines with no Internet. The
+                # named refusal wins, so the agent attempts a real login.
+                self.logger.info(
+                    "portal success page contradicted by getOnlineUserInfo; "
+                    "treating session as stale"
+                )
+                return AuthStatus.UNAUTHENTICATED
+            return page_status
+
+        if online_info is AuthStatus.UNAUTHENTICATED:
+            return online_info
+        if page_status is not AuthStatus.UNKNOWN:
+            return page_status
+
+        return self.check_redirect_status()
+
+    def fetch_portal_home(self) -> Optional[HttpResponse]:
+        """Fetch the portal home once so the individual checks can share it."""
         try:
-            response = self.request(url)
+            return self.request(self.config.portal_url)
         except OSError as exc:
-            self.logger.debug("getOnlineUserInfo failed: %s", exc)
-            return AuthStatus.UNKNOWN
-        return parse_online_user_info(response.text)
+            self.logger.debug("portal home fetch failed: %s", exc)
+            return None
+
+    def online_user_index(self, home: Optional[HttpResponse] = None) -> str:
+        return extract_user_index(
+            self.config.login_url,
+            home.url if home is not None else "",
+        )
+
+    def check_online_user_info(
+        self, home: Optional[HttpResponse] = None
+    ) -> AuthStatus:
+        user_index = self.online_user_index(home)
+        url = self.portal_url("/eportal/InterFace.do?method=getOnlineUserInfo")
+        if user_index:
+            url = f"{url}&userIndex={urllib.parse.quote(user_index)}"
+
+        # The portal intermittently answers {"result":"wait"} while it is still
+        # assembling the session view, so one retry is worth it before giving up
+        # on the only authoritative answer available.
+        for retry_available in (True, False):
+            try:
+                response = self.request(url)
+            except OSError as exc:
+                self.logger.debug("getOnlineUserInfo failed: %s", exc)
+                return AuthStatus.UNKNOWN
+            if online_user_result_code(response.text) == "wait" and retry_available:
+                continue
+            return parse_online_user_info(
+                response.text, user_index_supplied=bool(user_index)
+            )
+        return AuthStatus.UNKNOWN
 
     def check_redirect_status(self) -> AuthStatus:
         url = self.portal_url("/eportal/redirectortosuccess.jsp")
@@ -412,22 +496,23 @@ class CampusAuthClient:
             return AuthStatus.AUTHENTICATED
         return AuthStatus.UNKNOWN
 
-    def check_login_page_status(self) -> AuthStatus:
-        try:
-            response = self.request(self.config.portal_url)
-        except OSError as exc:
-            self.logger.debug("login page status check failed: %s", exc)
+    def check_login_page_status(self, home: Optional[HttpResponse] = None) -> AuthStatus:
+        response = home if home is not None else self.fetch_portal_home()
+        if response is None:
             return AuthStatus.UNKNOWN
 
         lowered_url = response.url.lower()
         lowered = response.text.lower()
+        # Only markers that mean "the portal served its success page". The
+        # portal's page template also carries a #toLogOut_1 CSS rule and a
+        # `var userIndex = ...` script on pages that are not the success page,
+        # so matching those identifiers reported an authenticated session for
+        # whatever the portal returned.
         if (
             "success" in lowered_url
             or "success.jsp" in lowered
             or "login success" in lowered
             or "登录成功" in response.text
-            or "logout" in lowered
-            or "userindex" in lowered
         ):
             return AuthStatus.AUTHENTICATED
 
@@ -498,12 +583,17 @@ class CampusAuthClient:
         return parse_login_result(response.text)
 
 
-def attempt_authentication(client: CampusAuthClient, logger: logging.Logger) -> AuthAttempt:
+def attempt_authentication(
+    client: CampusAuthClient, logger: logging.Logger, force_login: bool = False
+) -> AuthAttempt:
     try:
-        status = client.check_status()
-        logger.info("current auth status: %s", status.value)
-        if status is AuthStatus.AUTHENTICATED:
-            return AuthAttempt(AttemptKind.ALREADY_ONLINE, "already authenticated")
+        if not force_login:
+            status = client.check_status()
+            logger.info("current auth status: %s", status.value)
+            if status is AuthStatus.AUTHENTICATED:
+                return AuthAttempt(AttemptKind.ALREADY_ONLINE, "already authenticated")
+        else:
+            logger.info("forcing a fresh login attempt")
         result = client.login()
     except Exception as exc:  # noqa: BLE001 - CLI tool should log and keep running.
         logger.error("login attempt failed before server response: %s", exc)
