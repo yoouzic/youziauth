@@ -50,6 +50,11 @@ env/
 docs/superpowers/
 .worktrees/
 
+# 本地探测与诊断脚本：含真实校园 URL、账号样例和内部调研过程，不随源码发布。
+# 例外：sign_release.py 是发布流程的一部分（release.yml 会调用它），必须保持跟踪。
+tools/**
+!tools/sign_release.py
+
 # Editor and operating-system files
 .idea/
 .vscode/
