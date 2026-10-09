@@ -88,6 +88,16 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertNotIn('password', state['network'])
         self.assertNotIn('never-expose', str(state))
         self.controller.store.token.assert_not_called()
+        # 登录态只能来自「密文文件在不在」，绝不能为了把状态说准去解密会话令牌。
+        self.assertTrue(self.controller.store.has_session.called)
+        self.assertIsInstance(state['dorm']['has_session'], bool)
+
+    def test_dorm_login_state_degrades_instead_of_failing_the_snapshot(self):
+        """会话文件读不动时只降级这一小块：不能把「读不出登录态」变成「后台连不上」。"""
+        self.controller.store.has_session.side_effect = OSError('磁盘读不动')
+        state = self.bridge.snapshot()
+        self.assertIs(state['dorm']['has_session'], False)
+        self.assertEqual(state['network']['username'], 'student')
 
     def test_blank_password_is_preserved_by_existing_storage_contract(self):
         with patch('desktop_bridge.gui.save_gui_settings') as save:

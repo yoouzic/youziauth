@@ -48,7 +48,7 @@
       </section>
 
       <section class="page" id="dorm" aria-labelledby="dorm-title" hidden>
-        <div class="page-heading"><div><div class="eyebrow">一天的收尾，也从容一些</div><h1 id="dorm-title">寝室打卡</h1><p class="muted">查看学校今日安排，在有效时段内完成打卡。</p></div><button class="secondary" data-action="dorm_login"><i class="bi bi-person-check" aria-hidden="true"></i> 学校登录 / 重新登录</button></div>
+        <div class="page-heading"><div><div class="eyebrow">一天的收尾，也从容一些</div><h1 id="dorm-title">寝室打卡</h1><p class="muted">查看学校今日安排，在有效时段内完成打卡。</p></div><span class="section-mark"><i class="bi bi-journal-check" aria-hidden="true"></i></span></div>
         <div class="account-bar" id="account-bar" hidden>
           <label for="dorm-account">打卡账号</label>
           <select id="dorm-account"></select>
@@ -58,6 +58,33 @@
           <button type="button" class="secondary danger" id="account-delete">删除账号</button>
           <span id="account-state" role="status"></span>
         </div>
+        <article class="paper-card login-card" id="login-card">
+          <div class="login-head">
+            <div class="login-identity">
+              <div class="login-title"><i class="bi bi-person-badge" aria-hidden="true"></i> 学校登录 <span class="badge" id="login-badge">正在读取…</span></div>
+              <p class="login-line" id="login-line">正在读取登录状态…</p>
+              <p class="field-hint" id="idm-credential-state">正在读取凭据状态…</p>
+            </div>
+            <div class="login-actions">
+              <button class="primary" data-action="dorm_login"><i class="bi bi-person-check" aria-hidden="true"></i> 学校登录 / 重新登录</button>
+              <button class="secondary" id="idm-toggle" type="button" aria-expanded="false" aria-controls="idm-panel">管理静默登录</button>
+            </div>
+          </div>
+          <div class="login-panel" id="idm-panel" hidden>
+            <h4>统一认证静默登录</h4>
+            <p class="login-panel-hint">保存后登录会自动填写账号密码并识别验证码，不用你手动输入。</p>
+            <form id="idm-credential-form" autocomplete="off">
+              <div><label for="idm-username">学号</label><input id="idm-username" name="idm_username" type="text" maxlength="64" autocomplete="username" placeholder="统一认证学号"></div>
+              <div><label for="idm-password">密码</label><input id="idm-password" name="idm_password" type="password" maxlength="128" autocomplete="current-password" placeholder="留空则保持已保存的密码"></div>
+              <button type="submit" class="primary">保存凭据</button>
+              <span class="form-state" id="idm-save-state"></span>
+            </form>
+            <div class="login-danger">
+              <div class="login-danger-row"><div><strong>退出学校登录</strong><p class="field-hint">下次打卡需重新登录，并会暂停自动打卡；校园网账号不受影响。</p></div><button class="text-button danger" id="logout-dorm" type="button">退出登录</button></div>
+              <div class="login-danger-row"><div><strong>清除已保存的学号密码</strong><p class="field-hint">删掉记住的学号密码，下次登录需要手动输入。</p></div><button class="text-button danger" id="idm-clear" type="button">清除凭据</button></div>
+            </div>
+          </div>
+        </article>
         <article class="paper-card task-card"><div class="card-label"><span><i class="bi bi-journal-check" aria-hidden="true"></i> 今日任务</span><span class="badge" id="task-badge">待查询</span></div><h2 id="task-title">先看看今天的安排</h2><p class="muted" id="task-message">查询今日任务，不会提交打卡。</p><div class="task-details" id="task-details" hidden><div><span>任务日期</span><strong id="task-date"></strong></div><div><span>学校时段</span><strong id="task-time"></strong></div><div><span>打卡地点</span><strong id="task-address"></strong></div></div><div class="task-actions"><button class="primary" id="submit-dorm">提交今日打卡 <i class="bi bi-arrow-right" aria-hidden="true"></i></button><button class="secondary" data-action="dorm_query">查询今日任务</button><button class="text-button" data-action="dorm_cancel" id="cancel-dorm">取消当前操作</button></div></article>
         <div class="detail-grid">
           <form class="paper-card form-card" id="dorm-form">
@@ -70,7 +97,7 @@
           </form>
           <aside class="side-stack">
             <article class="paper-card compact location-source-card">
-            <h3><i class="bi bi-geo-alt" aria-hidden="true"></i> 定位来源与登录</h3>
+            <h3><i class="bi bi-geo-alt" aria-hidden="true"></i> 打卡定位</h3>
             <label for="location-source">选择定位来源</label>
             <select id="location-source" name="location_source" required>
               <option value="windows">真实定位（Windows / Wi-Fi）</option>
@@ -81,22 +108,7 @@
             <button class="primary full" id="authorize-location" data-action="location_authorize">授权并检测定位</button>
             <p class="field-hint" id="location-mode-hint" hidden>实时位置由 Windows 决定来源，不保证只使用 Wi-Fi。如遇系统权限提示，请选择允许；已拒绝的权限需在 Windows 定位设置中开启。</p>
             <button class="secondary full" id="open-map-picker" type="button" hidden>在地图上选择位置</button>
-            <button class="secondary full location-settings" data-action="location_settings">Windows 定位设置</button><button class="text-button danger" id="logout-dorm">清除学校登录凭据</button>
-          </article>
-          <article class="paper-card compact idm-credential-card">
-            <h3><i class="bi bi-shield-lock" aria-hidden="true"></i> 统一认证静默登录</h3>
-            <p class="field-hint" id="idm-credential-state">正在读取凭据状态…</p>
-            <form id="idm-credential-form" autocomplete="off">
-              <label for="idm-username">学号</label>
-              <input id="idm-username" name="idm_username" type="text" maxlength="64" autocomplete="username" placeholder="统一认证学号">
-              <label for="idm-password">密码</label>
-              <input id="idm-password" name="idm_password" type="password" maxlength="128" autocomplete="current-password" placeholder="留空则保持已保存的密码">
-              <div class="form-footer">
-                <span class="form-state" id="idm-save-state"></span>
-                <button type="submit" class="primary">保存凭据</button>
-              </div>
-            </form>
-            <button class="text-button danger" id="idm-clear" type="button">清除统一认证凭据</button>
+            <button class="secondary full location-settings" data-action="location_settings">Windows 定位设置</button>
           </article></aside>
         </div>
       </section>

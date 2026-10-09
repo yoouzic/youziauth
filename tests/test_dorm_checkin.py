@@ -347,6 +347,18 @@ class SessionStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.browser_session(self.store.token()))
         self.assertIsNone(self.store.browser_session(''))
 
+    def test_has_session_only_looks_at_the_ciphertext_file(self):
+        """has_session 是给只读快照用的：必须不解密、不抛异常、只看文件在不在。"""
+        protector = Mock(protect=lambda b: b[::-1], unprotect=Mock(side_effect=AssertionError('不许解密')))
+        store = Store(Path(self.store.root), protector=protector)
+        self.assertFalse(store.has_session())
+        self.store.save_token('private-token')
+        self.assertTrue(store.has_session())
+        # 密文被写坏时 token() 会抛，has_session() 仍要能回答「有」——
+        # 否则「退出登录」这类补救按钮会因为状态说不清而被禁掉。
+        (store.root / 'session' / 'credential.dat').write_text('corrupt', encoding='utf-8')
+        self.assertTrue(store.has_session())
+
     def test_logout_removes_session_without_removing_settings_or_pending(self):
         self.store.save_token('private-token')
         self.store.save_browser_session('private-token', 'student', self.cookies)

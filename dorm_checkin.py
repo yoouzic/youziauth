@@ -206,6 +206,15 @@ class Store:
     def token(self):
         return self._login_record()['token']
 
+    def has_session(self):
+        """本机是否保存着学校会话。**只看密文文件在不在，不解密。**
+
+        给只读快照用：快照绝不能把会话令牌读进内存（见 test_snapshot_excludes_secrets），
+        而界面又必须能说出「已登录 / 未登录」。与 token() 的分工是故意的 ——
+        token() 会解密、会因密文损坏而抛 CheckinError，这里只回答「有没有」。
+        """
+        return (self.root / 'session' / 'credential.dat').exists()
+
     def save_token(self, token):
         if not isinstance(token, str) or not token.strip() or any(c in token for c in '\r\n'):
             raise ValueError('登录凭据格式无效')

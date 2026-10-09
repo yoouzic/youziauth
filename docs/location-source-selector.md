@@ -9,7 +9,8 @@ so the control was present in the installed build — it simply was not visible.
 
 It is now a first-class part of the 寝室打卡 page sidebar:
 
-- The 定位来源与登录 card carries the selector, its own 保存定位来源 button, the current
+- The 打卡定位 card (renamed from 定位来源与登录, since login now lives in its own page-level
+  card next to 打卡账号) carries the selector, its own 保存定位来源 button, the current
   source badge and the scope hint.
 - The 总览 page shows 打卡定位来源 in 后台安排, so the active source is visible without
   opening the dorm page.

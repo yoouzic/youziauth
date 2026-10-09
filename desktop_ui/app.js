@@ -106,9 +106,7 @@ function render() {
   $('submit-dorm').firstChild.textContent=d.state==='uncertain'?'回查提交结果 ':'提交今日打卡 ';
   $('cancel-dorm').disabled=pending||!(d.busy||state.accounts?.busy);   // 别的账号在忙时也要能取消
   $('logout-dorm').disabled=pending||d.busy;
-  $('idm-credential-state').textContent=d.has_idm_credentials
-    ?`已保存统一认证凭据（学号 ${d.idm_username||'未知'}）：登录时会自动填写并识别验证码。`
-    :'未保存统一认证凭据：每次登录需人工输入账号密码和验证码。';
+  renderLogin(d,pending);
   $('idm-clear').disabled=!d.has_idm_credentials||pending||d.busy;
   $('idm-username').disabled=pending||d.busy;
   $('idm-password').disabled=pending||d.busy;
@@ -222,6 +220,14 @@ $('save-location-source').addEventListener('click',async()=>{
     render();
   }
 });
+/* 「管理静默登录」是折叠区：凭据表单不再和「打卡定位」挤在同一列，也不再让整页多一张
+   "表单卡"。展开与否由用户决定，render() 每 1.5 秒重绘也不碰它，所以不会自己弹回去。 */
+function setLoginPanel(open){
+  $('idm-panel').hidden=!open;
+  $('idm-toggle').setAttribute('aria-expanded',open?'true':'false');
+  if(open&&!$('idm-username').disabled)$('idm-username').focus();
+}
+$('idm-toggle').onclick=()=>setLoginPanel($('idm-panel').hidden);
 $('idm-credential-form').addEventListener('submit',async event=>{
   event.preventDefault();
   if(!state||syncedEpoch!==epoch){notify('凭据状态尚未同步，请稍后重试。',true);return;}
@@ -235,8 +241,8 @@ $('idm-credential-form').addEventListener('submit',async event=>{
     render();
   }
 });
-$('idm-clear').onclick=()=>confirmAction('清除统一认证凭据？',
-  '清除后登录需要人工输入账号密码和验证码。校园网账号与打卡登录态不受影响。',
+$('idm-clear').onclick=()=>confirmAction('清除已保存的学号密码？',
+  '只删除本机保存的统一认证学号密码，下次登录需人工输入。当前学校登录态和校园网账号都不受影响。',
   async()=>{if(await act('idm_credentials_clear')){$('idm-password').value='';$('idm-save-state').textContent='';render();}});
 $('toggle-password').addEventListener('click',()=>{const show=$('password').type==='password';$('password').type=show?'text':'password';$('toggle-password').setAttribute('aria-label',show?'隐藏密码':'显示密码');$('toggle-password').setAttribute('aria-pressed',String(show));});
 let confirmation=null,previousFocus=null;
@@ -272,7 +278,7 @@ $('submit-dorm').onclick=()=>{
     act(recheck?'dorm_query':'dorm_submit');
   });
 };
-$('logout-dorm').onclick=()=>confirmAction('清除学校登录凭据？','这会同时关闭自动打卡。校园网账号不受影响，下次打卡需要重新登录学校账号。',async()=>{if(await act('dorm_logout')){markDirty('dorm',false);render();}});
+$('logout-dorm').onclick=()=>confirmAction('退出学校登录？','这会同时关闭自动打卡。校园网账号不受影响，下次打卡需要重新登录学校账号。',async()=>{if(await act('dorm_logout')){markDirty('dorm',false);render();}});
 
 /* 打卡账号 ---------------------------------------------------------------------------------
    所有开启了自动打卡的账号都会在各自时段内自动打卡，但 state.dorm 仍然只描述活动账号，切换
@@ -294,7 +300,7 @@ function accountLabel(account){
     :account.signed_today?' · 今日已完成'
     :!account.enabled?' · 未开启自动打卡'
     :accountSuffixState[account.state]||' · 等待时段';
-  return account.name+(account.idm_username?` · ${account.idm_username}`:'')+suffix;
+  return account.name+(account.idm_username?` · 学号 ${account.idm_username}`:'')+suffix;
 }
 // 汇总只在多账号时出现：单个账号的自动打卡状态在下面的设置卡片里已经说清楚了。
 function accountSummary(items){
@@ -308,6 +314,31 @@ function requireAccountSync(){
   // 清单读不出来时后端会拒绝每一个账号操作，这里先按它的原话说明，不让按钮白点。
   if(state.accounts?.error){notify(state.accounts.error,true);return false;}
   return true;
+}
+/* 学校登录 ---------------------------------------------------------------------------------
+   登录态只有后端能回答：快照里的 has_session 直接读本机保存的学校会话。不用 state 反推 ——
+   「今日已完成」「等待时段」「自动打卡已关闭」都在读会话**之前**就返回了，反推会把「今天没查过」
+   说成「已登录」。宁可让人多点一次「学校登录」，也不能让人以为已经登录。
+   老快照没有这个字段，那时一律说「尚未确认」，不猜。
+   凭据与账号归属：统一认证凭据存在每个打卡账号自己的档案里，所以这里必须点名是谁的，
+   否则切换账号后这张卡的归属会静默改变，而用户看不出来。 */
+function renderLogin(d,pending){
+  const session=d.has_session,account=activeAccount();
+  const expired=d.state==='login_required',loggedIn=session===true;
+  const subject=account?`打卡账号「${account.name}」`:'本机';
+  badge('login-badge',
+    expired?'登录已失效':loggedIn?'已登录':session===false?'未登录':'尚未确认',
+    expired?'error':loggedIn?'success':session===false?'warning':'');
+  $('login-line').textContent=expired
+    ?`${subject}的学校登录已失效，点「学校登录 / 重新登录」才能继续打卡。`
+    :loggedIn?`${subject}已登录学校账号。`
+    :session===false?`${subject}尚未登录学校账号，点「学校登录 / 重新登录」即可开始。`
+    :`${subject}的登录状态尚未确认，可以先查询今日任务。`;
+  $('idm-credential-state').textContent=d.has_idm_credentials
+    ?`静默登录已就绪（学号 ${d.idm_username||'未知'}）`
+    :'静默登录未设置：每次登录需手动输入学号密码和验证码';
+  $('idm-toggle').textContent=d.has_idm_credentials?'管理静默登录':'设置静默登录';
+  $('idm-toggle').disabled=pending||d.busy;
 }
 function renderAccounts(){
   const bar=$('account-bar');

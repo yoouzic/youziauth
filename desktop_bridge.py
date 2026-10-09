@@ -278,6 +278,23 @@ class DesktopBridge(LocationProbe):
             return {'has_idm_credentials': False, 'idm_username': ''}
         return self._idm_credential_status(store)
 
+    def _dorm_has_session(self):
+        """学校登录态：本机是否保存着学校会话。
+
+        只用 store.has_session()（看密文文件在不在），**绝不调用 store.token() 去解密** ——
+        快照是只读的，会话令牌属于「绝不进快照」的那一类秘密，这条边界有测试守着
+        （test_snapshot_excludes_secrets）。宁可老实说「未登录」（代价是多点一次登录），
+        也不能为了把状态说准而把令牌读进内存。
+
+        只回答「有没有」，不校验会话是否仍然有效 —— 有效性由一次真实查询确认。
+        这个方向的误报是安全的：把「需要重新登录」说成「已登录」才会让人对着一个
+        点了没反应的按钮发呆。任何异常都降级为「没有」，不让整页快照失败。
+        """
+        try:
+            return bool(self._dorm.store.has_session())
+        except Exception:  # noqa: BLE001
+            return False
+
     def _idm_credential_status(self, store=None):
         """统一认证凭据状态：仅返回「是否已保存」与学号，绝不回传密码。
 
@@ -365,6 +382,8 @@ class DesktopBridge(LocationProbe):
                     'schedule': schedule,
                     'task': ({k: getattr(task, k) for k in
                               ('title', 'date', 'start', 'end', 'address', 'signed')} if task else None),
+                    # 学校登录态：只暴露「本机有没有会话」，绝不回传会话内容本身。
+                    'has_session': self._dorm_has_session(),
                     # 只暴露「是否已保存」与学号，绝不回传密码；多账号下读的是当前账号那一份。
                     **self._idm_status_for_active(),
                 },
@@ -804,16 +823,20 @@ class PreviewBridge(LocationProbe):
                         'message':'尚未检测，点击即可查看连接状态', 'checked':'', 'has_password':True},
             'dorm': {'state':'idle', 'message':'查询今日任务，开始今晚的安排', 'busy':False,
                      'settings':dataclasses.asdict(Settings()), 'schedule':'自动打卡：关闭', 'task':None,
-                     # 真实 bridge 会补上这两项；演示里也让它们跟着账号走，界面文案才自洽。
+                     # 真实 bridge 会补上这三项；演示里也让它们跟着账号走，界面文案才自洽。
+                     'has_session':True,
                      'has_idm_credentials':True, 'idm_username':'2026000000'},
             'accounts': {'error':'', 'max':MAX_ACCOUNTS, 'active':'demo1', 'busy':False,
                          'items':[{'id':'demo1', 'name':'演示账号一', 'active':True,
                                    'has_idm_credentials':True, 'idm_username':'2026000000',
+                                   # 演示里也要自洽：切到哪个账号，登录卡就跟着说谁的登录态。
+                                   'has_session':True,
                                    'missing':False, 'enabled':True, 'state':'signed',
                                    'message':'今日打卡已完成，当天不再重复检查',
                                    'busy':False, 'signed_today':True},
                                   {'id':'demo2', 'name':'演示账号二', 'active':False,
                                    'has_idm_credentials':False, 'idm_username':'',
+                                   'has_session':False,
                                    'missing':False, 'enabled':False, 'state':'idle',
                                    'message':'尚未查询今日任务', 'busy':False,
                                    'signed_today':False}]},
@@ -990,7 +1013,8 @@ class PreviewBridge(LocationProbe):
                 d['settings'] = dataclasses.asdict(settings)
                 d['schedule'] = '自动打卡：' + ('开启（演示）' if d['settings']['enabled'] else '关闭')
             elif action == 'dorm_login':
-                d.update(state='logged_in', message='学校登录成功（演示，不会打开真实认证）')
+                d.update(state='logged_in', message='学校登录成功（演示，不会打开真实认证）',
+                         has_session=True)
             elif action in ('dorm_query', 'dorm_submit'):
                 signed = action == 'dorm_submit'
                 d.update(state='signed' if signed else 'ready', message='今日打卡已完成（演示）' if signed else '今日任务待完成（演示）',
@@ -998,7 +1022,7 @@ class PreviewBridge(LocationProbe):
                                'start':'21:00', 'end':'23:30', 'address':'示例宿舍', 'signed':signed})
                 self._data['logs']['dorm'] += '演示 · ' + d['message'] + '\n'
             elif action == 'dorm_logout':
-                d.update(state='login_required', message='请重新登录学校账号', task=None)
+                d.update(state='login_required', message='请重新登录学校账号', task=None, has_session=False)
                 d['settings']['enabled'] = False
                 d['schedule'] = '自动打卡：关闭'
             elif action in ('account_add', 'account_switch', 'account_rename', 'account_delete'):
@@ -1035,9 +1059,10 @@ class PreviewBridge(LocationProbe):
             for item in items:
                 item['active'] = item is target
             accounts['active'] = target['id']
-            # 演示也要自洽：学号与「已保存凭据」跟着换人，否则切换后界面还在说上一个账号。
+            # 演示也要自洽：学号、「已保存凭据」和登录态都跟着换人，否则切换后界面还在说上一个账号。
             self._data['dorm']['has_idm_credentials'] = target['has_idm_credentials']
             self._data['dorm']['idm_username'] = target['idm_username']
+            self._data['dorm']['has_session'] = target['has_session']
             return {'ok': True, 'message': f"演示：已切换到账号「{target['name']}」。"
                                            '未读取或写入真实档案。'}
         if action == 'account_rename':
