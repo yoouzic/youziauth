@@ -38,6 +38,14 @@ class WorkflowPolicyTests(unittest.TestCase):
                 msg=name,
             )
 
+    def test_both_workflows_run_the_front_end_suite(self):
+        # `unittest discover` only matches test*.py, so tests/test_desktop_ui.cjs is invisible to
+        # the Python step: it drives desktop_ui/app.js against a DOM stub built from index.html.
+        # Leaving it unwired is how the 1.8.2 account-label regression reached a published release.
+        for name in ("ci.yml", "release.yml"):
+            text = ROOT.joinpath(".github", "workflows", name).read_text(encoding="utf-8")
+            self.assertIn("node --test tests/test_desktop_ui.cjs", text, msg=name)
+
     def test_signpath_configuration_is_gone(self):
         # SignPath was declined; nothing may still depend on it at release time.
         self.assertFalse(ROOT.joinpath(".signpath").exists())

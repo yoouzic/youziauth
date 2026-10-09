@@ -300,7 +300,7 @@ function accountLabel(account){
     :account.signed_today?' · 今日已完成'
     :!account.enabled?' · 未开启自动打卡'
     :accountSuffixState[account.state]||' · 等待时段';
-  return account.name+(account.idm_username?` · 学号 ${account.idm_username}`:'')+suffix;
+  return account.name+(account.idm_username?` · ${account.idm_username}`:'')+suffix;
 }
 // 汇总只在多账号时出现：单个账号的自动打卡状态在下面的设置卡片里已经说清楚了。
 function accountSummary(items){

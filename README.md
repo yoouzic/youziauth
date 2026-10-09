@@ -281,6 +281,19 @@ python .\campus_auth_web.py
 
 然后打开终端显示的本地地址，通常为 `http://127.0.0.1:8765/`。
 
+### 运行测试
+
+两套测试都要跑；它们覆盖的东西不重叠：
+
+```powershell
+python -m unittest discover -s tests -v      # Python 侧，687 个用例
+node --test tests/test_desktop_ui.cjs        # 界面侧，111 个用例
+```
+
+界面那套会把 `desktop_ui/app.js` 放进 `vm` 里跑，DOM 桩是从 `desktop_ui/index.html` 现读出来的，
+所以改了这两个文件就必须跑它——`unittest discover` 只匹配 `test*.py`，**看不到**这个 `.cjs`。
+两个工作流（`ci.yml`、`release.yml`）都会执行它。
+
 </details>
 
 ## 适用范围与免责声明

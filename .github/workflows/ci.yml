@@ -1,4 +1,4 @@
-﻿name: CI
+name: CI
 
 on:
   push:
@@ -22,6 +22,19 @@ jobs:
         run: python -m pip install --requirement requirements-build.txt
       - name: Run tests
         run: python -m unittest discover -s tests -v
+      - name: Run front-end tests
+        shell: powershell
+        run: |
+          # tests/test_desktop_ui.cjs drives the real desktop_ui/app.js inside a vm against a DOM
+          # stub built from index.html. `unittest discover` cannot see it (its pattern is test*.py),
+          # so without this step a break in app.js or index.html reaches main unnoticed -- which is
+          # exactly how the 1.8.2 account-label regression shipped.
+          $version = (node --version).TrimStart('v')
+          if ([int]$version.Split('.')[0] -lt 18) {
+            throw "The front-end suite needs Node 18+ for node --test (runner has $version)."
+          }
+          node --test tests/test_desktop_ui.cjs
+          if ($LASTEXITCODE -ne 0) { throw "Front-end tests failed" }
       - name: Compile Python sources
         run: python -m compileall -q .
       - name: Build MSI

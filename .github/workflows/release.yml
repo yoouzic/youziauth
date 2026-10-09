@@ -1,4 +1,4 @@
-﻿name: Signed Windows release
+name: Signed Windows release
 
 on:
   push:
@@ -33,6 +33,17 @@ jobs:
         run: python -m pip install --requirement requirements-build.txt
       - name: Run tests
         run: python -m unittest discover -s tests -v
+      - name: Run front-end tests
+        shell: powershell
+        run: |
+          # See .github/workflows/ci.yml: `unittest discover` never runs tests/test_desktop_ui.cjs,
+          # so a release has to gate on it explicitly or a UI regression ships published.
+          $version = (node --version).TrimStart('v')
+          if ([int]$version.Split('.')[0] -lt 18) {
+            throw "The front-end suite needs Node 18+ for node --test (runner has $version)."
+          }
+          node --test tests/test_desktop_ui.cjs
+          if ($LASTEXITCODE -ne 0) { throw "Front-end tests failed" }
       - name: Verify tag matches VERSION
         shell: powershell
         run: |
