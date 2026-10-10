@@ -86,28 +86,70 @@ class WorkflowPolicyTests(unittest.TestCase):
         parts = [int(part) for part in text.split(".") if part.isdigit()]
         return tuple(parts + [0] * (3 - len(parts)))[:3]
 
+    def _published_tag_versions(self):
+        # 已发布 = 有 tag。直接读 .git 里的引用，不走 subprocess：这里既不需要管道，也不想要
+        # 子进程句柄 —— 同一个文件里的其它用例已经在用 subprocess，句柄状态会互相干扰
+        # （实测整文件运行时报 WinError 6）。
+        git_dir = ROOT / ".git"
+        if not git_dir.is_dir():
+            return None
+        names = [path.name for path in git_dir.joinpath("refs", "tags").glob("*")]
+        packed = git_dir / "packed-refs"
+        if packed.is_file():
+            for line in packed.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith(("#", "^")) or " refs/tags/" not in line:
+                    continue
+                names.append(line.rsplit("refs/tags/", 1)[1])
+        return {
+            self._version_key(name.lstrip("v"))
+            for name in names if re.fullmatch(r"v\d+(?:\.\d+)*", name)
+        }
+
     def test_the_notes_reader_is_documented_with_a_writable_template(self):
         readme = ROOT.joinpath("docs", "release-notes", "README.md")
         self.assertTrue(readme.is_file(), "The notes format must be documented where it is written")
         text = readme.read_text(encoding="utf-8")
         self.assertIn("docs/release-notes/v<版本>.md", text)
         self.assertIn("**重点**", text)
-        # 已经发布的 tag 不该再补一份说明文件：Release 一发出去就加不了资产，补写的
-        # 文件只会让人以为「这一版当时就写了」。判据是「比 VERSION 旧」——VERSION 单调
-        # 递增，比它旧的版本都已经发布过了。
-        # 当前版本不在此列：说明文件正是和版本号一起提交、随后才打 tag 的，release.yml
-        # 也要求它在 gh release create 之前就存在。不能拿 VERSION 本身当「已发布」，
-        # 否则发布窗口里这条断言和发布流程会互相矛盾（实测：v1.8.6 就撞上了）。
+
+    def test_every_published_version_keeps_its_notes_file(self):
+        # 发布说明是 Release 的资产，Release 一发出去就加不了资产 —— 所以打 tag 之前
+        # docs/release-notes/v<版本>.md 必须先随版本号一起提交（release.yml 就是这么卡的）。
+        # 反过来说：只要某个版本上架过，它的说明文件就必须留在仓库里，否则再也补不进那一版。
+        # 判据是「有 tag」，不是「比 VERSION 旧」：说明文件正是和版本号同时提交、随后才打
+        # tag 的，拿 VERSION 当已发布会让这条断言和发布流程互相矛盾，把每一次版本号提升都
+        # 拦死（实测：升到 1.8.7 时撞上）。
+        published = self._published_tag_versions()
+        if published is None:
+            self.skipTest("git cannot list tags locally or from origin")
+        notes = {self._version_key(path.stem.lstrip("v"))
+                 for path in ROOT.joinpath("docs", "release-notes").glob("v*.md")}
         current = self._version_key(
             ROOT.joinpath("VERSION").read_text(encoding="utf-8").strip()
         )
-        backfilled = [
-            path for path in ROOT.joinpath("docs", "release-notes").glob("v*.md")
-            if self._version_key(path.stem.lstrip("v")) < current
-        ]
+        # Release 一发出去就加不了资产，所以 release.yml 要求当前版本的说明文件先随版本号一起
+        # 提交，缺了就中止发布。这一条等同于把那个门槛前移：光看 tag 会放过「当前版本根本没
+        # 写说明」，而那正是最常漏、也最没法事后补的一种。
+        self.assertIn(
+            current, notes,
+            f"v{'.'.join(map(str, current))} has no notes file; release.yml refuses to publish "
+            "without docs/release-notes/v<VERSION>.md",
+        )
+        # 说明文件是 v1.8.6 才引入的：比首个有说明的版本更早的 tag 无法追溯补写，只能豁免。
+        first = min(notes)
+        for version in sorted(published):
+            if version < first:
+                continue
+            self.assertIn(
+                version, notes,
+                f"v{'.'.join(map(str, version))} is published but has no notes file; "
+                "a published Release cannot gain that asset later",
+            )
+        # 反过来，说明文件也不该指向一个还没发布的版本：那通常意味着 tag 漏打了，
+        # 或者 VERSION 被写成了旧值。
         self.assertFalse(
-            backfilled,
-            "A tag that is already published cannot gain an asset; do not add its notes file",
+            [version for version in notes if version > current and version not in published],
+            "A notes file describes a version that is neither published nor the current one",
         )
 
     def test_signing_key_is_never_committed(self):
