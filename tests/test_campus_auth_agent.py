@@ -241,11 +241,11 @@ class AgentLoopTests(unittest.TestCase):
         agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]), updater=SlowUpdater())
         try:
             snapshot = agent.request_update_check()
-            self.assertTrue(started.wait(2), 'the update must actually start')
+            self.assertTrue(started.wait(10), 'the update must actually start')
             # 回来的时候更新还没结束 —— 这就是「不阻塞指令通道」。
             self.assertNotEqual(snapshot.update.get('state'), 'installed')
             finish.set()
-            deadline = time.monotonic() + 3
+            deadline = time.monotonic() + 10
             while agent.snapshot.update.get('state') != 'installed' and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertEqual(agent.snapshot.update.get('state'), 'installed')
@@ -272,11 +272,11 @@ class AgentLoopTests(unittest.TestCase):
         agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]), updater=updater)
         try:
             agent.request_update_check()
-            self.assertTrue(entered.wait(2))
+            self.assertTrue(entered.wait(10))
             agent.request_update_check()
             agent.request_update_check()
             release.set()
-            deadline = time.monotonic() + 3
+            deadline = time.monotonic() + 10
             while updater.calls < 1 and time.monotonic() < deadline:
                 time.sleep(0.02)
             time.sleep(0.1)
@@ -339,8 +339,14 @@ class AgentLoopTests(unittest.TestCase):
             started = time.monotonic()
             agent.periodic_update_check()
             elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 1.0, 'periodic_update_check must return at once')
-            self.assertTrue(held.wait(2), 'the update must actually be running')
+            # 主判据用锁而不是墙钟：更新还卡在 release.wait 上，所以检查一旦返回，
+            # 锁必须仍然被后台线程持有 —— 这就是「没有等待」。墙钟只做一个很松的兜底
+            # （CI runner 比开发机慢，1 秒的界会间歇性失败）。
+            self.assertTrue(held.wait(5), 'the update must actually be running')
+            self.assertFalse(
+                agent._update_lock.acquire(blocking=False),
+                'the work must still be in flight, so it cannot have been awaited')
+            self.assertLess(elapsed, 5.0, 'periodic_update_check must not wait for the download')
             # 更新还卡着，但网络循环照常跑完一轮。
             result = agent.run_cycle()
             self.assertEqual(result.snapshot.state, 'online_external')
