@@ -466,7 +466,10 @@ def _validate_inputs(path, executable, version, sha256, signature):
             or anchor.parent != current.parent):
         raise UpdateVerificationError(_ERRORS[10])
     msi = _file_path(path, "MSI 安装包路径无效或文件不可读取。")
-    if msi.suffix.lower() != ".msi":
+    # 断点续传的半成品叫 `.partial-<版本>.msi.part`（刻意不叫 .msi，免得被当成可安装的包）。
+    # 续传写完后进入校验/安装的正是这个文件，所以它的结尾也要放行 —— 否则整整 66 MB 下载
+    # 成功却在最后一步因为文件名被拒。内容仍由下面的摘要与签名校验把关。
+    if not msi.name.lower().endswith((".msi", ".msi.part")):
         raise UpdateVerificationError("更新安装包必须为 MSI 文件。")
     size = msi.stat().st_size
     if not 0 < size <= 0xFFFFFFFF:

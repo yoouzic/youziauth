@@ -555,5 +555,54 @@ class VerifierTopologyTests(unittest.TestCase):
                                         signature=b"x" * 64)
 
 
+class ResumeFileTests(unittest.TestCase):
+    """A resumed download installs from its .msi.part file.
+
+    Observed live: the agent downloaded all 65,962,304 bytes through the proxy in 5.7
+    minutes and then refused it with "更新安装包必须为 MSI 文件" -- the partial is named
+    .partial-<version>.msi.part on purpose, and the extension gate only knew .msi.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        for name in ("youziauth.exe", "youziauth-agent.exe"):
+            (self.root / name).write_bytes(b"build")
+        self.payload = b"package bytes"
+        self.sha256 = hashlib.sha256(self.payload).hexdigest()
+        for item in (
+            patch.object(update.sys, "platform", "win32"),
+            patch.object(update.sys, "frozen", True, create=True),
+            patch.object(update.sys, "executable", str(self.root / "youziauth-agent.exe")),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def validate(self, candidate):
+        return update._validate_inputs(candidate, self.root / "youziauth.exe", "1.9.0",
+                                       self.sha256, signature=b"x" * 64)
+
+    def test_a_resumed_partial_is_accepted(self):
+        partial = self.root / ".partial-1.9.0.msi.part"
+        partial.write_bytes(self.payload)
+        msi, anchor, *_ = self.validate(partial)
+        self.assertEqual(msi, partial)
+        self.assertEqual(anchor, self.root / "youziauth.exe")
+
+    def test_a_plain_msi_is_still_accepted(self):
+        plain = self.root / "youziauth-1.9.0.msi"
+        plain.write_bytes(self.payload)
+        self.assertEqual(self.validate(plain)[0], plain)
+
+    def test_anything_else_is_still_refused(self):
+        for name in ("notes.txt", "youziauth.msi.part.old", "evil.exe", "x.msi.bak"):
+            with self.subTest(name=name):
+                candidate = self.root / name
+                candidate.write_bytes(self.payload)
+                with self.assertRaises(update.UpdateVerificationError):
+                    self.validate(candidate)
+
+
 if __name__ == "__main__":
     unittest.main()
