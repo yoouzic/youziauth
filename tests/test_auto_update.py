@@ -260,6 +260,23 @@ class StatusFileTests(unittest.TestCase):
         self.assertTrue(target.is_file())
         self.assertEqual(auto_update.read_status(target).state, 'up_to_date')
 
+    def test_the_installed_version_is_read_from_either_layout(self):
+        # 冻结的 one-folder 构建把 VERSION 放在 _internal 里（PyInstaller 的内容目录，
+        # 也就是 sys._MEIPASS 指向的地方），**不在**可执行文件旁边。只看安装根目录会
+        # 读到空字符串，而读不到版本会让整条自动更新直接拒绝运行 —— 实测线上 1.8.7 的
+        # 安装目录就是这种布局。
+        install = Path(self.temporary.name) / 'install'
+        (install / '_internal').mkdir(parents=True)
+        self.assertEqual(auto_update.read_installed_version(install), '')
+        (install / '_internal' / 'VERSION').write_text('1.9.0\n', encoding='utf-8')
+        self.assertEqual(auto_update.read_installed_version(install), '1.9.0')
+        # 根目录那份优先（源码布局、或将来改了打包方式）。
+        (install / 'VERSION').write_text('2.0.0\n', encoding='utf-8')
+        self.assertEqual(auto_update.read_installed_version(install), '2.0.0')
+        # 根目录那份坏了就退回 _internal 里的好副本。
+        (install / 'VERSION').write_text('nonsense', encoding='utf-8')
+        self.assertEqual(auto_update.read_installed_version(install), '1.9.0')
+
     def test_the_installed_version_is_read_or_reported_as_unknown(self):
         install = Path(self.temporary.name) / 'install'
         install.mkdir()

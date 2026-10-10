@@ -40,6 +40,7 @@ import dataclasses
 import datetime as dt
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -123,15 +124,28 @@ def write_status(path: Path, status: UpdateStatus) -> None:
 
 
 def read_installed_version(install_dir: Path) -> str:
-    """The version actually on disk, or ``''`` when it cannot be read."""
-    try:
-        value = (Path(install_dir) / "VERSION").read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
-    parts = value.split(".")
-    if len(parts) != 3 or any(not part.isdigit() for part in parts):
-        return ""
-    return value
+    """The version actually on disk, or ``''`` when it cannot be read.
+
+    A frozen one-folder build ships ``VERSION`` **inside** ``_internal`` (PyInstaller's
+    contents directory, which is also what ``sys._MEIPASS`` points at), not next to the
+    executable. Looking only at the install root reads ``''``, and an unreadable version
+    makes the whole unattended update refuse to run -- so both layouts are checked, plus
+    the location the running process itself would resolve.
+    """
+    install_dir = Path(install_dir)
+    candidates = [install_dir / "VERSION", install_dir / "_internal" / "VERSION"]
+    running = Path(sys.executable) if getattr(sys, "frozen", False) else None
+    if running is not None and running.parent.name == Path(install_dir).name:
+        candidates.insert(0, running.parent / "VERSION")
+    for candidate in candidates:
+        try:
+            value = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        parts = value.split(".")
+        if len(parts) == 3 and all(part.isdigit() for part in parts):
+            return value
+    return ""
 
 
 def _timestamp() -> str:
