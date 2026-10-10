@@ -489,5 +489,71 @@ class ProcessBoundaryTests(unittest.TestCase):
                 self.assertNotIn("C:\\", message)
 
 
+class VerifierTopologyTests(unittest.TestCase):
+    """Who may drive an update, and what it may install.
+
+    The privileged SYSTEM agent owns unattended updates, so *it* runs the validation --
+    but it is youziauth-agent.exe, while the artifact being installed is youziauth.exe.
+    Requiring the caller to be youziauth.exe made every automatic update fail at the last
+    step, after the package had already been downloaded and re-verified.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.install = self.root / "install"
+        self.install.mkdir()
+        self.app = self.install / "youziauth.exe"
+        self.agent = self.install / "youziauth-agent.exe"
+        self.app.write_bytes(b"desktop build")
+        self.agent.write_bytes(b"agent build")
+        self.msi = self.root / "youziauth.msi"
+        self.msi.write_bytes(b"package")
+        self.sha256 = hashlib.sha256(b"package").hexdigest()
+        for item in (
+            patch.object(update.sys, "platform", "win32"),
+            patch.object(update.sys, "frozen", True, create=True),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def validate(self, caller, executable):
+        with patch.object(update.sys, "executable", str(caller)):
+            return update._validate_inputs(self.msi, executable, "1.9.0", self.sha256,
+                                          signature=b"x" * 64)
+
+    def test_the_desktop_build_may_verify_and_install_itself(self):
+        _msi, anchor, *_ = self.validate(self.app, None)
+        self.assertEqual(anchor, self.app)
+
+    def test_the_privileged_agent_may_drive_the_update(self):
+        # 这正是自动更新走的路径：agent 提权常驻，锚点是同目录下的 youziauth.exe。
+        _msi, anchor, *_ = self.validate(self.agent, self.app)
+        self.assertEqual(anchor, self.app)
+
+    def test_an_unrelated_process_may_not_drive_an_update(self):
+        other = self.root / "other.exe"
+        other.write_bytes(b"not ours")
+        with self.assertRaises(update.UpdateVerificationError):
+            self.validate(other, self.app)
+
+    def test_the_anchor_must_be_the_desktop_build_in_the_same_directory(self):
+        # 锚点换成 agent 自己、或换到别的目录，都要拒绝：更新只装 youziauth.exe 本体。
+        with self.assertRaises(update.UpdateVerificationError):
+            self.validate(self.agent, self.agent)
+        elsewhere = self.root / "youziauth.exe"
+        elsewhere.write_bytes(b"copied elsewhere")
+        with self.assertRaises(update.UpdateVerificationError):
+            self.validate(self.agent, elsewhere)
+
+    def test_nothing_may_be_installed_by_a_non_frozen_process(self):
+        with patch.object(update.sys, "frozen", False, create=True), \
+                patch.object(update.sys, "executable", str(self.app)):
+            with self.assertRaises(update.UpdateVerificationError):
+                update._validate_inputs(self.msi, self.app, "1.9.0", self.sha256,
+                                        signature=b"x" * 64)
+
+
 if __name__ == "__main__":
     unittest.main()

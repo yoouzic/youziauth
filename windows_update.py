@@ -91,6 +91,11 @@ _PAYLOAD_TEMPLATE = ('{{"v":1,"version":"{version}","sha256":"{sha256}","bytes":
 
 _VERIFY_ARGUMENT = "--verify-update"
 
+# The two frozen processes allowed to drive an update, and the one file an update may
+# install. They sit side by side in the install directory.
+_UPDATE_EXECUTABLES = frozenset({"youziauth.exe", "youziauth-agent.exe"})
+_UPDATE_ANCHOR = "youziauth.exe"
+
 # Signature gates precede Windows Installer COM access; paths never become
 # script source. The worker holds an exclusive read lock throughout, and the
 # verifier re-hashes the locked file instead of trusting a prior digest.
@@ -447,7 +452,18 @@ def _validate_inputs(path, executable, version, sha256, signature):
         raise UpdateVerificationError(_ERRORS[10])
     current = _file_path(Path(sys.executable), _ERRORS[10])
     anchor = current if executable is None else _file_path(executable, _ERRORS[10])
-    if current.name.casefold() != "youziauth.exe" or anchor != current:
+    # Two processes legitimately run this check, and the anchor must be the desktop build
+    # in both cases:
+    #  * youziauth.exe verifying and installing itself;
+    #  * youziauth-agent.exe -- the privileged SYSTEM agent that owns unattended updates --
+    #    which spawns youziauth.exe with --verify-update and installs that anchor.
+    # Requiring the caller to *be* youziauth.exe made every automatic update fail with
+    # "无法确认当前程序的更新公钥" after it had already downloaded and re-checked the
+    # package: the check described the old topology, not this one.
+    if current.name.casefold() not in _UPDATE_EXECUTABLES:
+        raise UpdateVerificationError(_ERRORS[10])
+    if (anchor.name.casefold() != _UPDATE_ANCHOR
+            or anchor.parent != current.parent):
         raise UpdateVerificationError(_ERRORS[10])
     msi = _file_path(path, "MSI 安装包路径无效或文件不可读取。")
     if msi.suffix.lower() != ".msi":
