@@ -695,6 +695,27 @@ test('idle updates show current version and offer an explicit check without auto
   assert.deepEqual(JSON.parse(JSON.stringify(h.calls)),[{action:'update_check',payload:{}}]);
 });
 
+test('what changed is readable while the package is still downloading',async()=>{
+  // 说明是在下载安装包**之前**取的，所以下载中就该看得到。等几十 MB 下完才显示，
+  // 等于让用户在整个下载期间都不知道自己在等什么。
+  const notes={'entries':[{'subject':'校园网：不再误报「能上网」','kind':'','date':''},
+                          {'subject':'更新页会写清这次改了什么','kind':'重点','date':''}],
+               'total':2,'more':false,'note':''};
+  for(const [state,label] of [['downloading','正在后台下载'],['verifying','正在验证'],
+                              ['ready','准备安装'],['installing','正在后台安装']]){
+    const h=await updateHarness({...readyUpdate,state,changes:notes,
+      downloaded_bytes:4194304,total_bytes:10485760,progress:40});
+    assert.equal(h.el('update-status').textContent,label,'state '+state);
+    assert.equal(h.el('update-changes').hidden,false,'notes must be visible in '+state);
+    assert.equal(h.el('update-changes-list').children.length,2,'notes must be listed in '+state);
+    assert.equal(h.el('update-changes-summary').textContent,'1.4.4 → v1.5.0 · 共 2 条');
+    assert.equal(h.el('update-changes-list').children[1].textContent,'重点 · 更新页会写清这次改了什么');
+  }
+  // 而「已经是最新」时不该出现：没有新版本就没有「这次改了什么」。
+  const fresh=await updateHarness({state:'up_to_date',latest_version:'1.4.4',changes:notes});
+  assert.equal(fresh.el('update-changes').hidden,true);
+});
+
 test('the check button asks the agent to look, it never installs',async()=>{
   // 用「已是最新」：'ready' 是代理准备安装，检查按钮本身就应该是禁用的。
   const h=await updateHarness({state:'up_to_date',latest_version:'1.4.4',message:'当前已是最新正式版。'});

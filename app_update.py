@@ -166,12 +166,16 @@ def release_assets(data, version):
         if type(size) is not int or not 0 < size <= (MAX_PACKAGE_BYTES if name.endswith('.msi') else 32768):
             raise ValueError('更新附件大小无效')
         result[name] = asset
-    # 中文说明是可选的：有就校验来源，没有或形状不对就当这版没写说明。
+    # 中文说明是可选的：只有发布真的上传了一个形状合法的 release-notes.md，才给出它
+    # 的来源地址。缺席、重复或形状不对都等于「这一版没写说明」，调用方据此退回提交对比。
+    # 用一个**已校验**的地址而不是按约定拼地址：拼出来的地址对「没上传」和「上传了」
+    # 是同一个字符串，而这两件事要走不同的路径。
     notes = [asset for asset in assets if asset.get('name') == NOTES_ASSET]
-    if len(notes) == 1 and notes[0].get('state') == 'uploaded':
+    if len(notes) == 1:
         asset = notes[0]
         size = asset.get('size')
         if (asset.get('browser_download_url') == f'{origin}/releases/download/v{version}/{NOTES_ASSET}'
+                and asset.get('state') == 'uploaded'
                 and type(size) is int and 0 < size <= MAX_NOTES_BYTES):
             result[NOTES_ASSET] = asset
     return result
@@ -562,10 +566,20 @@ class UpdateController:
             return
         assets = release_assets(data, version)
         package = assets['youziauth.msi']
+        # 缓存目录要先建好：说明是**先**取的，而它要写进这个目录。旧顺序里说明排在下载
+        # 之后，所以目录晚一步建也没人发现。
+        try:
+            self._cache.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            raise RuntimeError('无法保存或读取更新文件，请检查磁盘空间和本机权限后重试。') from None
+        # 先取「这次改了什么」，再动安装包。安装包有几十 MB，下载要几分钟；把说明放在
+        # 下载之后，用户在整个下载期间只知道「有新版本」，却不知道新版本改了什么 ——
+        # 而「要不要升」正是他此刻想知道的事。说明只是一份小文本，先拿它不花时间。
+        self._load_changes(self._data['current_version'], version, assets.get(NOTES_ASSET))
+        self._ensure_open()
         digest = read_checksum(assets['SHA256SUMS.txt']['browser_download_url'])
         signature = read_signature(assets['youziauth.msi.ed25519']['browser_download_url'])
         self._ensure_open()
-        self._cache.mkdir(parents=True, exist_ok=True)
         destination = self._cache / f'youziauth-{version}.msi'
         size = package['size']
         self._set(total_bytes=size)
@@ -575,15 +589,11 @@ class UpdateController:
         else:
             self._download(package['browser_download_url'], size, destination, version, digest, signature)
         self._ensure_open()
-        notes = assets.get(NOTES_ASSET)
-        self._load_changes(self._data['current_version'], version,
-                           notes['browser_download_url'] if notes else '')
-        self._ensure_open()
         self._package = (destination, version, digest, signature)
         self._set(state='ready', progress=100, downloaded_bytes=size,
                   message=f'v{version} 已下载，哈希与发布者签名校验通过；确认后即可安装。')
 
-    def _load_changes(self, current_version, version, notes_url=''):
+    def _load_changes(self, current_version, version, notes_asset=None):
         """填 ``changes`` 块：优先发布者手写的中文说明，其次提交对比，最后实话实说。
 
         纯展示信息：任何失败都只让界面少一块内容，绝不影响「有新版本、已下载、
@@ -602,10 +612,15 @@ class UpdateController:
         if cached is not None:
             self._set(changes=cached)
             return
+        # 先把「有新版本、正在取说明」摆出去，再发请求。这一步是**订阅**：调用方在
+        # 取说明期间读到的快照就有 latest_version，而不是等到下载都开始了才知道有新版。
+        self._set(state='checking', latest_version=version, changes=_no_changes(),
+                  message=f'发现 v{version}，正在读取更新说明…')
         changes = None
-        if notes_url:
+        if isinstance(notes_asset, dict) and isinstance(notes_asset.get('browser_download_url'), str):
             try:
-                changes = read_notes(read_small(notes_url, MAX_NOTES_BYTES), version)
+                changes = read_notes(
+                    read_small(notes_asset['browser_download_url'], MAX_NOTES_BYTES), version)
             except _FAILED_CHANGELOG:
                 changes = None      # 说明坏了就退回提交对比，不让这一版空着
         if changes is None:

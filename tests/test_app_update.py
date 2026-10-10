@@ -214,16 +214,73 @@ class UpdaterTests(unittest.TestCase):
             with self.subTest(contents=contents), patch('app_update.open_url', side_effect=corrupted):
                 state = self.check()
             self.assertEqual(state['state'], 'error')
-            self.assertFalse(list(Path(self.tmp.name).iterdir()))
+            # 只断言没有可安装的包：说明是**先**于下载取的，它的缓存文件留在这里是正常的。
+            self.assertFalse(list(Path(self.tmp.name).glob('*.msi')))
 
     def test_signature_rejection_is_visible_and_leaves_no_installable_package(self):
         with patch('app_update.open_url', side_effect=self.open), patch('app_update.verify_msi', side_effect=RuntimeError('安装包签名无效')):
             state = self.check()
         self.assertEqual(state['state'], 'error')
         self.assertIn('签名', state['message'])
-        self.assertFalse(list(Path(self.tmp.name).iterdir()))
+        self.assertFalse(list(Path(self.tmp.name).glob('*.msi')))
         with self.assertRaises(RuntimeError):
             self.controller.install(True, '1.5.0')
+
+    def test_the_notes_arrive_before_the_package_is_downloaded(self):
+        # 顺序很关键：安装包几十 MB，下载要几分钟。说明若排在下载之后，用户在整个下载
+        # 期间只知道「有新版本」，不知道改了什么 —— 而「要不要升」正是此刻的问题。
+        self.data = release(notes=NOTES)
+        order = []
+        original = self.open
+
+        def traced(url):
+            if url.endswith('release-notes.md'):
+                order.append('notes')
+            elif url.endswith('youziauth.msi'):
+                order.append('package')
+            elif url.endswith('SHA256SUMS.txt'):
+                order.append('checksum')
+            return original(url)
+
+        with patch('app_update.open_url', side_effect=traced), patch('app_update.verify_msi'):
+            state = self.check()
+        self.assertEqual(state['state'], 'ready')
+        self.assertEqual(order.count('package'), 1)
+        self.assertLess(order.index('notes'), order.index('checksum'),
+                        'the notes must be fetched before the checksum plumbing')
+        self.assertLess(order.index('checksum'), order.index('package'),
+                        'and both must precede the tens-of-megabytes download')
+        # 说明已经在手里了：这就是「先显示改了什么，再更新」。
+        self.assertEqual(state['changes']['total'], 3)
+
+    def test_the_release_and_its_notes_are_published_while_the_package_downloads(self):
+        # 下载期间就要能看到「发现 vX + 这次改了什么」，而不是等 ready 才一次性出现。
+        # 做法：把 MSI 的响应卡住，站在下载中读快照。
+        self.data = release(notes=NOTES)
+        original = self.open
+        entered, release_download = threading.Event(), threading.Event()
+
+        def held(url):
+            if url.endswith('youziauth.msi'):
+                entered.set()
+                release_download.wait(5)
+            return original(url)
+
+        with patch('app_update.open_url', side_effect=held), patch('app_update.verify_msi'):
+            self.controller.check()
+            try:
+                self.assertTrue(entered.wait(3), 'the download must start')
+                mid = self.controller.snapshot()
+            finally:
+                release_download.set()
+            self.controller._worker.join(5)
+
+        self.assertEqual(mid['state'], 'downloading')
+        self.assertEqual(mid['latest_version'], '1.5.0')
+        self.assertEqual(mid['changes']['total'], 3,
+                         'the notes must already be visible mid-download')
+        self.assertEqual(mid['progress'], 0, 'and the download must not have finished')
+        self.assertEqual(self.controller.snapshot()['state'], 'ready')
 
     def test_hand_written_chinese_notes_win_over_the_commit_list(self):
         self.data = release(notes=NOTES)
@@ -555,7 +612,7 @@ class UpdaterTests(unittest.TestCase):
         with patch('app_update.open_url', side_effect=cancelled):
             state = self.check()
         self.assertNotEqual(state['state'], 'ready')
-        self.assertFalse(list(Path(self.tmp.name).iterdir()))
+        self.assertFalse(list(Path(self.tmp.name).glob('*.msi')))
         with self.assertRaises(RuntimeError):
             self.controller.check()
 

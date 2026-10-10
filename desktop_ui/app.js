@@ -278,9 +278,11 @@ function changeRows(changes){
   return {items,more,total,note:items.length?note:(note||CHANGE_FALLBACK)};
 }
 function renderChanges(u){
-  // 「这次改了什么」只在真的拿到新版本说明时出现：代理已经下载好（ready）、正在装、
-  // 或刚装完。launching/launched 是旧 agent 的词，保留兼容。
-  const changes=['ready','installing','installed','launching','launched'].includes(u.state)?u.changes:null;
+  // 「这次改了什么」在**发现新版本的那一刻**就该出现：说明是在下载安装包之前取的，
+  // 要等几十 MB 下完才显示等于让用户在整个下载期间都不知道自己在等什么。所以
+  // downloading / verifying 也要显示。launching/launched 是旧 agent 的词，保留兼容。
+  const changes=['downloading','verifying','ready','installing','installed',
+                 'launching','launched'].includes(u.state)?u.changes:null;
   const {items,more,total,note}=changeRows(changes);
   $('update-changes').hidden=!(items.length||note);
   $('update-changes-summary').textContent=items.length

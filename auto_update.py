@@ -196,8 +196,14 @@ class Updater:
         except Exception:  # noqa: BLE001 - a failed relaunch is reported, not raised
             return False
 
-    def run_cycle(self) -> UpdateStatus:
-        """Check, verify, install silently, and report. One attempt, no loops."""
+    def run_cycle(self, progress=None) -> UpdateStatus:
+        """Check, verify, install silently, and report. One attempt, no loops.
+
+        ``progress`` (optional) receives a status block as soon as the release is known,
+        before the download starts. The interface needs that gap filled: the package is
+        tens of megabytes, and "what changed" is exactly what the user wants to read
+        while they wait.
+        """
         current = read_installed_version(self.install_dir)
         if not current:
             return _report(self._report, UpdateStatus(
@@ -210,6 +216,9 @@ class Updater:
             controller.check()
             worker = getattr(controller, "_worker", None)
             if worker is not None:
+                # 安装包下载要几分钟。趁它在下，把「发现新版本 + 更新内容」先报出去，
+                # 而不是等下完再一次性告诉用户。
+                self._report_interim(controller, progress, current)
                 worker.join(600)
             snapshot = controller.snapshot()
             status = self._status_from_check(snapshot, current)
@@ -247,21 +256,52 @@ class Updater:
         finally:
             controller.close()
 
+    def _report_interim(self, controller, progress, current):
+        """Publish the release (and its notes) while the package is still downloading.
+
+        Only the "checking / downloading / verifying" window is published: those are the
+        states a controller passes through *before* the download finishes. Guessing at
+        the rest would put a status block in front of the user that the next real update
+        immediately contradicts.
+        """
+        if progress is None:
+            return None
+        try:
+            snapshot = controller.snapshot()
+        except Exception:  # noqa: BLE001 - a status peek must never break the update
+            return None
+        state = str(snapshot.get("state", ""))
+        if state not in ("checking", "downloading", "verifying"):
+            return None
+        status = self._status_from_check(snapshot, current)
+        if status.state in ("checking", "downloading", "verifying"):
+            return _report(progress, status)
+        return None
+
     def _status_from_check(self, snapshot: dict, current: str) -> UpdateStatus:
-        """Translate the controller's check result into a status block."""
+        """Translate the controller's check result into a status block.
+
+        ``changes`` is carried for every state that has a release on the table, not just
+        ``ready``: the agent publishes this block once, when the check returns, and the
+        interface has to be able to show "what changed" while the package is still
+        downloading. Dropping it here would hide the notes exactly when they matter.
+        """
         state = str(snapshot.get("state", "error"))
-        latest = str(snapshot.get("latest_version", ""))
         changes = snapshot.get("changes")
         if not isinstance(changes, dict):
             changes = {}
+        known = state in ("ready", "up_to_date", "error")
+        interesting = state in ("downloading", "verifying", "ready", "installing")
+        if not isinstance(changes.get("entries"), list):
+            changes = {}
         return UpdateStatus(
-            state=state if state in ("ready", "up_to_date", "error") else "error",
-            current_version=current, latest_version=latest,
+            state=state if known or state in ("downloading", "verifying", "installing") else "error",
+            current_version=current, latest_version=str(snapshot.get("latest_version", "")),
             progress=int(snapshot.get("progress", 0) or 0),
             checked=str(snapshot.get("checked", "") or _timestamp()),
             message=str(snapshot.get("message", "")),
-            detail="" if state in ("ready", "up_to_date") else "check failed",
-            changes=changes if state == "ready" else {},
+            detail="" if known else "check failed",
+            changes=changes if interesting else {},
         )
 
     def _status_from_install(self, result: object, version: str, tray: bool = False) -> UpdateStatus:

@@ -301,11 +301,13 @@ class Agent:
         """跑一次后台更新。任何异常都只降级为错误状态，绝不能让 agent 退出。
 
         调用方必须已经持有 ``self._update_lock``。
+
+        中途也会发布状态：安装包有几十 MB，用户不该在整个下载期间都看不到「这次改了什么」。
         """
         if self.updater is None:
             return self.snapshot
         try:
-            status = self.updater.run_cycle()
+            status = self.updater.run_cycle(progress=self._publish_update)
         except Exception as exc:  # noqa: BLE001 - a failed update must not stop the agent
             self.logger.warning("automatic update failed: %s", type(exc).__name__)
             return self.snapshot
@@ -318,33 +320,49 @@ class Agent:
     def request_update_check(self) -> RuntimeSnapshot:
         """界面请求「现在检查一次更新」—— 只是一个信号，没有任何参数。
 
-        **立刻返回**：检查加下载可能要好几分钟，而这条指令走在 named pipe 上，界面那边
+        **立刻返回**：检查加下载可能好几分钟，而这条指令走在 named pipe 上，界面那边
         三秒就超时。真正的更新在后台线程里跑，进度由运行时快照回报。
         """
-        if self.updater is None or not self._update_lock.acquire(blocking=False):
-            return self.snapshot
-
-        def work():
-            try:
-                self._run_update_check("requested")
-            finally:
-                self._update_lock.release()
-
-        threading.Thread(target=work, name="youziauth-agent-update", daemon=True).start()
+        self._start_update_thread("requested")
         return self.snapshot
 
     def update_due(self) -> bool:
         return self.updater is not None and time.monotonic() >= self._next_update_at
 
     def periodic_update_check(self) -> RuntimeSnapshot:
+        """到点检查一次。**在后台线程里跑**，立刻返回。
+
+        它是在网络循环的间隙被调用的，而一次更新要下载几十 MB。同步跑会把校园网认证
+        推迟几分钟 —— 那是这个进程的本职工作，不能给更新让路。
+        """
         # 先排下一次，再动手：安装会把这个进程杀掉，重启后不该立刻再跑一遍。
         self._next_update_at = time.monotonic() + self.update_interval_seconds
-        if not self._update_lock.acquire(blocking=False):
-            return self.snapshot      # 已经有一次在跑，不重复发起
-        try:
-            return self._run_update_check("periodic")
-        finally:
+        self._start_update_thread("periodic")
+        return self.snapshot
+
+    def _start_update_thread(self, reason: str) -> None:
+        """拿不到锁就说明已经有一次在跑，直接返回（不排队、不重复发起）。"""
+        if self.updater is None or not self._update_lock.acquire(blocking=False):
+            return
+
+        def work():
+            try:
+                self._run_update_check(reason)
+            finally:
+                self._update_lock.release()
+
+        threading.Thread(target=work, name="youziauth-agent-update", daemon=True).start()
+
+    def wait_for_update(self, timeout: float = 5.0) -> bool:
+        """等正在跑的那次更新结束。给测试和退出流程用，不参与正常调度。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._update_lock.acquire(blocking=False):
+                time.sleep(0.01)
+                continue
             self._update_lock.release()
+            return True
+        return False
 
     def serve_forever(
         self,

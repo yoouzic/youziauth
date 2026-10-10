@@ -193,6 +193,7 @@ class AgentArgumentTests(unittest.TestCase):
 class AgentLoopTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
+        self._agents = []
         self.snapshot_path = Path(self.temporary.name) / "runtime.json"
         self.config = campus_auth.AuthConfig(
             username="student",
@@ -203,11 +204,14 @@ class AgentLoopTests(unittest.TestCase):
         self.logger.addHandler(logging.NullHandler())
 
     def tearDown(self):
+        # 更新检查在后台线程里跑，清理临时目录前要等它收工，否则它会往正在删的目录里写快照。
+        for agent in self._agents:
+            agent.wait_for_update(5)
         self.temporary.cleanup()
 
     def make_agent(self, probe, authenticator, boot_id="boot-1", updater=None,
                    update_interval_seconds=6 * 60 * 60):
-        return Agent(
+        agent = Agent(
             config_loader=lambda: self.config,
             probe=probe,
             authenticator=authenticator,
@@ -217,13 +221,15 @@ class AgentLoopTests(unittest.TestCase):
             updater=updater,
             update_interval_seconds=update_interval_seconds,
         )
+        self._agents.append(agent)
+        return agent
 
     def test_an_update_request_returns_immediately_and_reports_the_result(self):
         # 检查加下载可能几分钟，而指令走在三秒超时的 named pipe 上：必须先回。
         started, finish = threading.Event(), threading.Event()
 
         class SlowUpdater:
-            def run_cycle(inner):
+            def run_cycle(inner, progress=None):
                 started.set()
                 finish.wait(3)
                 return auto_update.UpdateStatus(state='installed', current_version='1.9.0',
@@ -254,7 +260,7 @@ class AgentLoopTests(unittest.TestCase):
             def __init__(inner):
                 inner.calls = 0
 
-            def run_cycle(inner):
+            def run_cycle(inner, progress=None):
                 inner.calls += 1
                 entered.set()
                 release.wait(3)
@@ -299,7 +305,7 @@ class AgentLoopTests(unittest.TestCase):
             def __init__(inner):
                 inner.calls = 0
 
-            def run_cycle(inner):
+            def run_cycle(inner, progress=None):
                 inner.calls += 1
                 return auto_update.UpdateStatus(state='up_to_date', message='已是最新。')
 
@@ -308,9 +314,41 @@ class AgentLoopTests(unittest.TestCase):
                                 update_interval_seconds=300)
         self.assertTrue(agent.update_due(), 'the first check is due immediately')
         agent.periodic_update_check()
-        self.assertEqual(updater.calls, 1)
-        # 下一次被排到 300 秒之后：安装会杀掉进程，重启后不该马上又装一遍。
+        # 排期是立刻生效的（安装会杀掉进程，重启后不该马上又装一遍）；
+        # 实际检查在后台线程里跑，所以这里等它结束再数次数。
         self.assertFalse(agent.update_due())
+        self.assertTrue(agent.wait_for_update(5), 'the background check must finish')
+        self.assertEqual(updater.calls, 1)
+
+    def test_a_slow_update_never_delays_the_network_heartbeat(self):
+        # 更新要下载几十 MB，而它是插在网络循环间隙跑的。同步跑会把校园网认证推迟
+        # 几分钟 —— 那是这个进程的本职工作，不能给更新让路。
+        held, release = threading.Event(), threading.Event()
+
+        class HangingUpdater:
+            def run_cycle(inner, progress=None):
+                held.set()
+                release.wait(5)
+                return auto_update.UpdateStatus(state='up_to_date', message='已是最新。')
+
+        agent = self.make_agent(FakeProbe([NetworkObservation(True, False)]),
+                                FakeAuthenticator([]), updater=HangingUpdater())
+        try:
+            started = time.monotonic()
+            agent.periodic_update_check()
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.0, 'periodic_update_check must return at once')
+            self.assertTrue(held.wait(2), 'the update must actually be running')
+            # 更新还卡着，但网络循环照常跑完一轮。
+            result = agent.run_cycle()
+            self.assertEqual(result.snapshot.state, 'online_external')
+        finally:
+            release.set()
+            agent.wait_for_update(5)
+
+    def test_waiting_for_an_update_returns_once_it_settles(self):
+        agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]))
+        self.assertTrue(agent.wait_for_update(1), 'a free agent settles immediately')
 
     def test_hotspot_connection_skips_portal_login(self):
         authenticator = FakeAuthenticator([AuthAttempt(AttemptKind.REJECTED, "no")])
