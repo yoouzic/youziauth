@@ -6,7 +6,7 @@ from __future__ import annotations
 import dataclasses
 import urllib.error
 import urllib.request
-from typing import Callable
+from typing import Callable, Optional
 
 
 # Plain HTTP on port 80, exactly what Windows NCSI probes (see
@@ -27,11 +27,26 @@ CONNECTIVITY_PROBES: tuple[tuple[str, str], ...] = (
 )
 CONNECTIVITY_URL, CONNECTIVITY_BODY = CONNECTIVITY_PROBES[0]
 
+# The second question: does the path ordinary browsing takes actually work?
+# These hosts are deliberately NOT in the NCSI set, so a proxy that sends the
+# NCSI hosts DIRECT (see proxy_rules) still routes these through its node -- which
+# is what the user's browser does. Only a 204 is accepted; a captive portal
+# cannot fake it without also being able to reach the host.
+PROXY_PATH_PROBES: tuple[str, ...] = ("http://www.gstatic.com/generate_204",)
+
 
 @dataclasses.dataclass(frozen=True)
 class NetworkObservation:
+    """``internet_ok`` is the uplink; ``proxy_path_ok`` is the browsing path.
+
+    They disagree in exactly the case that caused all the confusion: the campus
+    session is healthy and the uplink works, but the proxy node does not, so
+    nothing loads and Windows shows a captive-portal prompt anyway.
+    """
+
     internet_ok: bool
     portal_reachable: bool
+    proxy_path_ok: bool = True
 
 
 # Measure the uplink, not whatever proxy the machine happens to be configured
@@ -39,22 +54,34 @@ class NetworkObservation:
 # which urllib honours on Windows, so a dead proxy listener would be reported as
 # "no Internet" while the campus network is perfectly healthy -- and a working
 # one would mask a broken uplink. Whether a VPN can reach the outside world is a
-# separate question from whether this machine has an Internet uplink.
+# separate question from whether this machine has an Internet uplink, and it is
+# asked separately below.
 DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def probe_internet_once(url: str, expected_body: str, timeout: int) -> bool:
+def probe_once(
+    url: str,
+    timeout: int,
+    expected_body: Optional[str] = None,
+    opener=None,
+) -> bool:
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "youziauth-connectivity-check/1.0"},
         method="GET",
     )
     try:
-        with DIRECT_OPENER.open(request, timeout=timeout) as response:
+        with (opener or DIRECT_OPENER).open(request, timeout=timeout) as response:
+            if expected_body is None:
+                return response.status == 204
             text = response.read(256).decode("utf-8", errors="replace").strip()
             return response.status == 200 and text == expected_body
     except (OSError, urllib.error.URLError):
         return False
+
+
+def probe_internet_once(url: str, expected_body: str, timeout: int) -> bool:
+    return probe_once(url, timeout, expected_body=expected_body)
 
 
 def check_external_internet(timeout: int) -> bool:
@@ -62,6 +89,15 @@ def check_external_internet(timeout: int) -> bool:
         probe_internet_once(url, expected_body, timeout)
         for url, expected_body in CONNECTIVITY_PROBES
     )
+
+
+def check_proxy_path(timeout: int) -> bool:
+    """Whether the proxy path works, asked with the proxy the system configures.
+
+    This deliberately does NOT use DIRECT_OPENER: the point is to reproduce what
+    the browser does, so it goes through the system proxy when there is one.
+    """
+    return any(probe_once(url, timeout) for url in PROXY_PATH_PROBES)
 
 
 def check_portal_reachable(url: str, timeout: int) -> bool:
@@ -85,15 +121,20 @@ class NetworkProbe:
         self,
         internet_check: Callable[[int], bool] = check_external_internet,
         portal_check: Callable[[str, int], bool] = check_portal_reachable,
+        proxy_path_check: Callable[[int], bool] = check_proxy_path,
     ):
         self.internet_check = internet_check
         self.portal_check = portal_check
+        self.proxy_path_check = proxy_path_check
 
     def observe(self, config) -> NetworkObservation:
         timeout = max(1, min(int(config.request_timeout_seconds), 8))
         if self.internet_check(timeout):
-            return NetworkObservation(True, False)
+            # Only worth asking when there is an uplink for the proxy to use.
+            return NetworkObservation(True, False, self.proxy_path_check(timeout))
         return NetworkObservation(
             False,
             self.portal_check(config.portal_url, timeout),
+            # Without an uplink nothing can carry browsing either.
+            False,
         )

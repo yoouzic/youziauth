@@ -131,7 +131,15 @@ class Agent:
             self.network_attempt_index = 0
             self.transient_failures = 0
             self.automatic_login_blocked = False
-            snapshot = self._publish(AgentState.ONLINE_EXTERNAL, "互联网连接正常")
+            # The uplink works. If the browsing path does not, the campus session
+            # is not the problem -- the proxy/VPN carrying ordinary traffic is --
+            # and saying "互联网连接正常" there is what made this app look like it
+            # was lying while nothing loaded.
+            if observation.proxy_path_ok:
+                detail = "互联网连接正常"
+            else:
+                detail = "外网可通，但代理/VPN 不通（请检查 Clash 节点）"
+            snapshot = self._publish(AgentState.ONLINE_EXTERNAL, detail)
             return CycleResult(snapshot, self.config.check_interval_seconds, False)
 
         if not observation.portal_reachable:

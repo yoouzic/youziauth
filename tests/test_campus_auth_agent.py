@@ -49,22 +49,51 @@ class NetworkProbeTests(unittest.TestCase):
         probe = NetworkProbe(
             internet_check=lambda timeout: True,
             portal_check=lambda url, timeout: calls.append(url) or False,
+            proxy_path_check=lambda timeout: True,
         )
 
         observation = probe.observe(campus_auth.AuthConfig(request_timeout_seconds=4))
 
-        self.assertEqual(observation, NetworkObservation(True, False))
+        self.assertEqual(observation, NetworkObservation(True, False, True))
         self.assertEqual(calls, [])
 
     def test_failed_internet_check_probes_campus_portal(self):
         probe = NetworkProbe(
             internet_check=lambda timeout: False,
             portal_check=lambda url, timeout: url.startswith("http://222.198.127.170"),
+            proxy_path_check=lambda timeout: True,
         )
 
         observation = probe.observe(campus_auth.AuthConfig())
 
-        self.assertEqual(observation, NetworkObservation(False, True))
+        # No uplink means nothing can carry browsing either; the proxy path is
+        # not claimed to work.
+        self.assertEqual(observation, NetworkObservation(False, True, False))
+
+    def test_a_working_uplink_reports_a_broken_proxy_path_separately(self):
+        # The whole point: campus session fine, uplink fine, proxy node dead.
+        probe = NetworkProbe(
+            internet_check=lambda timeout: True,
+            portal_check=lambda url, timeout: False,
+            proxy_path_check=lambda timeout: False,
+        )
+
+        observation = probe.observe(campus_auth.AuthConfig())
+
+        self.assertTrue(observation.internet_ok)
+        self.assertFalse(observation.proxy_path_ok)
+
+    def test_the_proxy_path_check_is_not_asked_without_an_uplink(self):
+        asked = []
+        probe = NetworkProbe(
+            internet_check=lambda timeout: False,
+            portal_check=lambda url, timeout: True,
+            proxy_path_check=lambda timeout: asked.append(timeout) or True,
+        )
+
+        probe.observe(campus_auth.AuthConfig())
+
+        self.assertEqual(asked, [])
 
     def test_probe_is_plain_http_like_windows_ncsi(self):
         # https://www.msftconnecttest.com/connecttest.txt is served by an Akamai
@@ -80,6 +109,14 @@ class NetworkProbeTests(unittest.TestCase):
             "http://www.msftconnecttest.com/connecttest.txt",
         )
         self.assertEqual(network_probe.CONNECTIVITY_BODY, "Microsoft Connect Test")
+
+    def test_the_proxy_path_probes_are_not_ncsi_hosts(self):
+        # If they were, a proxy that sends the NCSI hosts DIRECT would make both
+        # questions identical and the distinction would be worthless.
+        ncsi = {url for url, _ in network_probe.CONNECTIVITY_PROBES}
+        for url in network_probe.PROXY_PATH_PROBES:
+            self.assertNotIn(url, ncsi)
+            self.assertTrue(url.startswith("http://"), url)
 
     def test_captive_portal_page_does_not_count_as_internet(self):
         class FakeResponse:
@@ -183,6 +220,19 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(result.snapshot.state, "online_external")
         self.assertEqual(authenticator.calls, 0)
         self.assertFalse(result.notification_required)
+
+    def test_a_broken_proxy_path_is_named_instead_of_claiming_all_is_well(self):
+        authenticator = FakeAuthenticator([AuthAttempt(AttemptKind.REJECTED, "no")])
+        agent = self.make_agent(
+            FakeProbe([NetworkObservation(True, False, proxy_path_ok=False)]),
+            authenticator,
+        )
+
+        result = agent.run_cycle()
+
+        self.assertEqual(result.snapshot.state, "online_external")
+        self.assertIn("代理", result.snapshot.detail)
+        self.assertEqual(authenticator.calls, 0)
 
     def test_network_not_ready_uses_fast_retry_without_notification(self):
         authenticator = FakeAuthenticator([AuthAttempt(AttemptKind.REJECTED, "no")])
