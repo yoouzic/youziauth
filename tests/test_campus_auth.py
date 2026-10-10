@@ -736,10 +736,7 @@ class StructuredAttemptTests(unittest.TestCase):
     def test_force_login_skips_the_already_authenticated_short_circuit(self):
         class FakeClient:
             def check_status(self):
-                return campus_auth.AuthStatus.AUTHENTICATED
-
-            def release_session(self):
-                return campus_auth.LoginResult(ok=True, message="no session to release")
+                raise AssertionError("force_login must not consult the cached status")
 
             def login(self):
                 return campus_auth.LoginResult(ok=True, message="success")
