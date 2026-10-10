@@ -22,17 +22,25 @@ class FakeProbe:
 
 
 class FakeAuthenticator:
-    def __init__(self, attempts):
+    """Returns ``attempts`` for normal calls and ``forced_attempts`` for repairs."""
+
+    def __init__(self, attempts, forced_attempts=None):
         self.attempts = list(attempts)
+        self.forced_attempts = (
+            None if forced_attempts is None else list(forced_attempts)
+        )
         self.calls = 0
         self.force_flags = []
 
     def __call__(self, config, logger, force_login=False):
         self.calls += 1
         self.force_flags.append(force_login)
-        if len(self.attempts) > 1:
-            return self.attempts.pop(0)
-        return self.attempts[0]
+        source = self.attempts
+        if force_login and self.forced_attempts is not None:
+            source = self.forced_attempts
+        if len(source) > 1:
+            return source.pop(0)
+        return source[0]
 
 
 class NetworkProbeTests(unittest.TestCase):
@@ -87,12 +95,49 @@ class NetworkProbeTests(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-        original = network_probe.urllib.request.urlopen
-        network_probe.urllib.request.urlopen = lambda request, timeout: FakeResponse()
+        original = network_probe.DIRECT_OPENER.open
+        network_probe.DIRECT_OPENER.open = lambda request, timeout: FakeResponse()
         try:
             self.assertFalse(network_probe.check_external_internet(2))
         finally:
-            network_probe.urllib.request.urlopen = original
+            network_probe.DIRECT_OPENER.open = original
+
+    def test_uplink_probe_ignores_the_system_proxy(self):
+        class FakeResponse:
+            status = 200
+            headers = {}
+
+            def read(self, size):
+                return b"Microsoft Connect Test"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        import urllib.request
+
+        # What Clash/v2ray leave behind on this machine: a loopback proxy that
+        # urllib would honour for every request.
+        original_getproxies = urllib.request.getproxies
+        original_open = network_probe.DIRECT_OPENER.open
+        urllib.request.getproxies = lambda: {"http": "http://127.0.0.1:1"}
+        network_probe.DIRECT_OPENER.open = lambda request, timeout: FakeResponse()
+        try:
+            self.assertTrue(network_probe.check_external_internet(2))
+        finally:
+            urllib.request.getproxies = original_getproxies
+            network_probe.DIRECT_OPENER.open = original_open
+
+        self.assertEqual(
+            [
+                handler
+                for handler in network_probe.DIRECT_OPENER.handlers
+                if isinstance(handler, urllib.request.ProxyHandler)
+            ],
+            [],
+        )
 
 
 class AgentArgumentTests(unittest.TestCase):
@@ -181,7 +226,30 @@ class AgentLoopTests(unittest.TestCase):
         # being short-circuited by the portal's "already authenticated" answer.
         self.assertEqual(authenticator.force_flags, [False, True])
 
-    def test_unverified_already_online_is_reauthenticated(self):
+    def test_unverified_session_is_never_reported_online(self):
+        # The portal holds a session while the machine has no Internet. Nothing
+        # can force a login out of this state, so the agent must publish the
+        # truth and keep polling until the portal releases the record itself.
+        authenticator = FakeAuthenticator(
+            [AuthAttempt(AttemptKind.ALREADY_ONLINE, "already authenticated")]
+        )
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+
+        results = [agent.run_cycle() for _ in range(5)]
+
+        self.assertTrue(
+            all(item.snapshot.state == "waiting_for_network" for item in results)
+        )
+        self.assertTrue(all(not item.notification_required for item in results))
+        # It must not blame the campus session: the measured cause of "portal says
+        # online but nothing loads" on this setup is the proxy/VPN path.
+        self.assertIn("Clash", results[0].snapshot.detail)
+        # Never logs out, never forces a login: every call is a plain status check.
+        self.assertEqual(authenticator.force_flags, [False] * 5)
+
+    def test_unverified_session_recovers_when_the_portal_releases_it(self):
+        # Measured on the live portal: the stale record clears by itself and the
+        # normal login path then takes over, all without touching the session.
         authenticator = FakeAuthenticator(
             [
                 AuthAttempt(AttemptKind.ALREADY_ONLINE, "already authenticated"),
@@ -190,31 +258,12 @@ class AgentLoopTests(unittest.TestCase):
         )
         agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
 
-        result = agent.run_cycle()
+        waiting = agent.run_cycle()
+        recovered = agent.run_cycle()
 
-        # The portal claimed a live session but the Internet was unreachable, so
-        # the agent had to verify it with a real login instead of reporting it.
-        self.assertEqual(result.snapshot.state, "online_campus")
-        self.assertEqual(authenticator.calls, 2)
-        self.assertEqual(authenticator.force_flags, [False, True])
-
-    def test_unverified_session_is_not_reported_online_when_relogin_is_refused(self):
-        authenticator = FakeAuthenticator(
-            [
-                AuthAttempt(AttemptKind.ALREADY_ONLINE, "already authenticated"),
-                AuthAttempt(AttemptKind.REJECTED, "已在线，无需重复认证"),
-            ]
-        )
-        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
-
-        result = agent.run_cycle()
-
-        # A refused duplicate login is not a credential failure, and it must not
-        # be dressed up as success either: the machine still has no Internet.
-        self.assertNotEqual(result.snapshot.state, "auth_failed")
-        self.assertNotEqual(result.snapshot.state, "online_campus")
-        self.assertEqual(result.snapshot.state, "waiting_for_network")
-        self.assertFalse(result.notification_required)
+        self.assertEqual(waiting.snapshot.state, "waiting_for_network")
+        self.assertEqual(recovered.snapshot.state, "online_campus")
+        self.assertEqual(authenticator.force_flags, [False, False])
 
     def test_verified_already_online_is_still_accepted_when_internet_works(self):
         authenticator = FakeAuthenticator([AuthAttempt(AttemptKind.ALREADY_ONLINE, "already authenticated")])

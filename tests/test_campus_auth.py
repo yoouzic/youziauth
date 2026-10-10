@@ -367,6 +367,70 @@ class OnlineUserInfoTests(unittest.TestCase):
 
         self.assertEqual(status, campus_auth.AuthStatus.UNAUTHENTICATED)
 
+    def test_login_refuses_to_reuse_the_success_page_redirect_as_query_string(self):
+        self.assertIsNotNone(campus_auth, import_error)
+
+        # Exactly what the live portal does while it still holds a session.
+        class FakeClient(campus_auth.CampusAuthClient):
+            def request(self, url, data=None, allow_redirects=True, referer=None):
+                return campus_auth.HttpResponse(
+                    200,
+                    {},
+                    "<html><title>登录成功</title></html>",
+                    self.portal_url("/eportal/./success.jsp?userIndex=6432343835"),
+                )
+
+        client = FakeClient(campus_auth.AuthConfig(username="student", password="pw"))
+
+        with self.assertRaises(RuntimeError) as caught:
+            client.get_query_string()
+
+        # Posting "userIndex=..." as queryString is what made the portal answer
+        # "设备未注册,请在ePortal上添加认证设备".
+        self.assertIn("userIndex", str(caught.exception))
+        self.assertIn("still holds a session", str(caught.exception))
+
+    def test_login_still_accepts_a_real_eportal_query_string(self):
+        self.assertIsNotNone(campus_auth, import_error)
+
+        class FakeClient(campus_auth.CampusAuthClient):
+            def request(self, url, data=None, allow_redirects=True, referer=None):
+                return campus_auth.HttpResponse(
+                    200,
+                    {},
+                    "<html></html>",
+                    self.portal_url(
+                        "/eportal/index.jsp?wlanuserip=10.0.0.5&wlanacname=ac01&ssid=swu-wifi"
+                    ),
+                )
+
+        query = FakeClient(
+            campus_auth.AuthConfig(username="student", password="pw")
+        ).get_query_string()
+
+        self.assertEqual(query, "wlanuserip=10.0.0.5&wlanacname=ac01&ssid=swu-wifi")
+
+    def test_force_login_does_not_log_the_session_out(self):
+        self.assertIsNotNone(campus_auth, import_error)
+        order = []
+
+        class FakeClient:
+            def check_status(self):
+                raise AssertionError("force_login must not consult the cached status")
+
+            def login(self):
+                order.append("login")
+                return campus_auth.LoginResult(ok=True, message="success")
+
+        attempt = campus_auth.attempt_authentication(
+            FakeClient(), logging.getLogger("test"), force_login=True
+        )
+
+        # Measured on the live portal: logging out tears down connectivity while
+        # the ePortal keeps its record, so a forced attempt must never do it.
+        self.assertEqual(attempt.kind.value, "login_succeeded")
+        self.assertEqual(order, ["login"])
+
     def test_portal_requests_bypass_the_system_proxy(self):
         self.assertIsNotNone(campus_auth, import_error)
         import http.server
@@ -673,6 +737,9 @@ class StructuredAttemptTests(unittest.TestCase):
         class FakeClient:
             def check_status(self):
                 return campus_auth.AuthStatus.AUTHENTICATED
+
+            def release_session(self):
+                return campus_auth.LoginResult(ok=True, message="no session to release")
 
             def login(self):
                 return campus_auth.LoginResult(ok=True, message="success")

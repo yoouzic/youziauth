@@ -533,12 +533,25 @@ class CampusAuthClient:
 
         response = self.request(self.config.portal_url)
         redirected_query = urllib.parse.urlparse(response.url).query
-        if redirected_query:
+        if looks_like_login_query_string(redirected_query):
             return html.unescape(redirected_query)
 
         extracted = extract_query_string(response.text)
         if extracted:
             return extracted
+
+        if redirected_query:
+            # While the portal still holds a session it answers with
+            # success.jsp?userIndex=... instead of the login page, and that
+            # userIndex is NOT a login queryString. Posting it as queryString=
+            # made the portal look up a device it cannot resolve and answer
+            # "设备未注册,请在ePortal上添加认证设备", so refuse instead of guessing.
+            parameter = redirected_query.split("=", 1)[0]
+            raise RuntimeError(
+                "the portal still holds a session and offered no login queryString "
+                f"(it redirected with {parameter}=...); the session has to be "
+                "released before this machine can authenticate again"
+            )
 
         raise RuntimeError(
             "could not find ePortal queryString; make sure this machine is on the campus network"
@@ -593,6 +606,13 @@ def attempt_authentication(
             if status is AuthStatus.AUTHENTICATED:
                 return AuthAttempt(AttemptKind.ALREADY_ONLINE, "already authenticated")
         else:
+            # Only skips the cached-status shortcut. Deliberately does NOT log the
+            # session out first: measured against the live portal, logout tears
+            # down the BRAS authorization (connectivity really drops) while the
+            # ePortal keeps its session record, so the machine then has no
+            # Internet *and* still cannot get a login queryString -- a 10 minute
+            # outage in exchange for nothing. Recovery comes from the portal
+            # releasing its own stale record, which it does on its own.
             logger.info("forcing a fresh login attempt")
         result = client.login()
     except Exception as exc:  # noqa: BLE001 - CLI tool should log and keep running.

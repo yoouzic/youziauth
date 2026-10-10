@@ -152,30 +152,24 @@ class Agent:
         attempt = self.authenticator(self.config, self.logger, force_login=force_login)
 
         if attempt.kind is AttemptKind.ALREADY_ONLINE and not observation.internet_ok:
-            # The portal served its success page, but this very cycle already
-            # proved the machine cannot reach the Internet. A Ruijie session
-            # record can outlive the gateway authorization that actually carries
-            # traffic, so the record on its own is not evidence of a working
-            # session -- trusting it is what reported "already authenticated"
-            # for hours and stopped the agent from ever logging in again. Verify
-            # it by authenticating for real: a healthy session just answers
-            # success again, a stale one gets repaired.
+            # The portal says this machine is authenticated, yet the uplink probe
+            # failed. On a campus network the portal record is usually telling the
+            # truth -- what breaks the Internet here is the proxy/VPN the machine
+            # routes through, not the campus session. Measured on the live setup:
+            # switching Clash off its proxy path restored the Internet without any
+            # re-authentication, and logging the session out instead cost a
+            # 10 minute outage while the portal kept its record anyway. So never
+            # touch the session here: report what is true and let the probe clear
+            # the state once the uplink is back.
             self.logger.info(
-                "portal claims an existing session while the Internet is "
-                "unreachable; re-authenticating"
+                "portal reports an authenticated session but the uplink is down; "
+                "leaving the session alone"
             )
-            verified = self.authenticator(self.config, self.logger, force_login=True)
-            if verified.kind is AttemptKind.REJECTED:
-                # The portal still asserts a live session, so a refused
-                # duplicate login is not a credential problem and must not be
-                # reported as one. Stay honest instead: there is still no
-                # Internet, so the session stays unverified.
-                snapshot = self._publish(
-                    AgentState.WAITING_FOR_NETWORK,
-                    "门户声称已在线，但上网仍不通",
-                )
-                return CycleResult(snapshot, self.config.check_interval_seconds, False)
-            attempt = verified
+            snapshot = self._publish(
+                AgentState.WAITING_FOR_NETWORK,
+                "校园网已认证，但外网不通（请检查 Clash/代理）",
+            )
+            return CycleResult(snapshot, self.config.check_interval_seconds, False)
 
         if attempt.kind in (AttemptKind.ALREADY_ONLINE, AttemptKind.LOGIN_SUCCEEDED):
             self.transient_failures = 0
@@ -216,9 +210,11 @@ class Agent:
     def reload_config(self) -> RuntimeSnapshot:
         self.config = self.config_loader()
         self.retry_policy = RetryPolicy(self.config.check_interval_seconds)
+        # Clear the rejection block, but do not force: reloading settings is not
+        # a reason to skip the cached session status.
         self.automatic_login_blocked = False
         self.transient_failures = 0
-        return self.run_cycle(force_login=True).snapshot
+        return self.run_cycle().snapshot
 
     def suppress_notifications_for_boot(self) -> RuntimeSnapshot:
         self.snapshot = dataclasses.replace(

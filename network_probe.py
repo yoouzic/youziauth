@@ -34,6 +34,15 @@ class NetworkObservation:
     portal_reachable: bool
 
 
+# Measure the uplink, not whatever proxy the machine happens to be configured
+# with. Clash/v2ray leave ProxyEnable=1 plus a loopback proxy in the registry,
+# which urllib honours on Windows, so a dead proxy listener would be reported as
+# "no Internet" while the campus network is perfectly healthy -- and a working
+# one would mask a broken uplink. Whether a VPN can reach the outside world is a
+# separate question from whether this machine has an Internet uplink.
+DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def probe_internet_once(url: str, expected_body: str, timeout: int) -> bool:
     request = urllib.request.Request(
         url,
@@ -41,7 +50,7 @@ def probe_internet_once(url: str, expected_body: str, timeout: int) -> bool:
         method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with DIRECT_OPENER.open(request, timeout=timeout) as response:
             text = response.read(256).decode("utf-8", errors="replace").strip()
             return response.status == 200 and text == expected_body
     except (OSError, urllib.error.URLError):
