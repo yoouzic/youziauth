@@ -26,6 +26,10 @@ from windows_credentials import CredentialStore, machine_config_path, program_da
 
 AGENT_PIPE_NAME = "youziauth-agent"
 TRANSIENT_RETRY_DELAYS = (5, 15, 30)
+# While the uplink is fine the agent has nothing to report, so it says so on entry
+# to that state and then this often. Without it a quiet log is indistinguishable
+# from a stopped agent.
+ONLINE_HEARTBEAT_SECONDS = 1800
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,6 +79,7 @@ class Agent:
         self.network_attempt_index = 0
         self.transient_failures = 0
         self.automatic_login_blocked = False
+        self._online_logged_at = None
         suppressed = False
         try:
             previous = read_snapshot(self.snapshot_path)
@@ -117,6 +122,27 @@ class Agent:
         incident_id = self.snapshot.incident_id or uuid.uuid4().hex
         return self._publish(AgentState.AUTH_FAILED, detail, incident_id=incident_id)
 
+    def _log_online_heartbeat(self, previous_state: str) -> None:
+        """Say something occasionally while the uplink is fine.
+
+        A healthy agent publishes ONLINE_EXTERNAL and returns without touching the
+        portal, so it writes no log line at all. That made "everything is fine" and
+        "the process died" look identical in campus_auth.log -- which is exactly the
+        question it invites. Log on entry to the online state and then every half
+        hour, which is frequent enough to prove liveness and rare enough not to bury
+        the lines that matter.
+        """
+        now = time.monotonic()
+        entered = previous_state != AgentState.ONLINE_EXTERNAL.value
+        if not entered and self._online_logged_at is not None:
+            if now - self._online_logged_at < ONLINE_HEARTBEAT_SECONDS:
+                return
+        self._online_logged_at = now
+        self.logger.info(
+            "uplink is up; background check running (every %ss)",
+            self.config.check_interval_seconds,
+        )
+
     def run_cycle(self, force_login: bool = False) -> CycleResult:
         try:
             observation: NetworkObservation = self.probe.observe(self.config)
@@ -139,7 +165,9 @@ class Agent:
                 detail = "互联网连接正常"
             else:
                 detail = "外网可通，但代理/VPN 不通（请检查 Clash 节点）"
+            previous = self.snapshot.state
             snapshot = self._publish(AgentState.ONLINE_EXTERNAL, detail)
+            self._log_online_heartbeat(previous)
             return CycleResult(snapshot, self.config.check_interval_seconds, False)
 
         if not observation.portal_reachable:

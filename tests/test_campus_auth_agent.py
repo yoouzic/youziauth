@@ -7,7 +7,7 @@ import campus_auth
 import network_probe
 from agent_ipc import RuntimeSnapshot, read_snapshot, write_snapshot
 from auth_runtime import AuthAttempt, AttemptKind
-from campus_auth_agent import Agent, build_arg_parser
+from campus_auth_agent import ONLINE_HEARTBEAT_SECONDS, Agent, build_arg_parser
 from network_probe import NetworkObservation, NetworkProbe
 
 
@@ -220,6 +220,42 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(result.snapshot.state, "online_external")
         self.assertEqual(authenticator.calls, 0)
         self.assertFalse(result.notification_required)
+
+    def test_a_healthy_agent_says_so_without_flooding_the_log(self):
+        # A quiet log must not look like a stopped agent: entering the online state
+        # logs at once, then it repeats on the heartbeat interval only.
+        agent = self.make_agent(
+            FakeProbe([NetworkObservation(True, False)]),
+            FakeAuthenticator([AuthAttempt(AttemptKind.REJECTED, "no")]),
+        )
+        with self.assertLogs(agent.logger, level="INFO") as captured:
+            agent.run_cycle()
+            agent.run_cycle()
+            self.assertEqual(sum("uplink is up" in line for line in captured.output), 1)
+
+            agent._online_logged_at -= ONLINE_HEARTBEAT_SECONDS + 1
+            agent.run_cycle()
+            self.assertEqual(sum("uplink is up" in line for line in captured.output), 2)
+
+    def test_returning_online_after_an_outage_reports_immediately(self):
+        agent = self.make_agent(
+            FakeProbe(
+                [
+                    NetworkObservation(True, False),   # online
+                    NetworkObservation(False, False),  # portal gone
+                    NetworkObservation(True, False),   # online again
+                ]
+            ),
+            FakeAuthenticator([AuthAttempt(AttemptKind.REJECTED, "no")]),
+        )
+        with self.assertLogs(agent.logger, level="INFO") as captured:
+            agent.run_cycle()
+            agent.run_cycle()
+            agent.run_cycle()
+
+        # Two entries into the online state, and the second one must not have waited
+        # for the interval: the outage in between is worth reporting.
+        self.assertEqual(sum("uplink is up" in line for line in captured.output), 2)
 
     def test_a_broken_proxy_path_is_named_instead_of_claiming_all_is_well(self):
         authenticator = FakeAuthenticator([AuthAttempt(AttemptKind.REJECTED, "no")])
