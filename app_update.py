@@ -16,10 +16,65 @@ from windows_update import install_msi, verify_msi
 
 REPOSITORY = 'yoouzic/youziauth'
 LATEST_RELEASE_URL = f'https://api.github.com/repos/{REPOSITORY}/releases/latest'
+COMPARE_URL = f'https://api.github.com/repos/{REPOSITORY}/compare/'
 MAX_PACKAGE_BYTES = 1024 * 1024 * 1024
-# Every release must carry the installer plus both detached authenticators; a
-# release missing any of them is refused rather than silently downgraded.
+# 安装包与校验材料的必备清单；缺任何一个都拒绝更新，不降级放行。
 RELEASE_ASSETS = ('youziauth.msi', 'SHA256SUMS.txt', 'youziauth.msi.ed25519')
+# 中文更新说明是**可选**资产：界面有它就用它，没有就退回提交列表。
+# 它刻意不进 RELEASE_ASSETS —— 一旦列为必备，任何忘记带说明的发布都会让所有
+# 老客户端彻底无法自助更新，这个代价比少一段说明大得多。
+NOTES_ASSET = 'release-notes.md'
+MAX_NOTES_BYTES = 32 * 1024
+
+# --- 更新内容 ---------------------------------------------------------------
+# 首选是发布者手写的中文说明（`release-notes.md` 资产，源文件在 docs/release-notes/）。
+# 它取不到时退回 compare API 的提交列表，范围是 `<已安装版本>...<最新版本>`，也就是
+# 用户这次升级真正跨过的提交 —— 顺序不能反：GitHub 的 `--generate-notes` 对常规提交
+# 只给一行 compare 链接（实测 v1.8.5 的正文只有 80 字节），提交标题又都是英文。
+#
+# 上限按实测放：36 个提交（v1.5.0 → v1.8.5）的响应是 1.1 MiB，所以 256 KiB 那种
+# 「小响应」的限额会把正常升级直接判成超限。这里留 4 MiB，远超我们一两次发布的
+# 提交量；GitHub 自己在 250 个提交处拒绝比较，不会给出无界响应。
+MAX_CHANGES_BYTES = 4 * 1024 * 1024
+MAX_CHANGES_ENTRIES = 60     # 后端上限，防止快照无界增长；界面据此判断总数是否可信
+_CHANGES_CACHE = 'changes-v{current}-v{latest}.json'
+# 提交标题里的内部前缀：`fix(auth): ...`、`feat!: ...` 等，展示时去掉。
+_CONVENTIONAL = re.compile(r'^(?P<kind>[a-z][a-z0-9]*)'
+                           r'(?:\([^()]{1,32}\))?!?:\s+(?P<subject>\S.*)$')
+# 只报给用户的变化类型；`chore: version 1.9.0`、`test:`、`ci:`、`docs:` 属于维护
+# 噪音，列出来只会把真正的修复和功能挤掉。
+_USER_FACING_KINDS = ('feat', 'fix', 'perf', 'refactor', 'revert')
+# 没有可比对的说明时给一句实话；界面会在这句话下面单独给一个「在 GitHub 上查看发布
+# 记录」的链接。所以这句话**不要**自己再提 GitHub，否则同一个出口会出现两遍。
+NO_CHANGES = '没能自动获取这次更新的说明。'
+
+# 手写中文说明支持的 markdown 子集：标题行写版本号，`- ` 列表项是一行说明。
+# 粗体前缀 `- **重点**：…` 标成「重点」，正文里的 `**`、`*`、反引号一律去掉 ——
+# 界面走 textContent，标记留着只会显示成星号。
+_NOTES_HEADING = re.compile(r'^#{1,6}\s+v?(?P<version>[0-9]+\.[0-9]+\.[0-9]+)\s*$')
+_NOTES_TITLE = re.compile(r'^#{1,6}\s+(?P<title>\S.*)$')
+_NOTES_BULLET = re.compile(r'^\s*(?:[-*+]|\d+[.)])\s+(?P<text>\S.*)$')
+_NOTES_HIGHLIGHT = re.compile(r'^\*\*(?P<label>[^*]{1,12})\*\*[：:、,，]?\s*(?P<text>.*)$')
+_LONG_ENTRY = 200
+
+_CHANGELOG_FAILURES = (HTTPError, URLError, TimeoutError, ConnectionError, OSError,
+                       ValueError, TypeError, KeyError, AttributeError, UnicodeError, RecursionError)
+# 取更新内容时**任何**异常都只能让界面少一块内容，不能影响「有新版本」这条主链路：
+# read_small 超限、validate_url 拒绝、JSON 形状不对，全部算在里面。
+_FAILED_CHANGELOG = (RuntimeError,) + _CHANGELOG_FAILURES
+
+
+def compare_url(current_version, latest_version):
+    """已安装版本到最新版本之间的提交对比地址。"""
+    return f'{COMPARE_URL}v{current_version}...v{latest_version}'
+
+
+def _no_changes(note=NO_CHANGES, total=0):
+    """「没有可比对的说明」的块，界面据此只显示一句实话 + 一个手工出口。
+
+    只带这些字段，不携带仓库地址或路径：快照会直接交给界面。
+    """
+    return {'entries': [], 'total': total, 'more': False, 'note': note}
 
 
 def version_tuple(value):
@@ -56,8 +111,11 @@ class GitHubRedirectHandler(HTTPRedirectHandler):
 
 def open_url(url):
     validate_url(url)
+    # 每一个 api.github.com 端点都要 JSON 的 Accept —— 只认 LATEST_RELEASE_URL 的话，
+    # compare 端点会直接回 415 Unsupported Media Type（实测）。附件下载仍走 octet-stream。
+    json_api = url.startswith('https://api.github.com/')
     request = Request(url, headers={'User-Agent': 'youziauth-updater',
-                                   'Accept': 'application/vnd.github+json' if url == LATEST_RELEASE_URL else 'application/octet-stream',
+                                   'Accept': 'application/vnd.github+json' if json_api else 'application/octet-stream',
                                    'X-GitHub-Api-Version': '2022-11-28'})
     return build_opener(GitHubRedirectHandler()).open(request, timeout=20)
 
@@ -108,6 +166,14 @@ def release_assets(data, version):
         if type(size) is not int or not 0 < size <= (MAX_PACKAGE_BYTES if name.endswith('.msi') else 32768):
             raise ValueError('更新附件大小无效')
         result[name] = asset
+    # 中文说明是可选的：有就校验来源，没有或形状不对就当这版没写说明。
+    notes = [asset for asset in assets if asset.get('name') == NOTES_ASSET]
+    if len(notes) == 1 and notes[0].get('state') == 'uploaded':
+        asset = notes[0]
+        size = asset.get('size')
+        if (asset.get('browser_download_url') == f'{origin}/releases/download/v{version}/{NOTES_ASSET}'
+                and type(size) is int and 0 < size <= MAX_NOTES_BYTES):
+            result[NOTES_ASSET] = asset
     return result
 
 
@@ -125,6 +191,182 @@ def read_signature(url):
     if re.fullmatch(r'[0-9a-fA-F]{128}', text) is None:
         raise RuntimeError('安装包发布签名无效，请等待发布者修复后重试。')
     return text.lower()
+
+
+# --- 更新内容 ---------------------------------------------------------------
+
+def clean_subject(message):
+    """把一条提交标题变成用户能读的一行，并回报它的类型。
+
+    返回 ``(类型, 标题)``：类型取自 ``fix(auth): ...`` 这类约定式前缀，标题去掉
+    前缀本身。没有前缀就用 ``''`` 作类型 —— 老提交和手写合并都得算进更新内容。
+    """
+    if not isinstance(message, str):
+        return '', ''
+    first = message.splitlines()[0].strip() if message.strip() else ''
+    if not first:
+        return '', ''
+    match = _CONVENTIONAL.match(first)
+    if match is None:
+        return '', first
+    kind = match.group('kind').lower()
+    subject = match.group('subject').strip()
+    if not subject:
+        # `fix:` 后面什么都没有，去掉前缀就只剩空行；保留原文反而更有信息量。
+        return '', first
+    return kind, subject
+
+
+def _commit_date(commit):
+    """提交的日期（只取 YYYY-MM-DD），取不到就留空。
+
+    `committer` 在 GitHub 上可能是 null（提交者账号已删或没关联），所以退回
+    `author`；两个都没有时界面只显示标题，而不是编一个日期出来。
+    """
+    if not isinstance(commit, dict):
+        return ''
+    payload = commit.get('commit')
+    if not isinstance(payload, dict):
+        return ''
+    for field in ('committer', 'author'):
+        who = payload.get(field)
+        date = who.get('date') if isinstance(who, dict) else None
+        if isinstance(date, str) and len(date) >= 10 and date[4] == '-' and date[7] == '-':
+            return date[:10]
+    return ''
+
+
+def _changelog_entries(commits):
+    """提交列表 -> ``(条目, 总条数, 是否截断)``，只留用户看得见的变化。"""
+    entries, seen, count = [], set(), 0
+    for commit in commits:
+        if not isinstance(commit, dict):
+            continue
+        payload = commit.get('commit')
+        if not isinstance(payload, dict):
+            continue
+        kind, subject = clean_subject(payload.get('message'))
+        if not subject or kind not in _USER_FACING_KINDS:
+            continue
+        key = (kind, subject.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        count += 1
+        if len(entries) < MAX_CHANGES_ENTRIES:
+            entries.append({'subject': subject, 'kind': kind, 'date': _commit_date(commit)})
+    return entries, count, count > len(entries)
+
+
+def _plain(text):
+    """去掉行内的 markdown 标记，界面只显示纯文本。"""
+    return text.replace('**', '').replace('`', '').replace('*', '').strip()
+
+
+def read_notes(raw, version):
+    """把手写的中文更新说明解析成 ``changes`` 块。
+
+    只认 ``docs/release-notes/v<版本>.md`` 里的约定格式：一级标题写版本号，``- `` 列表
+    项各是一行说明。版本对不上就直接判无效 —— 宁可退回提交列表，也不能把上一个版本的
+    说明当成这个版本的讲给用户听。
+    """
+    try:
+        text = raw.decode('utf-8-sig')
+    except (AttributeError, UnicodeError):
+        raise ValueError('更新说明不是 UTF-8 文本') from None
+    entries, declared, title, seen = [], '', '', set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith('#'):
+            match = _NOTES_HEADING.match(stripped)
+            if match is not None:
+                declared = match.group('version')
+                continue
+            if not title and (named := _NOTES_TITLE.match(stripped)) is not None:
+                title = _plain(named.group('title'))
+            continue
+        match = _NOTES_BULLET.match(stripped)
+        if match is None:
+            # 标题之外的第一段正文当作简介；代码块/引用行不算。
+            if not title and not stripped.startswith(('>', '```')):
+                title = _plain(stripped)
+            continue
+        raw_entry = match.group('text').strip()
+        if not raw_entry:
+            continue
+        # 先认粗体标签，再去标记：反过来 `**重点**：…` 的星号会先被删掉，标签就丢了。
+        kind, subject = '', raw_entry
+        if (highlight := _NOTES_HIGHLIGHT.match(raw_entry)) is not None:
+            kind, subject = _plain(highlight.group('label')), _plain(highlight.group('text'))
+            if not subject:
+                kind, subject = '', raw_entry
+        subject = _plain(subject)
+        if not subject:
+            continue
+        if len(subject) > _LONG_ENTRY:
+            subject = subject[:_LONG_ENTRY].rstrip() + '…'
+        if subject.casefold() in seen:
+            continue
+        seen.add(subject.casefold())
+        entries.append({'subject': subject, 'kind': kind, 'date': ''})
+    if declared != version:
+        raise ValueError('更新说明的版本与发布版本不一致')
+    if not entries:
+        raise ValueError('更新说明没有任何条目')
+    if len(entries) > MAX_CHANGES_ENTRIES:
+        entries = entries[:MAX_CHANGES_ENTRIES]
+    return {'entries': entries, 'total': len(entries), 'more': False, 'note': title}
+
+
+def read_changes(raw):
+    """校验 compare API 的响应并抽出变更条目（只读一个已知结构）。"""
+    try:
+        data = json.loads(raw.decode('utf-8-sig'))
+    except (AttributeError, ValueError, UnicodeError):
+        raise ValueError('更新说明不是有效的 JSON') from None
+    if not isinstance(data, dict):
+        raise ValueError('更新说明格式无效')
+    if data.get('status') not in ('ahead', 'behind', 'identical', 'diverged'):
+        raise ValueError('更新说明状态无效')
+    total = data.get('total_commits')
+    commits = data.get('commits')
+    if type(total) is not int or not 0 <= total <= 100000 or not isinstance(commits, list):
+        raise ValueError('更新说明条目无效')
+    entries, count, truncated = _changelog_entries(commits)
+    note = ''
+    if not count:
+        # status=identical 表示两个标签指向同一处（重发或补发版本号）；其余情况是
+        # 这次升级没有用户可见的变化。
+        note = ('这次升级只包含内部维护改动。' if total or data['status'] != 'identical'
+                else '这个版本与当前已安装版本内容相同。')
+    return {'entries': entries, 'total': count, 'more': truncated, 'note': note}
+
+
+def load_changes(path):
+    """读取缓存过的更新内容；缓存不可用就返回 ``None`` 重新取。"""
+    try:
+        cached = json.loads(Path(path).read_text(encoding='utf-8'))
+        if (not isinstance(cached, dict) or not isinstance(cached.get('entries'), list)
+                or type(cached.get('total')) is not int or not isinstance(cached.get('note'), str)
+                or type(cached.get('more')) is not bool):
+            return None
+        return {'entries': [dict(entry) for entry in cached['entries']],
+                'total': cached['total'], 'more': cached['more'], 'note': cached['note']}
+    except (OSError, ValueError, TypeError, RecursionError, AttributeError):
+        return None
+
+
+def save_changes(path, changes):
+    """尽力缓存更新内容：写不进去也不能影响更新本身。"""
+    try:
+        path = Path(path)
+        temporary = path.with_name(path.name + '.tmp')
+        temporary.write_text(json.dumps(changes, ensure_ascii=False), encoding='utf-8')
+        temporary.replace(path)
+    except (OSError, ValueError, TypeError):
+        pass
 
 
 def file_digest(path):
@@ -145,7 +387,7 @@ class UpdateController:
         self._worker = None
         self._package = None
         self._data = dict(state='idle', current_version=current_version, latest_version='', progress=0,
-                          downloaded_bytes=0, total_bytes=0, checked='',
+                          downloaded_bytes=0, total_bytes=0, checked='', changes=_no_changes(),
                           message='启动后自动检查 GitHub 正式版；有更新时自动下载，安装前会征求确认。')
 
     def snapshot(self):
@@ -211,7 +453,7 @@ class UpdateController:
 
     def _check(self):
         self._package = None
-        self._set(latest_version='', progress=0, downloaded_bytes=0, total_bytes=0)
+        self._set(latest_version='', progress=0, downloaded_bytes=0, total_bytes=0, changes=_no_changes())
         if not self._data['current_version']:
             raise RuntimeError('无法读取本机版本，已停止自动更新；请使用完整的官方安装版。')
         current = version_tuple(self._data['current_version'])
@@ -254,9 +496,48 @@ class UpdateController:
         else:
             self._download(package['browser_download_url'], size, destination, version, digest, signature)
         self._ensure_open()
+        notes = assets.get(NOTES_ASSET)
+        self._load_changes(self._data['current_version'], version,
+                           notes['browser_download_url'] if notes else '')
+        self._ensure_open()
         self._package = (destination, version, digest, signature)
         self._set(state='ready', progress=100, downloaded_bytes=size,
                   message=f'v{version} 已下载，哈希与发布者签名校验通过；确认后即可安装。')
+
+    def _load_changes(self, current_version, version, notes_url=''):
+        """填 ``changes`` 块：优先发布者手写的中文说明，其次提交对比，最后实话实说。
+
+        纯展示信息：任何失败都只让界面少一块内容，绝不影响「有新版本、已下载、
+        校验通过」这条主链路。成功一次就缓存到本机，重复检查和重装同一版本都不再
+        请求 GitHub（也避开未登录的 60 次/小时限流）。
+
+        ``current_version`` 必须是 ``'1.4.4'`` 这样的版本号字符串 —— ``_check`` 里的
+        ``current`` 已是三元组，传进来会拼出 ``v(1, 4, 4)...`` 这种地址。
+        """
+        try:
+            cache = self._cache / _CHANGES_CACHE.format(current=current_version, latest=version)
+        except (AttributeError, ValueError, TypeError):
+            self._set(changes=_no_changes())
+            return
+        cached = load_changes(cache)
+        if cached is not None:
+            self._set(changes=cached)
+            return
+        changes = None
+        if notes_url:
+            try:
+                changes = read_notes(read_small(notes_url, MAX_NOTES_BYTES), version)
+            except _FAILED_CHANGELOG:
+                changes = None      # 说明坏了就退回提交对比，不让这一版空着
+        if changes is None:
+            try:
+                changes = read_changes(read_small(compare_url(current_version, version), MAX_CHANGES_BYTES))
+            except _FAILED_CHANGELOG:
+                self._set(changes=_no_changes())
+                return
+        self._ensure_open()
+        save_changes(cache, changes)
+        self._set(changes=changes)
 
     def _download(self, url, size, destination, version, digest, signature):
         self._set(state='downloading', message=f'发现 v{version}，正在后台下载安装包…')

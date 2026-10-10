@@ -140,6 +140,64 @@ function updateSize(bytes){
   if(bytes<1048576)return (bytes/1024).toFixed(1)+' KiB';
   return (bytes/1048576).toFixed(1)+' MiB';
 }
+const SHOWN_CHANGES = 12;
+const BACKEND_MAX_CHANGES = 60;   // 与 app_update.MAX_CHANGES_ENTRIES 保持一致
+const CHANGE_KINDS = {feat:'新增', fix:'修复', perf:'优化', refactor:'调整', revert:'回退'};
+const CHANGE_RESERVE = '在 GitHub 上查看发布记录';
+// 与 app_update.NO_CHANGES 是两句话，别把常量名也叫成它：那边讲后端为什么取不到，
+// 这边只在快照根本没有这一层时兜底。
+const CHANGE_FALLBACK = '这次更新的具体内容暂时取不到。';
+function changeRows(changes){
+  // 没有这一层（老快照、非 ready 状态）就什么都不显示，绝不用兜底文案把卡片撑出来。
+  if(!changes||typeof changes!=='object')return {items:[],more:'',total:0,note:''};
+  // 只信形状对得上的字段：后端不可用或版本不匹配时，这里必须降级，不能抛。
+  const entries=Array.isArray(changes.entries)?changes.entries:[];
+  const items=entries.slice(0,SHOWN_CHANGES).map(entry=>{
+    // 只认真的对象：String(null ?? '') 会渲染成 "null" 这一行。
+    if(!entry||typeof entry!=='object')return '';
+    const subject=typeof entry.subject==='string'?entry.subject.trim():'';
+    if(!subject)return '';
+    const date=typeof entry?.date==='string'?entry.date.trim():'';
+    // 手写中文说明自带的标签本就是中文（如「重点」），直接用；只有英文提交类型才翻译。
+    const raw=typeof entry.kind==='string'?entry.kind.trim():'';
+    const kind=raw?(CHANGE_KINDS[raw]||raw):'';
+    const line=(kind?kind+' · ':'')+subject+(date?' · '+date:'');
+    return line;
+  }).filter(Boolean);
+  // 后端快照封顶 60 条（app_update.MAX_CHANGES_ENTRIES），所以条目正好顶到 60 且
+  // more 为真时，total 不一定是真实总数 —— 那时只说「更多」，不写一个没底的具体数字。
+  const known=Number.isInteger(changes.total)&&changes.total>=items.length?changes.total:items.length;
+  const capped=changes.more===true&&entries.length>=BACKEND_MAX_CHANGES;
+  const total=capped?0:known;
+  const more=capped?'还有更多更新内容未列出，可在 GitHub 上查看完整记录。'
+    :total>SHOWN_CHANGES?'还有 '+(total-SHOWN_CHANGES)+' 条更新内容未列出，可在 GitHub 上查看完整记录。'
+    :total>items.length?'还有 '+(total-items.length)+' 条更新内容未列出，可在 GitHub 上查看完整记录。':'';
+  // note 是「为什么没有说明」，后面接 ChangeReserve 那个链接；两者不重复同一句话。
+  const note=typeof changes.note==='string'?changes.note.trim():'';
+  return {items,more,total,note:items.length?note:(note||CHANGE_FALLBACK)};
+}
+function renderChanges(u){
+  const changes=['ready','launching','launched'].includes(u.state)?u.changes:null;
+  const {items,more,total,note}=changeRows(changes);
+  $('update-changes').hidden=!(items.length||note);
+  $('update-changes-summary').textContent=items.length
+    ?u.current_version+' → v'+u.latest_version+(total?' · 共 '+total+' 条':' · 更多改动'):'';
+  // 后端文本只经 textContent 进 DOM：提交标题可能带 < & 之类的字符。
+  $('update-changes-list').replaceChildren(...items.map(text=>{
+    const item=document.createElement('li');item.textContent=text;return item;
+  }));
+  $('update-changes-more').textContent=more;
+  $('update-changes-more').hidden=!more;
+  // 每次都重建「说明 + 手工出口」：说明是一句话，出口另起一行，两者不重复同一句话。
+  const noteText=note?note+' ':'';
+  const lead=document.createElement('span');lead.textContent=noteText;
+  const link=document.createElement('a');
+  link.textContent=CHANGE_RESERVE;
+  link.href='https://github.com/yoouzic/youziauth/releases';
+  link.target='_blank';
+  link.rel='noopener noreferrer';
+  $('update-changes-note').replaceChildren(lead,link);
+}
 function renderUpdates(){
   const u=state.update,ready=u.state==='ready',error=u.state==='error';
   const names={idle:'等待检查',checking:'正在检查',downloading:'正在下载',verifying:'正在验证',ready:'可以安装',up_to_date:'无需更新',error:'更新未完成',launching:'正在打开安装向导',launched:'已打开安装向导'};
@@ -164,6 +222,7 @@ function renderUpdates(){
   if($('update-notice-text').textContent!==notice)$('update-notice-text').textContent=notice;
   $('update-notice').classList.toggle('error',error);
   $('update-notice').hidden=!ready&&!error;
+  renderChanges(u);
 }
 function requireUpdateSync(){
   if(!state||syncedEpoch!==epoch){notify('更新状态尚未同步，请稍后重试。',true);return false;}

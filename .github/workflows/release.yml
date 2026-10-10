@@ -69,6 +69,24 @@ jobs:
       - name: Verify signed release
         shell: powershell
         run: ./packaging/verify_release.ps1 -MsiPath ./dist/youziauth.msi -Version $env:RELEASE_VERSION -OutputDirectory ./release
+      - name: Publish the hand-written Chinese notes
+        shell: powershell
+        run: |
+          # 客户端「这次更新改了什么」优先读这个资产，来自 docs/release-notes/v<版本>.md。
+          # 发布前就要求文件存在，所以**先写说明再打 tag**。
+          New-Item -ItemType Directory -Force -Path .\release | Out-Null
+          $source = "docs/release-notes/v$env:RELEASE_VERSION.md"
+          if (-not (Test-Path $source)) {
+            throw "Missing $source. Write the Chinese notes for this release before tagging."
+          }
+          $first = (Get-Content $source -TotalCount 1).Trim()
+          if ($first -notmatch '^#{1,6}\s+v?[0-9][0-9.]*\s*$') {
+            throw "$source must start with a heading holding the version, for example '## v$env:RELEASE_VERSION'."
+          }
+          if ((($first -replace '^#{1,6}\s+','') -replace '^v','').Trim() -ne $env:RELEASE_VERSION) {
+            throw "$source is headed '$first' but this release is v$env:RELEASE_VERSION."
+          }
+          Copy-Item $source .\release\release-notes.md -Force
       - name: Publish signed release
         shell: powershell
         env:
@@ -78,5 +96,6 @@ jobs:
             .\dist\youziauth.msi `
             .\release\SHA256SUMS.txt `
             .\release\youziauth.msi.ed25519 `
+            .\release\release-notes.md `
             .\release\release-provenance.json `
             --verify-tag --generate-notes

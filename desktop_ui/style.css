@@ -23,6 +23,19 @@
 .update-download progress::-webkit-progress-bar{background:var(--soft);border-radius:9px}
 .update-download progress::-webkit-progress-value{background:var(--blue);border-radius:9px}
 .update-download progress::-moz-progress-bar{background:var(--blue);border-radius:9px}
+.update-changes{margin-top:18px}
+.update-changes .card-label{flex-wrap:wrap;gap:6px 14px}
+.update-changes .card-label h3{margin-bottom:0}
+.update-changes-list{margin:14px 0 0;padding:0;list-style:none;display:grid;gap:9px}
+.update-changes-list li{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:baseline;gap:6px 12px;font-size:14px;line-height:1.5;overflow-wrap:anywhere}
+.update-changes-list li::before{content:"·";color:var(--blue);font-weight:700}
+.update-changes-list .update-changes-kind{color:var(--muted);font-size:12px;white-space:nowrap}
+.update-changes-list .update-changes-subject{min-width:0}
+.update-changes-list .update-changes-date{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.update-changes-more{margin-top:12px;color:var(--muted);font-size:12px}
+.update-changes-note{display:flex;flex-direction:column;gap:7px;align-items:flex-start;margin-top:14px}
+.update-changes-note a{text-decoration:underline;text-underline-offset:3px}
+.update-changes-list:empty{margin:0}
 .update-policy{margin-top:18px}
 .update-policy p+p{margin-top:7px}
 @media(max-width:760px){.update-notice{align-items:flex-start;flex-direction:column}.update-versions{grid-template-columns:1fr}.update-card .card-label{flex-wrap:wrap}}

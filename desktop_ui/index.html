@@ -160,6 +160,12 @@
           <div class="update-download"><div class="info-row"><span id="update-progress-label">下载进度</span><span id="update-download-size">尚未下载</span></div><progress id="update-progress" max="100" value="0" aria-labelledby="update-progress-label" aria-describedby="update-download-size" hidden></progress></div>
           <div class="task-actions"><button id="check-updates" type="button" class="secondary" disabled>检查更新</button><button id="install-update" type="button" class="primary" hidden disabled>安装更新</button></div>
         </article>
+        <article class="paper-card compact update-changes" id="update-changes" hidden>
+          <div class="card-label"><h3>这次更新改了什么</h3><span class="little-label" id="update-changes-summary"></span></div>
+          <ul class="update-changes-list" id="update-changes-list"></ul>
+          <p class="update-changes-more" id="update-changes-more" hidden></p>
+          <p class="update-changes-note field-hint" id="update-changes-note"></p>
+        </article>
         <article class="quiet-note update-policy"><i class="bi bi-shield-check" aria-hidden="true"></i><div><p>更新来源：GitHub Releases · yoouzic/youziauth</p></div></article>
       </section>
       <footer class="page-footer"><span>youziauth · 校园日常</span><span>简单一点，从容一点。</span></footer>

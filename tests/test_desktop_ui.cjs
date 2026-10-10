@@ -6,6 +6,7 @@ const fs=require('node:fs');
 const path=require('node:path');
 
 function updateFixture(overrides={}){
+  // changes 默认缺席：老快照没有这一层，界面必须当没有它一样正常工作。
   return {state:'idle',current_version:'1.4.4',latest_version:'',progress:0,downloaded_bytes:0,total_bytes:0,checked:'',message:'等待后台检查更新。',busy:false,...overrides};
 }
 function accountsFixture(overrides={}){
@@ -157,7 +158,8 @@ function harness(source='windows',extras={}){
     Image:extras.Image,getComputedStyle:extras.getComputedStyle,
     window:{addEventListener(){},scrollTo(){},pywebview:{api}},
     document:{getElementById:id=>elements.get(id)||null,
-      createElement(tag){return {tagName:String(tag).toUpperCase(),value:'',textContent:'',selected:false};},
+      createElement(tag){return {tagName:String(tag).toUpperCase(),value:'',textContent:'',selected:false,
+                                href:'',target:'',rel:''};},
       querySelectorAll:selector=>{
       if(selector==='[data-action]')return actions;
       if(selector==='.nav-link')return navigation;
@@ -612,6 +614,23 @@ async function updateHarness(overrides={}){
   return h;
 }
 const readyUpdate={state:'ready',latest_version:'1.5.0',progress:100,downloaded_bytes:10485760,total_bytes:10485760,checked:'2026-09-15 09:30',message:'安装包已下载，哈希与签名验证通过。'};
+// 「更新了什么」块，字段与 app_update.read_changes() 完全一致。
+function changesFixture(overrides={}){
+  return {entries:[{subject:'choose, name and manage the simulated position on a map',kind:'feat',date:'2026-09-24'},
+                   {subject:'stop reporting a stale portal session as a healthy uplink',kind:'fix',date:'2026-10-10'}],
+          total:2,more:false,note:'',...overrides};
+}
+// 发布者手写的中文说明：kind 是中文标签，date 为空（后端不给手写说明编日期）。
+function chineseChangesFixture(overrides={}){
+  return {entries:[
+    {subject:'校园网：代理开着时不再误报「能上网」',kind:'',date:''},
+    {subject:'寝室打卡支持每个账号独立时段',kind:'重点',date:''},
+    {subject:'定位来源切换后立刻对自动打卡生效',kind:'',date:''}],
+    total:3,more:false,note:'这一版只改校园网和打卡。',...overrides};
+}
+function manyEntries(count){
+  return Array.from({length:count},(unused,index)=>({subject:'fix number '+index,kind:'fix',date:'2026-10-10'}));
+}
 
 function clickUpdate(h,id){
   const button=h.el(id);
@@ -844,6 +863,101 @@ test('release messages and version strings are rendered literally, never as clou
   assert.equal(h.el('update-notice-link').attributes.href,'#updates');
   h.el('confirm-cancel').onclick();
   assert.equal(h.calls.length,0);
+});
+
+/* What changed in this update ------------------------------------------------------------------ */
+test('update entries are listed, and the card stays hidden while they are unknown',async()=>{
+  const idle=await updateHarness();idle.navigate('updates');
+  assert.equal(idle.el('update-changes').hidden,true,'No entries means no card');
+  assert.equal(idle.el('update-changes-list').children.length,0);
+  const h=await updateHarness({...readyUpdate,changes:changesFixture()});
+  assert.equal(h.el('update-changes').hidden,false);
+  assert.equal(h.el('update-changes-summary').textContent,'1.4.4 → v1.5.0 · 共 2 条');
+  const listed=h.el('update-changes-list').children;
+  assert.equal(listed.length,2);
+  for(const item of listed)assert.equal(item.tagName,'LI');
+  assert.equal(listed[0].textContent,'新增 · choose, name and manage the simulated position on a map · 2026-09-24');
+  assert.equal(listed[1].textContent,'修复 · stop reporting a stale portal session as a healthy uplink · 2026-10-10');
+  assert.equal(h.el('update-changes-more').hidden,true);
+  // 有条目时说明为空，只留一个手工出口。
+  assert.equal(h.el('update-changes-note').children[0].textContent,'');
+  assert.equal(h.el('update-changes-note').children[1].textContent,'在 GitHub 上查看发布记录');
+  // 拿不到说明时的出口：一句实话加一个手工链接。
+  const bare=await updateHarness({...readyUpdate,changes:{entries:[],total:0,more:false,note:'没能自动获取这次更新的说明。'}});
+  assert.equal(bare.el('update-changes').hidden,false);
+  assert.equal(bare.el('update-changes-list').children.length,0);
+  assert.equal(bare.el('update-changes-note').children[0].textContent,'没能自动获取这次更新的说明。 ');
+  assert.equal(bare.el('update-changes-note').children[1].textContent,'在 GitHub 上查看发布记录');
+  assert.equal(bare.el('update-changes-note').children[1].href,'https://github.com/yoouzic/youziauth/releases');
+  assert.equal(bare.el('update-changes-note').children[1].target,'_blank');
+  assert.equal(bare.el('update-changes-note').children[1].rel,'noopener noreferrer');
+});
+
+test('a long update list is capped and says how much it left out',async()=>{
+  const h=await updateHarness({...readyUpdate,changes:{entries:manyEntries(20),total:20,more:true,note:''}});
+  assert.equal(h.el('update-changes-list').children.length,12,'Only the first entries are listed inline');
+  assert.match(h.el('update-changes-summary').textContent,/共 20 条/);
+  assert.match(h.el('update-changes-more').textContent,/还有 8 条/);
+  assert.equal(h.el('update-changes-more').hidden,false);
+  // 后端快照封顶 60 条时 total 会比实际条数大，界面不能再报一个编出来的具体数字。
+  const capped=await updateHarness({...readyUpdate,changes:{entries:manyEntries(60),total:200,more:true,note:''}});
+  assert.equal(capped.el('update-changes-list').children.length,12);
+  assert.match(capped.el('update-changes-summary').textContent,/更多改动/);
+  assert.doesNotMatch(capped.el('update-changes-summary').textContent,/\d+ 条/);
+  assert.match(capped.el('update-changes-more').textContent,/还有更多/);
+  assert.doesNotMatch(capped.el('update-changes-more').textContent,/\d+ 条/);
+  // 没顶到后端上限时仍然报准确数字：45 条里只带了 40 条，列 12 条，还剩 33 条。
+  const exact=await updateHarness({...readyUpdate,changes:{entries:manyEntries(40),total:45,more:true,note:''}});
+  assert.match(exact.el('update-changes-summary').textContent,/共 45 条/);
+  assert.match(exact.el('update-changes-more').textContent,/还有 33 条/);
+});
+
+test('the change list never restates a version that is already installed',async()=>{
+  for(const state of ['up_to_date','error','idle','checking']){
+    const h=await updateHarness(updateFixture({state,changes:changesFixture()}));
+    assert.equal(h.el('update-changes').hidden,true,'state '+state+' must not show change notes');
+    assert.equal(h.el('update-changes-list').children.length,0);
+  }
+});
+
+test('hand-written Chinese notes are shown as written, never retranslated',async()=>{
+  const h=await updateHarness({...readyUpdate,changes:chineseChangesFixture()});
+  const listed=h.el('update-changes-list').children.map(item=>item.textContent);
+  assert.deepEqual(listed,[
+    '校园网：代理开着时不再误报「能上网」',
+    '重点 · 寝室打卡支持每个账号独立时段',
+    '定位来源切换后立刻对自动打卡生效',
+  ]);
+  // 中文标签照原样用（不是 CHANGE_KINDS 里的英文键），也不该被追加日期。
+  assert.doesNotMatch(listed.join('\n'),/校园网.*·\s*$/m);
+  assert.equal(h.el('update-changes-summary').textContent,'1.4.4 → v1.5.0 · 共 3 条');
+  assert.equal(h.el('update-changes-note').children[0].textContent,'这一版只改校园网和打卡。 ');
+  assert.equal(h.el('update-changes-more').hidden,true);
+});
+
+test('commit subjects and notes from the cloud are rendered literally',async()=>{
+  const subject='<img src=x onerror=alert(1)> fixed';
+  const note='<script>alert(2)</script> 没能自动获取说明。';
+  const h=await updateHarness({...readyUpdate,changes:{entries:[{subject,kind:'fix',date:'2026-10-10'}],total:1,more:false,note}});
+  assert.equal(h.el('update-changes-list').children[0].textContent,'修复 · '+subject+' · 2026-10-10');
+  assert.ok(h.el('update-changes-note').children[0].textContent.includes(note));
+});
+
+test('a snapshot without the change layer stays renderable',async()=>{
+  const h=await updateHarness();await h.refresh();   // updateFixture ships no changes key at all
+  h.navigate('updates');
+  assert.equal(h.el('update-changes').hidden,true);
+  assert.equal(h.el('update-changes-list').children.length,0);
+  assert.equal(h.el('update-status').textContent,'等待检查');
+  // 形状不对的云端字段只降级，不抛异常：轮询期间界面不能整块挂掉。
+  for(const bad of [{entries:'nope',total:3,more:false,note:''},
+                    {entries:[{subject:42},{subject:'   '},null],total:3,more:false,note:''}]){
+    const broken=await updateHarness({...readyUpdate,changes:bad});
+    assert.equal(broken.el('update-status').textContent,'可以安装','A bad change block must not break the update card');
+    assert.equal(broken.el('install-update').hidden,false);
+    assert.equal(broken.el('update-changes').hidden,false);
+    assert.equal(broken.el('update-changes-list').children.length,0);
+  }
 });
 
 /* Simulation map picker ------------------------------------------------------------------- */

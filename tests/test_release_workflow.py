@@ -67,6 +67,36 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("Out-File", text.split("Check release key configuration")[1].split("setup-python")[0])
         self.assertNotIn("signpath", text.lower())
 
+    def test_release_notes_are_prepared_and_version_checked_before_publishing(self):
+        # 「这次更新改了什么」优先读 release-notes.md 资产，所以发布流程必须在
+        # gh release create 之前备好它，并挡住版本号写错的文件。
+        text = ROOT.joinpath(".github", "workflows", "release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("docs/release-notes/v$env:RELEASE_VERSION.md", text)
+        self.assertIn("release\\release-notes.md", text)
+        # 版本号检查与发布顺序：先校验，后创建 Release。
+        self.assertLess(text.index("Publish the hand-written Chinese notes"),
+                        text.index("gh release create"))
+        self.assertIn("throw", text.split("Publish the hand-written Chinese notes")[1])
+        self.assertIn("release-notes.md", text.split("gh release create")[1])
+
+    def test_the_notes_reader_is_documented_with_a_writable_template(self):
+        readme = ROOT.joinpath("docs", "release-notes", "README.md")
+        self.assertTrue(readme.is_file(), "The notes format must be documented where it is written")
+        text = readme.read_text(encoding="utf-8")
+        self.assertIn("docs/release-notes/v<版本>.md", text)
+        self.assertIn("**重点**", text)
+        # 已经发布的 tag 不该再放一份说明文件，否则会被误当成「这一版已经写了」。
+        published = {f"v{line.strip()}.md" for line in
+                     ROOT.joinpath("VERSION").read_text(encoding="utf-8").splitlines()
+                     if line.strip()}
+        self.assertFalse(
+            [path for path in ROOT.joinpath("docs", "release-notes").glob("v*.md")
+             if path.name in published],
+            "A tag that is already published cannot gain an asset; do not add its notes file",
+        )
+
     def test_signing_key_is_never_committed(self):
         ignore = ROOT.joinpath(".gitignore").read_text(encoding="utf-8")
         self.assertIn(".release-key/", ignore)
