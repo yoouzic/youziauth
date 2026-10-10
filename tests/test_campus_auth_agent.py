@@ -561,13 +561,17 @@ class BuildUpdaterTests(unittest.TestCase):
     """
 
     def setUp(self):
+        # resolve() 是必须的：Windows 上 TemporaryDirectory 给出的是 8.3 短路径
+        # （C:/Users/RUNNER~1/...），而 install_dir_for_current_process 会把它 resolve 成
+        # 长路径。CI runner 开着 8.3 名字，于是两个路径字符串不相等 —— 本地机器通常不是。
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.install = Path(self.temporary.name) / "install"
+        self.root = Path(self.temporary.name).resolve()
+        self.install = self.root / "install"
         (self.install / "_internal").mkdir(parents=True)
         (self.install / "_internal" / "VERSION").write_text("1.9.0\n", encoding="utf-8")
         (self.install / "youziauth.exe").write_bytes(b"stub")
-        self.app_dir = Path(self.temporary.name) / "appdata"
+        self.app_dir = self.root / "appdata"
 
     def build(self):
         import campus_auth_agent
