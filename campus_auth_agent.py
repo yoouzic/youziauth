@@ -11,6 +11,7 @@ import datetime as dt
 import logging
 import logging.handlers
 import re
+import sys
 import threading
 import time
 import uuid
@@ -67,6 +68,8 @@ class Agent:
         snapshot_path: Path,
         logger: logging.Logger,
         boot_id: Optional[str] = None,
+        updater=None,
+        update_interval_seconds: int = 6 * 60 * 60,
     ):
         self.config_loader = config_loader
         self.config = config_loader()
@@ -79,6 +82,12 @@ class Agent:
         self.network_attempt_index = 0
         self.transient_failures = 0
         self.automatic_login_blocked = False
+        # 后台自动更新：这是 SYSTEM 常驻进程存在的意义之一 —— 它已经提权，所以
+        # 检查、下载、验签、静默安装都不需要再弹一次 UAC。
+        self.updater = updater
+        self.update_interval_seconds = max(300, int(update_interval_seconds))
+        self._next_update_at = 0.0
+        self._update_lock = threading.Lock()
         self._online_logged_at = None
         suppressed = False
         try:
@@ -114,6 +123,7 @@ class Agent:
             incident_id=incident_id,
             detail=sanitized_detail(detail),
             updated_at=self._now(),
+            update=self.snapshot.update,
         )
         write_snapshot(self.snapshot_path, self.snapshot)
         return self.snapshot
@@ -268,9 +278,73 @@ class Agent:
             snapshot = self.retry_now()
         elif command.command == "reload-config":
             snapshot = self.reload_config()
+        elif command.command == "check-update":
+            snapshot = self.request_update_check()
         else:
             snapshot = self.suppress_notifications_for_boot()
         return {"ok": True, "snapshot": dataclasses.asdict(snapshot)}
+
+    def _publish_update(self, status) -> RuntimeSnapshot:
+        """把自动更新状态并进运行时快照，界面经由同一条通道读到它。"""
+        self.snapshot = dataclasses.replace(
+            self.snapshot,
+            update=status.to_dict(),
+            updated_at=self._now(),
+        )
+        try:
+            write_snapshot(self.snapshot_path, self.snapshot)
+        except OSError:
+            pass
+        return self.snapshot
+
+    def _run_update_check(self, reason: str) -> RuntimeSnapshot:
+        """跑一次后台更新。任何异常都只降级为错误状态，绝不能让 agent 退出。
+
+        调用方必须已经持有 ``self._update_lock``。
+        """
+        if self.updater is None:
+            return self.snapshot
+        try:
+            status = self.updater.run_cycle()
+        except Exception as exc:  # noqa: BLE001 - a failed update must not stop the agent
+            self.logger.warning("automatic update failed: %s", type(exc).__name__)
+            return self.snapshot
+        self.logger.info(
+            "automatic update (%s): state=%s current=%s latest=%s detail=%s",
+            reason, status.state, status.current_version, status.latest_version, status.detail,
+        )
+        return self._publish_update(status)
+
+    def request_update_check(self) -> RuntimeSnapshot:
+        """界面请求「现在检查一次更新」—— 只是一个信号，没有任何参数。
+
+        **立刻返回**：检查加下载可能要好几分钟，而这条指令走在 named pipe 上，界面那边
+        三秒就超时。真正的更新在后台线程里跑，进度由运行时快照回报。
+        """
+        if self.updater is None or not self._update_lock.acquire(blocking=False):
+            return self.snapshot
+
+        def work():
+            try:
+                self._run_update_check("requested")
+            finally:
+                self._update_lock.release()
+
+        threading.Thread(target=work, name="youziauth-agent-update", daemon=True).start()
+        return self.snapshot
+
+    def update_due(self) -> bool:
+        return self.updater is not None and time.monotonic() >= self._next_update_at
+
+    def periodic_update_check(self) -> RuntimeSnapshot:
+        # 先排下一次，再动手：安装会把这个进程杀掉，重启后不该立刻再跑一遍。
+        self._next_update_at = time.monotonic() + self.update_interval_seconds
+        if not self._update_lock.acquire(blocking=False):
+            return self.snapshot      # 已经有一次在跑，不重复发起
+        try:
+            return self._run_update_check("periodic")
+        finally:
+            self._update_lock.release()
 
     def serve_forever(
         self,
@@ -293,6 +367,13 @@ class Agent:
         threading.Thread(target=command_loop, name="youziauth-agent-ipc", daemon=True).start()
         delay = 0
         while not stop_event.wait(delay):
+            if self.update_due():
+                # 只在网络循环的间隙跑一次；安装会终止本进程，重启后由 next_update_at
+                # 拦住，不会变成「装一次、重启、马上又装」的循环。
+                try:
+                    self.periodic_update_check()
+                except Exception as exc:  # noqa: BLE001 - never let an update stop the agent
+                    self.logger.error("periodic update check failed: %s", type(exc).__name__)
             result = self.run_cycle()
             delay = result.next_delay
 
@@ -341,6 +422,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_updater(program_data: Path):
+    """后台自动更新的实装：只在冻结的正式安装版里启用。
+
+    源码运行时没有可安装的 MSI，也没有稳定的安装目录，所以返回 None —— agent 照常
+    做校园网认证，只是不碰更新。这样开发机上跑 agent 不会误装什么东西。
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    try:
+        import auto_update
+        from startup_tasks import install_dir_for_current_process, run_tray_task
+
+        install_dir = install_dir_for_current_process()
+        if install_dir is None or not (install_dir / "VERSION").is_file():
+            return None
+        return auto_update.Updater(
+            install_dir=install_dir,
+            cache_dir=Path(program_data) / "updates",
+            executable=install_dir / "youziauth.exe",
+            relaunch=run_tray_task,
+            log_dir=Path(program_data) / "updates",
+        )
+    except Exception:  # noqa: BLE001 - an unavailable updater must not stop the agent
+        return None
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
@@ -349,6 +456,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"agent config error: {sanitized_detail(str(exc))}")
         return 2
     logger = configure_agent_logging(Path(config.log_file), args.verbose)
+    snapshot_path = (program_data_root(args.config.parent.parent) / "runtime.json"
+                     if args.config == machine_config_path(args.config.parent.parent)
+                     else args.config.parent / "runtime.json")
     agent = Agent(
         config_loader=lambda: load_agent_config(args.config),
         probe=NetworkProbe(),
@@ -359,10 +469,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                 force_login=force_login,
             )
         ),
-        snapshot_path=program_data_root(args.config.parent.parent) / "runtime.json"
-        if args.config == machine_config_path(args.config.parent.parent)
-        else args.config.parent / "runtime.json",
+        snapshot_path=snapshot_path,
         logger=logger,
+        updater=build_updater(snapshot_path.parent),
     )
     if args.once:
         result = agent.run_cycle()

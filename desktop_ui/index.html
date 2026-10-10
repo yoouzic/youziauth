@@ -151,14 +151,14 @@
 
       <section class="page" id="records" aria-labelledby="records-title" hidden><div class="page-heading"><div><div class="eyebrow">每一步，都有迹可循</div><h1 id="records-title">运行记录</h1><p class="muted">查看最近的连接检测与寝室打卡结果。</p></div><button class="secondary" id="refresh-records"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i> 刷新记录</button></div><article class="paper-card records-card"><div class="records-header"><div class="segmented" role="group" aria-label="记录类型"><button class="selected" data-log="network" aria-pressed="true">校园网</button><button data-log="dorm" aria-pressed="false">寝室打卡</button></div><span class="little-label">仅保存在本机</span></div><div id="empty-records" class="empty-state"><i class="bi bi-journal-text" aria-hidden="true"></i><h2>还没有运行记录</h2><p class="muted">完成一次检测或任务查询后，记录会出现在这里。</p></div><pre id="log-output" tabindex="0" hidden></pre><button class="log-jump" id="log-jump" type="button" hidden>↓ <span id="log-jump-count">0</span> 条新记录</button></article></section>
       <section class="page" id="updates" aria-labelledby="updates-title" hidden>
-        <div class="page-heading"><div><div class="eyebrow">保持最新，安装由你确认</div><h1 id="updates-title">软件更新</h1><p class="muted">启动后在后台检查最新正式版，不影响你继续使用。</p></div></div>
+        <div class="page-heading"><div><div class="eyebrow">保持最新，更新自动完成</div><h1 id="updates-title">软件更新</h1><p class="muted">后台代理会定期检查正式版，验签通过后自行静默安装，不需要你确认。</p></div></div>
         <article class="paper-card compact update-card">
-          <div class="card-label"><h3>版本与下载</h3><span id="update-status" class="badge">等待读取</span></div>
+          <div class="card-label"><h3>版本与后台更新</h3><span id="update-status" class="badge">等待读取</span></div>
           <div class="update-versions"><div class="info-row"><span>当前版本</span><strong id="update-current-version">正在读取…</strong></div><div class="info-row"><span>最新正式版</span><strong id="update-latest-version">尚未检查</strong></div></div>
           <p id="update-message" class="muted">正在读取更新状态…</p>
           <p id="update-checked" class="field-hint">尚未检查</p>
-          <div class="update-download"><div class="info-row"><span id="update-progress-label">下载进度</span><span id="update-download-size">尚未下载</span></div><progress id="update-progress" max="100" value="0" aria-labelledby="update-progress-label" aria-describedby="update-download-size" hidden></progress></div>
-          <div class="task-actions"><button id="check-updates" type="button" class="secondary" disabled>检查更新</button><button id="install-update" type="button" class="primary" hidden disabled>安装更新</button></div>
+          <div class="update-download"><div class="info-row"><span id="update-progress-label">后台更新进度</span><span id="update-download-size">尚未下载</span></div><progress id="update-progress" max="100" value="0" aria-labelledby="update-progress-label" aria-describedby="update-download-size" hidden></progress></div>
+          <div class="task-actions"><button id="check-updates" type="button" class="secondary" disabled>立即检查</button></div>
         </article>
         <article class="paper-card compact update-changes" id="update-changes" hidden>
           <div class="card-label"><h3>这次更新改了什么</h3><span class="little-label" id="update-changes-summary"></span></div>
@@ -166,7 +166,7 @@
           <p class="update-changes-more" id="update-changes-more" hidden></p>
           <p class="update-changes-note field-hint" id="update-changes-note"></p>
         </article>
-        <article class="quiet-note update-policy"><i class="bi bi-shield-check" aria-hidden="true"></i><div><p>更新来源：GitHub Releases · yoouzic/youziauth</p></div></article>
+        <article class="quiet-note update-policy"><i class="bi bi-shield-check" aria-hidden="true"></i><div><p>更新来源：GitHub Releases · yoouzic/youziauth</p><p>每一个安装包都要通过内置 Ed25519 公钥验签；由已提权的后台代理自行下载、校验并静默安装。界面只负责显示进度，无法让代理安装任何指定文件。</p></div></article>
       </section>
       <footer class="page-footer"><span>youziauth · 校园日常</span><span>简单一点，从容一点。</span></footer>
     </main>

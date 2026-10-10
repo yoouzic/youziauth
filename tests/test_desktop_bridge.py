@@ -181,25 +181,69 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertEqual(save.call_args.args[1].password, '')
         self.assertEqual(save.call_args.args[1].check_interval_seconds, 90)
 
-    def test_update_snapshot_and_actions_are_isolated_from_school_operations(self):
+    def test_update_check_asks_the_privileged_agent_and_never_downloads_here(self):
         state = self.bridge.snapshot()
         self.assertIn('update', state)
         self.assertEqual(state['update']['state'], 'idle')
-        with patch.object(self.bridge._updates, 'check', return_value='正在检查') as check:
+        # 界面请求检查 = 向 agent 发一个不带参数的信号；桌面进程自己不再下载任何东西。
+        with patch.object(self.bridge, '_agent_command') as command:
+            self.bridge._agent = True
             self.assertTrue(self.bridge.dispatch('update_check')['ok'])
-            check.assert_called_once_with()
+            command.assert_called_once_with('check-update')
+        with patch.object(self.bridge._updates, 'check') as check:
+            self.bridge._agent = True
+            self.bridge.dispatch('update_check')
+            check.assert_not_called()
         self.controller.start.assert_not_called()
         self.controller.poll.assert_not_called()
 
-    def test_update_install_requires_explicit_confirmation_and_no_active_operations(self):
-        self.assertFalse(self.bridge.dispatch('update_install', {'version': '1.5.0'})['ok'])
-        with patch.object(self.bridge._updates, 'install', return_value='打开安装向导') as install:
-            self.controller.busy = True
-            self.assertFalse(self.bridge.dispatch('update_install', {'confirmed': True, 'version': '1.5.0'})['ok'])
+    def test_the_desktop_process_has_no_install_action_at_all(self):
+        # 关键安全性质：未提权的界面**不能**触发安装。它连这个动作都没有，
+        # 所以不存在「界面把包交给提权端」这条本地提权通道。
+        self.assertFalse(self.bridge.dispatch('update_install', {'confirmed': True, 'version': '1.5.0'})['ok'])
+        with patch.object(self.bridge._updates, 'install') as install:
+            self.bridge.dispatch('update_install', {'confirmed': True, 'version': '1.5.0'})
             install.assert_not_called()
-            self.controller.busy = False
-            self.assertTrue(self.bridge.dispatch('update_install', {'confirmed': True, 'version': '1.5.0'})['ok'])
-            install.assert_called_once_with(True, '1.5.0')
+
+    def test_an_update_check_without_a_running_agent_is_refused(self):
+        self.bridge._agent = False
+        result = self.bridge.dispatch('update_check')
+        self.assertFalse(result['ok'])
+        self.assertIn('后台', result['message'])
+
+    def test_the_interface_adopts_the_agents_update_status(self):
+        accepted = self.bridge._updates.adopt({
+            'state': 'installing', 'current_version': '1.8.4', 'latest_version': '1.9.0',
+            'progress': 100, 'checked': '2026-10-10 18:00', 'message': '正在后台静默安装…',
+            'detail': '', 'changes': {},
+        })
+        self.assertTrue(accepted)
+        state = self.bridge.snapshot()['update']
+        self.assertEqual(state['state'], 'installing')
+        self.assertEqual(state['latest_version'], '1.9.0')
+        # 形状不对或状态词不在词表里的一律拒绝：快照是外部数据。
+        self.assertFalse(self.bridge._updates.adopt({'state': 'give-me-admin'}))
+        self.assertFalse(self.bridge._updates.adopt({'state': 'idle', 'evil': 1}))
+
+    def test_a_read_only_controller_refuses_to_check_or_install(self):
+        # 界面这条控制器是只读的：真要有代码尝试让它自己下载，会明确失败而不是
+        # 悄悄开始第二次互相打架的检查。
+        with self.assertRaises(RuntimeError):
+            self.bridge._updates.check()
+        with self.assertRaises(RuntimeError):
+            self.bridge._updates.install(True, '1.5.0')
+
+    def test_losing_the_agent_clears_a_ready_update(self):
+        self.bridge._updates.adopt({
+            'state': 'ready', 'current_version': '1.8.4', 'latest_version': '1.9.0',
+            'progress': 100, 'checked': '', 'message': '已下载', 'detail': '', 'changes': {},
+        })
+        self.assertEqual(self.bridge.snapshot()['update']['state'], 'ready')
+        self.bridge._updates.disconnect()
+        state = self.bridge.snapshot()['update']
+        self.assertEqual(state['state'], 'idle')
+        self.assertEqual(state['latest_version'], '')
+        self.assertIn('后台', state['message'])
 
     def test_preview_update_download_is_synthetic_and_install_never_opens_windows(self):
         with patch('desktop_bridge.UpdateController') as controller:

@@ -169,8 +169,11 @@ function harness(source='windows',extras={}){
       querySelectorAll:selector=>{
       if(selector==='[data-action]')return actions;
       if(selector==='.nav-link')return navigation;
+      // 动作名要按整串匹配：'check-updates' 的子串会命中 'install-update' 之类，
+      // 那样一个按钮会被当成另一个按钮，禁用状态看起来「没生效」。
       const selected=[...selector.matchAll(/\[data-action="([^"]+)"\]/g)].map(m=>m[1]);
       if(selected.length)return actions.filter(button=>selected.includes(button.dataset.action));
+      // id 选择器同样按整串匹配，避免 #check 命中 #check-updates 这类前缀重合。
       const ids=[...selector.matchAll(/#([\w-]+)/g)].map(m=>m[1]);
       return ids.map(id=>elements.get(id)).filter(Boolean);
     }},
@@ -662,13 +665,20 @@ test('updates navigation selects its own page and retains the sidebar link',asyn
 test('update actions are disabled and cannot run before the first snapshot',async()=>{
   const h=harness();
   assert.equal(h.el('check-updates').disabled,true);
-  assert.equal(h.el('install-update').disabled,true);
-  assert.equal(h.el('install-update').hidden,true);
-  clickUpdate(h,'check-updates');clickUpdate(h,'install-update');
+  // 按钮在首次快照前是禁用的，处理器自己也挡住 —— 即便有人直接调用也不发请求。
+  clickUpdate(h,'check-updates');
   assert.equal(h.calls.length,0);
-  assert.equal(h.el('confirm-dialog').open,false);
-  assert.match(h.el('toast').textContent,/尚未同步/);
   await settle();
+});
+
+test('the interface has no install action: the privileged agent installs',async()=>{
+  // 关键安全性质的前端一侧：界面里根本不存在「安装更新」按钮，也没有确认对话框
+  // 那条路径，所以未提权的界面不可能触发安装。
+  const html=fs.readFileSync(path.join(__dirname,'../desktop_ui/index.html'),'utf8');
+  assert.doesNotMatch(html,/install-update/);
+  const source=fs.readFileSync(path.join(__dirname,'../desktop_ui/app.js'),'utf8');
+  assert.doesNotMatch(source,/update_install/);
+  assert.doesNotMatch(source,/install-update/);
 });
 
 test('idle updates show current version and offer an explicit check without auto-dispatch',async()=>{
@@ -680,10 +690,18 @@ test('idle updates show current version and offer an explicit check without auto
   assert.match(h.el('update-checked').textContent,/尚未检查/);
   assert.equal(h.el('check-updates').disabled,false);
   assert.equal(h.el('update-notice').hidden,true);
-  assert.equal(h.el('install-update').hidden,true);
   assert.equal(h.calls.length,0);
   clickUpdate(h,'check-updates');await settle();
   assert.deepEqual(JSON.parse(JSON.stringify(h.calls)),[{action:'update_check',payload:{}}]);
+});
+
+test('the check button asks the agent to look, it never installs',async()=>{
+  // 用「已是最新」：'ready' 是代理准备安装，检查按钮本身就应该是禁用的。
+  const h=await updateHarness({state:'up_to_date',latest_version:'1.4.4',message:'当前已是最新正式版。'});
+  assert.equal(h.el('check-updates').disabled,false);
+  clickUpdate(h,'check-updates');await settle();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls)),[{action:'update_check',payload:{}}]);
+  assert.equal(h.calls.some(call=>call.action==='update_install'),false);
 });
 
 test('up-to-date state never offers a downgrade when the release is older',async()=>{
@@ -692,11 +710,8 @@ test('up-to-date state never offers a downgrade when the release is older',async
   assert.match(h.el('update-status').textContent,/无需更新/);
   assert.match(h.el('update-message').textContent,/无需更新/);
   assert.match(h.el('update-checked').textContent,/2026-09-15 09:30/);
-  assert.equal(h.el('install-update').hidden,true);
   assert.equal(h.el('update-notice').hidden,true);
-  clickUpdate(h,'install-update');await settle();
   assert.equal(h.calls.length,0);
-  assert.equal(h.el('confirm-dialog').open,false);
 });
 
 test('update errors persist across pages without poll toasts and allow a retry',async()=>{
@@ -704,9 +719,8 @@ test('update errors persist across pages without poll toasts and allow a retry',
   const h=await updateHarness({state:'error',message});
   assert.match(h.el('update-status').textContent,/更新未完成/);
   assert.equal(h.el('update-message').textContent,message);
-  assert.equal(h.el('check-updates').textContent,'重新检查');
+  assert.equal(h.el('check-updates').textContent,'再检查一次');
   assert.equal(h.el('check-updates').disabled,false);
-  assert.equal(h.el('install-update').hidden,true);
   for(const page of ['overview','network','dorm','records','updates']){
     h.navigate(page);await h.refresh();
     assert.equal(h.el('update-notice').hidden,false);
@@ -721,16 +735,20 @@ test('update errors persist across pages without poll toasts and allow a retry',
   assert.equal(h.el('update-notice').hidden,true);
 });
 
-for(const [state,label] of [['checking','正在检查'],['downloading','正在下载'],['verifying','正在验证'],['launching','正在打开安装向导']]){
-  test(`${state} updates disable checks and cannot open installation confirmation`,async()=>{
-    const h=await updateHarness({state,busy:true,message:'正在处理，请稍候。'});
+for(const [state,label] of [['checking','正在检查'],['downloading','正在后台下载'],['verifying','正在验证'],
+                            ['installing','正在后台安装'],['ready','准备安装'],['installed','已自动更新']]){
+  test(`${state} updates are reported without asking the user to install`,async()=>{
+    const h=await updateHarness({...readyUpdate,state,message:'正在处理，请稍候。'});
     assert.equal(h.el('update-status').textContent,label);
-    assert.equal(h.el('check-updates').disabled,true);
-    assert.equal(h.el('install-update').hidden,true);
-    assert.equal(h.el('install-update').disabled,true);
-    clickUpdate(h,'check-updates');clickUpdate(h,'install-update');await settle();
-    assert.equal(h.calls.length,0);
-    assert.equal(h.el('confirm-dialog').open,false);
+    if(state==='installed'){
+      assert.equal(h.el('check-updates').disabled,false);
+      assert.equal(h.el('update-notice').hidden,false);
+      assert.match(h.el('update-notice-text').textContent,/已自动更新到 1\.5\.0/);
+    }else{
+      assert.equal(h.el('check-updates').disabled,true);
+    }
+    clickUpdate(h,'check-updates');await settle();
+    assert.deepEqual(h.calls.map(call=>call.action).filter(a=>a==='update_install'),[]);
   });
 }
 
@@ -748,117 +766,60 @@ test('download progress exposes percentage and transferred size with an accessib
   assert.match(h.el('update-download-size').textContent,/512 B.*总大小未知/);
 });
 
-test('ready updates show a quiet global prompt and cancellation never dispatches',async()=>{
-  const h=await updateHarness(readyUpdate);h.navigate('overview');
-  assert.equal(h.el('update-status').textContent,'可以安装');
-  assert.equal(h.el('install-update').hidden,false);
-  assert.equal(h.el('install-update').disabled,false);
-  assert.equal(h.el('update-notice').hidden,false);
-  assert.match(h.el('update-notice-text').textContent,/1\.5\.0.*确认/);
-  assert.equal(h.el('update-notice-link').attributes.href,'#updates');
-  assert.equal(h.el('update-notice').classList.contains('error'),false);
-  await h.refresh();await h.refresh();
-  assert.equal(h.el('toast').hidden,true);
-  assert.equal(h.calls.length,0);
-  clickUpdate(h,'install-update');
-  assert.equal(h.el('confirm-dialog').open,true);
-  assert.match(h.el('confirm-title').textContent,/1\.5\.0/);
-  const text=h.el('confirm-text').textContent;
-  assert.match(text,/Windows.*管理员授权/);
-  assert.match(text,/安装期间.*关闭.*程序.*系统代理/);
-  assert.match(text,/完成后.*重新打开/);
-  h.el('confirm-cancel').onclick();h.el('confirm-ok').onclick();await settle();
+test('a silent install reports progress and then success without a confirmation step',async()=>{
+  const h=await updateHarness({...readyUpdate,state:'installing',message:'正在后台静默安装 v1.5.0…'});
+  assert.equal(h.el('update-status').textContent,'正在后台安装');
+  assert.equal(h.el('update-progress').hidden,false);
+  assert.equal(h.el('check-updates').disabled,true);
   assert.equal(h.el('confirm-dialog').open,false);
+  h.data.update=updateFixture({state:'installed',latest_version:'1.5.0',progress:100,
+    downloaded_bytes:10485760,total_bytes:10485760,message:'已自动更新到 v1.5.0。',
+    current_version:'1.5.0'});await h.refresh();
+  assert.equal(h.el('update-status').textContent,'已自动更新');
+  assert.equal(h.el('update-current-version').textContent,'1.5.0');
+  assert.equal(h.el('update-notice').hidden,false);
+  assert.equal(h.el('update-notice').classList.contains('error'),false);
   assert.equal(h.calls.length,0);
 });
 
-test('installation confirms exactly the displayed version after an unchanged poll',async()=>{
-  const h=await updateHarness(readyUpdate);clickUpdate(h,'install-update');
-  await h.refresh();
-  h.el('confirm-ok').onclick();h.el('confirm-ok').onclick();await settle();
-  assert.deepEqual(JSON.parse(JSON.stringify(h.calls)),[{action:'update_install',payload:{confirmed:true,version:'1.5.0'}}]);
+test('snapshot failure disables the check button instead of dispatching',async()=>{
+  const h=await updateHarness({state:'up_to_date',latest_version:'1.4.4',message:'当前已是最新正式版。'});
+  assert.equal(h.el('check-updates').disabled,false);
+  h.api.snapshot=async()=>{throw Error('snapshot unavailable');};await h.refresh();
+  assert.equal(h.el('check-updates').disabled,true);
+  clickUpdate(h,'check-updates');await settle();
+  assert.equal(h.calls.length,0);
 });
 
-for(const [name,change] of [['version',{latest_version:'1.6.0'}],['state',{state:'error',message:'安装包已失效，请重新检查。'}]]){
-  test(`installation rejects a changed ${name} after confirmation opened`,async()=>{
-    const h=await updateHarness(readyUpdate);clickUpdate(h,'install-update');
-    Object.assign(h.data.update,change);await h.refresh();
-    h.el('confirm-ok').onclick();await settle();
-    assert.equal(h.calls.length,0);
-    assert.match(h.el('toast').textContent,/重新确认/);
-  });
-}
-
-for(const openFirst of [false,true]){
-  test(`snapshot failure blocks installation ${openFirst?'after':'before'} opening confirmation`,async()=>{
-    const h=await updateHarness(readyUpdate);
-    if(openFirst)clickUpdate(h,'install-update');
-    h.api.snapshot=async()=>{throw Error('snapshot unavailable');};await h.refresh();
-    assert.equal(h.el('install-update').disabled,true);
-    assert.equal(h.el('check-updates').disabled,true);
-    if(openFirst)h.el('confirm-ok').onclick();else clickUpdate(h,'install-update');
-    await settle();
-    assert.equal(h.calls.length,0);
-    assert.equal(h.el('confirm-dialog').open,false);
-    assert.match(h.el('toast').textContent,/尚未同步/);
-  });
-}
-
-test('installation rejects a different synchronization epoch even after successful refresh',async()=>{
-  const h=await updateHarness(readyUpdate);clickUpdate(h,'install-update');
-  h.stop.listeners.click();await settle();
-  assert.equal(h.el('connection-error').hidden,true);
-  h.el('confirm-ok').onclick();await settle();
-  assert.deepEqual(h.calls.map(call=>call.action),['network_stop']);
-  assert.match(h.el('toast').textContent,/重新确认/);
-});
-
-test('pending bridge actions keep ready update buttons disabled even if a poll succeeds',async()=>{
-  const h=await updateHarness(readyUpdate);
+test('pending bridge actions keep the check button disabled even if a poll succeeds',async()=>{
+  // 用「已是最新」而不是「准备安装」：后者本来就会禁止再点检查（代理正在准备安装），
+  // 那样测不出「被进行中的操作挡住、操作结束后恢复」这件事。
+  const h=await updateHarness({state:'up_to_date',latest_version:'1.4.4',message:'当前已是最新正式版。'});
   const dispatch=h.api.dispatch;let complete;
   h.api.dispatch=async(action,payload)=>{const result=await dispatch(action,payload);await new Promise(resolve=>complete=()=>resolve(result));return result;};
   h.stop.listeners.click();await settle();await h.refresh();
-  assert.equal(h.el('install-update').disabled,true);
   assert.equal(h.el('check-updates').disabled,true);
-  clickUpdate(h,'install-update');clickUpdate(h,'check-updates');
-  assert.equal(h.el('confirm-dialog').open,false);
+  clickUpdate(h,'check-updates');
   assert.deepEqual(h.calls.map(call=>call.action),['network_stop']);
   complete();await settle();
-  assert.equal(h.el('install-update').disabled,false);
+  assert.equal(h.el('check-updates').disabled,false);
 });
 
-const updateDrafts={
-  network:h=>{h.el('username').value='unsaved-user';h.el('network-form').listeners.input();},
-  dorm:h=>{h.el('auto-interval').value='600';h.el('dorm-form').listeners.input();},
-  source:h=>pickSource(h,'simulation'),
-};
-for(const [kind,edit] of Object.entries(updateDrafts)){
-  for(const openFirst of [false,true]){
-    test(`unsaved ${kind} draft blocks installation ${openFirst?'during':'before'} confirmation`,async()=>{
-      const h=await updateHarness(readyUpdate);
-      if(openFirst)clickUpdate(h,'install-update');
-      edit(h);await h.refresh();
-      if(openFirst)h.el('confirm-ok').onclick();else clickUpdate(h,'install-update');
-      await settle();
-      assert.equal(h.calls.length,0);
-      assert.equal(h.el('confirm-dialog').open,false);
-      assert.match(h.el('toast').textContent,/未保存.*先保存/);
-      if(kind==='network')assert.equal(h.el('username').value,'unsaved-user');
-      if(kind==='dorm')assert.equal(h.el('auto-interval').value,'600');
-      if(kind==='source')assert.equal(h.el('location-source').value,'simulation');
-    });
-  }
-}
-
-test('launched means the wizard opened, not that the version is installed',async()=>{
-  const h=await updateHarness({...readyUpdate,state:'launched',message:'已打开安装向导，请按向导完成安装，完成后重新打开程序。'});
-  assert.equal(h.el('update-status').textContent,'已打开安装向导');
-  assert.match(h.el('update-message').textContent,/按向导完成安装/);
-  assert.doesNotMatch(h.el('update-status').textContent,/安装成功|更新成功|已安装/);
-  assert.equal(h.el('update-current-version').textContent,'1.4.4');
-  assert.equal(h.el('install-update').hidden,true);
-  assert.equal(h.el('update-notice').hidden,true);
+test('a ready update blocks another check while the agent prepares to install',async()=>{
+  const h=await updateHarness(readyUpdate);
+  assert.equal(h.el('update-status').textContent,'准备安装');
+  assert.equal(h.el('check-updates').disabled,true);
+  clickUpdate(h,'check-updates');await settle();
   assert.equal(h.calls.length,0);
+});
+
+test('an install that finished but could not relaunch is reported, not claimed as working',async()=>{
+  const h=await updateHarness({...updateFixture({state:'error',current_version:'1.5.0',
+    latest_version:'1.5.0',progress:100,
+    message:'v1.5.0 已安装但程序没能启动，已停止重试并保留日志。'})});
+  assert.equal(h.el('update-status').textContent,'更新未完成');
+  assert.match(h.el('update-message').textContent,/没能启动/);
+  assert.equal(h.el('update-notice').classList.contains('error'),true);
 });
 
 test('release messages and version strings are rendered literally, never as cloud HTML',async()=>{
@@ -868,11 +829,7 @@ test('release messages and version strings are rendered literally, never as clou
   assert.equal(h.el('update-message').textContent,message);
   assert.equal(h.el('update-latest-version').textContent,version);
   assert.ok(h.el('update-notice-text').textContent.includes(message));
-  h.data.update={...updateFixture(readyUpdate),latest_version:version};await h.refresh();
-  clickUpdate(h,'install-update');
-  assert.ok(h.el('confirm-title').textContent.includes(version));
   assert.equal(h.el('update-notice-link').attributes.href,'#updates');
-  h.el('confirm-cancel').onclick();
   assert.equal(h.calls.length,0);
 });
 
@@ -964,8 +921,8 @@ test('a snapshot without the change layer stays renderable',async()=>{
   for(const bad of [{entries:'nope',total:3,more:false,note:''},
                     {entries:[{subject:42},{subject:'   '},null],total:3,more:false,note:''}]){
     const broken=await updateHarness({...readyUpdate,changes:bad});
-    assert.equal(broken.el('update-status').textContent,'可以安装','A bad change block must not break the update card');
-    assert.equal(broken.el('install-update').hidden,false);
+    assert.equal(broken.el('update-status').textContent,'准备安装','A bad change block must not break the update card');
+    assert.equal(broken.el('update-changes').hidden,false);
     assert.equal(broken.el('update-changes').hidden,false);
     assert.equal(broken.el('update-changes-list').children.length,0);
   }

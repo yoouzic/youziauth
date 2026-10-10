@@ -278,7 +278,9 @@ function changeRows(changes){
   return {items,more,total,note:items.length?note:(note||CHANGE_FALLBACK)};
 }
 function renderChanges(u){
-  const changes=['ready','launching','launched'].includes(u.state)?u.changes:null;
+  // 「这次改了什么」只在真的拿到新版本说明时出现：代理已经下载好（ready）、正在装、
+  // 或刚装完。launching/launched 是旧 agent 的词，保留兼容。
+  const changes=['ready','installing','installed','launching','launched'].includes(u.state)?u.changes:null;
   const {items,more,total,note}=changeRows(changes);
   $('update-changes').hidden=!(items.length||note);
   $('update-changes-summary').textContent=items.length
@@ -300,42 +302,39 @@ function renderChanges(u){
   $('update-changes-note').replaceChildren(lead,link);
 }
 function renderUpdates(){
-  const u=state.update,ready=u.state==='ready',error=u.state==='error';
-  const names={idle:'等待检查',checking:'正在检查',downloading:'正在下载',verifying:'正在验证',ready:'可以安装',up_to_date:'无需更新',error:'更新未完成',launching:'正在打开安装向导',launched:'已打开安装向导'};
-  badge('update-status',names[u.state],error?'error':ready||u.state==='up_to_date'?'success':'');
+  const u=state.update,error=u.state==='error';
+  const done=u.state==='installed';
+  const busy=['checking','downloading','verifying','installing','ready'].includes(u.state);
+  // 后台自动更新：界面只报进度，不再有「可以安装 / 已打开安装向导」这类需要用户
+  // 参与的状态。安装由常驻的提权代理完成。
+  const names={idle:'等待检查',checking:'正在检查',downloading:'正在后台下载',verifying:'正在验证',
+    ready:'准备安装',up_to_date:'无需更新',installing:'正在后台安装',installed:'已自动更新',
+    error:'更新未完成',launching:'正在安装',launched:'已自动更新'};
+  badge('update-status',names[u.state]||'等待检查',error?'error':done||u.state==='up_to_date'?'success':'');
   $('update-current-version').textContent=u.current_version;
   $('update-latest-version').textContent=u.latest_version||'尚未检查';
   $('update-message').textContent=u.message;
   $('update-checked').textContent=u.checked?'最近检查 · '+u.checked:'尚未检查';
-  $('check-updates').textContent=error?'重新检查':'检查更新';
-  const blocked=pending||syncedEpoch!==epoch||u.busy;
-  $('check-updates').disabled=blocked;
-  $('install-update').hidden=!ready;
-  $('install-update').disabled=blocked||!ready;
-  const progressVisible=['downloading','verifying','ready','launching','launched'].includes(u.state);
+  $('check-updates').textContent=error?'再检查一次':busy?'正在检查…':'立即检查';
+  $('check-updates').disabled=pending||syncedEpoch!==epoch||busy;
+  const progressVisible=['downloading','verifying','ready','installing','installed'].includes(u.state);
   $('update-progress').hidden=!progressVisible;
   $('update-progress').value=u.progress;
-  $('update-progress-label').textContent=progressVisible?'下载进度 · '+Math.round(u.progress)+'%':'下载进度';
+  $('update-progress-label').textContent=progressVisible?'后台更新进度 · '+Math.round(u.progress)+'%':'后台更新进度';
   $('update-download-size').textContent=u.total_bytes?updateSize(u.downloaded_bytes)+' / '+updateSize(u.total_bytes)
     :u.downloaded_bytes||u.state==='downloading'?updateSize(u.downloaded_bytes)+' · 总大小未知':'尚未下载';
-  const notice=ready?'新版本 '+u.latest_version+' 可以安装 · '+u.message+' 安装前需要你的确认。':error?'软件更新未完成 · '+u.message:'';
+  // 安装不再需要用户确认，所以全局提示只在成功和失败时出现。
+  const notice=done?'已自动更新到 '+u.latest_version+' · '+u.message
+    :error?'自动更新未完成 · '+u.message:'';
   // Keep polling quiet, including the live region when its text has not changed.
   if($('update-notice-text').textContent!==notice)$('update-notice-text').textContent=notice;
   $('update-notice').classList.toggle('error',error);
-  $('update-notice').hidden=!ready&&!error;
+  $('update-notice').hidden=!done&&!error;
   renderChanges(u);
 }
 function requireUpdateSync(){
   if(!state||syncedEpoch!==epoch){notify('更新状态尚未同步，请稍后重试。',true);return false;}
   if(pending){notify('其他操作正在处理，请稍后重试。',true);return false;}
-  return true;
-}
-function requireReadyUpdate(){
-  if(!requireUpdateSync())return false;
-  if(state.update.state!=='ready'||state.update.busy){notify('更新状态已变化，请在下载与验证完成后重新确认。',true);return false;}
-  if(dirty.network||dirty.dorm||sourceDirty||$('location-source').value!==savedLocationSource()){
-    notify('有未保存的校园网、寝室打卡或定位来源设置，请先保存，再安装更新，避免丢失修改。',true);return false;
-  }
   return true;
 }
 async function refresh(){
@@ -430,18 +429,13 @@ $('confirm-cancel').onclick=()=>$('confirm-dialog').close();
 $('confirm-dialog').addEventListener('close',()=>{confirmation=null;previousFocus?.focus();});
 $('confirm-ok').onclick=()=>{const action=confirmation;$('confirm-dialog').close();if(action)action();};
 $('check-updates').onclick=()=>{
+  // 浏览器不会把点击派发给 disabled 的按钮，但这里仍然显式挡住：同步状态、进行中的
+  // 操作、以及代理正在下载/准备安装时都不该再发一次检查。
+  if($('check-updates').disabled)return;
   if(!requireUpdateSync())return;
-  if(state.update.busy){notify('正在检查、下载或验证更新，请稍候。');return;}
+  if(state.update.busy){notify('后台正在检查、下载或安装更新，请稍候。');return;}
+  // 只发一个「现在检查一下」的请求；下载、验签、安装都在提权代理那边完成。
   act('update_check');
-};
-$('install-update').onclick=()=>{
-  if(!requireReadyUpdate())return;
-  const version=state.update.latest_version,confirmedEpoch=syncedEpoch;
-  confirmAction('安装更新 '+version+'？','确认后将重新验证安装包并打开安装向导，Windows 会请求管理员授权。安装期间会关闭本程序与系统代理，完成后需重新打开程序。打开向导不代表安装成功；取消不会安装，也不会退出程序。',()=>{
-    if(!requireReadyUpdate())return;
-    if(syncedEpoch!==confirmedEpoch||state.update.latest_version!==version){notify('更新版本或同步状态已变化，请重新确认。',true);return;}
-    act('update_install',{confirmed:true,version});
-  });
 };
 $('submit-dorm').onclick=()=>{
   if(!requireSavedLocationSource())return;

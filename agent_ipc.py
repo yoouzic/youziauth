@@ -20,6 +20,9 @@ ALLOWED_COMMANDS = {
     "retry",
     "reload-config",
     "suppress-notifications-for-boot",
+    # 请求提权端现在检查一次更新。指令里**不带任何参数** —— 提权端自己决定下载和
+    # 安装什么，未提权的进程无法让它安装任意文件。
+    "check-update",
 }
 ALLOWED_UI_COMMANDS = {"show", "settings", "retry", "suppress"}
 ALLOWED_STATES = {
@@ -85,12 +88,17 @@ class RuntimeSnapshot:
     incident_id: str = ""
     detail: str = ""
     updated_at: str = ""
+    # 后台自动更新的状态（由 auto_update 填充）。界面读它来显示「正在后台更新 /
+    # 已自动更新到 vX」，而不是自己去做检查和安装。
+    update: dict = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.boot_id:
             raise ValueError("boot_id is required")
         if self.state not in ALLOWED_STATES:
             raise ValueError(f"unsupported runtime state: {self.state}")
+        if not isinstance(self.update, dict):
+            raise ValueError("update must be a JSON object")
 
 
 def _atomic_write(path: Path, data: bytes) -> None:

@@ -100,6 +100,9 @@
 
 其余要点：
 
+- **安装与安装后自检**见 [silent-auto-update.md](silent-auto-update.md)：正式安装版由已提权的
+  常驻代理静默安装（`msiexec /qn`），没有向导也没有人工兜底，所以失败现场只留在
+  `%ProgramData%\youziauth\updates\msi-install.log`，并且装完必须通过健康检查才算成功。
 - **每次成功都缓存**到 `updates/changes-v<旧>-v<新>.json`，重复检查和重装同一版本不再请求
   GitHub，也避开未登录的 60 次/小时限流。
 - **纯展示，失败零代价**：无网、限流、标签不存在、响应超限、版本号对不上、字段形状不对，

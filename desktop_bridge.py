@@ -233,13 +233,19 @@ class DesktopBridge(LocationProbe):
         self._window_action = lambda action: None
         self._updates = UpdateController(read_current_version(gui.resource_path('VERSION')),
                                          self._config.parent / 'updates',
-                                         Path(sys.executable) if getattr(sys, 'frozen', False) else None)
+                                         Path(sys.executable) if getattr(sys, 'frozen', False) else None,
+                                         # 界面不再自己检查和安装：那正是每次更新都要
+                                         # 点一下确认 + 弹一次 UAC 的原因。状态来自
+                                         # 常驻的提权代理。
+                                         manual=False)
 
     def _start_updates(self):
-        try:
-            self._updates.check()
-        except RuntimeError:
-            pass
+        """Nothing to start: the privileged agent owns the update lifecycle.
+
+        Kept as the single place the bootstrap calls so the change is visible, and so a
+        future "check now"请求 can be routed through the agent channel here.
+        """
+        return None
 
     @property
     def _dorm(self):
@@ -492,11 +498,9 @@ class DesktopBridge(LocationProbe):
 
     def _dispatch(self, action, payload):
         if action == 'update_check':
-            return self._updates.check()
-        if action == 'update_install':
-            if self._dorm_busy() or self._location_gate.locked() or self._network_gate.locked():
-                raise RuntimeError('请先停止本地后台检测，并等待当前网络、打卡或定位操作完成后，再确认安装更新。')
-            return self._updates.install(payload.get('confirmed'), payload.get('version'))
+            # 界面自己不再下载或安装。要「立刻检查」就走 agent 的指令通道：那是一个
+            # **不带任何参数**的信号，提权端仍然自己决定下载和安装什么。
+            return self._request_agent_update_check()
         if action in ('account_add', 'account_switch', 'account_rename', 'account_delete'):
             return self._account_action(action, payload)
         if action == 'location_authorize':
@@ -783,6 +787,20 @@ class DesktopBridge(LocationProbe):
     def _agent_command(self, command):
         agent_ipc.send_command('youziauth-agent', agent_ipc.AgentCommand(command), timeout_ms=3000)
 
+    def _request_agent_update_check(self):
+        """Ask the privileged agent to check for an update right now.
+
+        The signal carries no path, version or signature: the agent decides everything,
+        so a compromised desktop process cannot make SYSTEM install an arbitrary file.
+        """
+        if not self._agent:
+            raise RuntimeError('后台检测未在运行；开启后会自动检查更新，也可以在这里立即请求一次。')
+        try:
+            self._agent_command('check-update')
+        except OSError:
+            raise RuntimeError('无法联系后台代理，请稍后重试或检查后台检测是否在运行。') from None
+        return '已请求后台代理检查更新；发现新版本会静默安装，无需再确认。'
+
     def _network_work(self, config, monitor):
         attempt = 0
         try:
@@ -849,11 +867,18 @@ class DesktopBridge(LocationProbe):
                 with self._lock:
                     self._state, self._message = state, snapshot.detail or snapshot.state
                     self._last_agent = snapshot
+                # 自动更新状态跟着同一条快照进来：更新页显示的是提权代理的真实进度，
+                # 而不是界面自己另做一次检查。
+                if isinstance(getattr(snapshot, 'update', None), dict) and snapshot.update:
+                    self._updates.adopt(snapshot.update)
                 toast = self._notification_tracker.evaluate(snapshot)
                 if toast:
                     windows_notifications.show_toast(toast)
             except (OSError, ValueError):
                 self._state, self._message = 'checking', '等待系统认证代理…'
+                # 代理没在跑，就没有人在做更新：不能继续显示一个界面已经无法执行的
+                # 「可以安装」，那会让用户对着一个永远装不上的按钮点。
+                self._updates.disconnect('后台自动更新未在运行；在「校园网」页开启后台检测后会自动检查。')
 
     def _close(self):
         self._closed.set()

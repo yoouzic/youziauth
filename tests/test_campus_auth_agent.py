@@ -1,8 +1,12 @@
 import logging
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
+import agent_ipc
+import auto_update
 import campus_auth
 import network_probe
 from agent_ipc import RuntimeSnapshot, read_snapshot, write_snapshot
@@ -201,7 +205,8 @@ class AgentLoopTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def make_agent(self, probe, authenticator, boot_id="boot-1"):
+    def make_agent(self, probe, authenticator, boot_id="boot-1", updater=None,
+                   update_interval_seconds=6 * 60 * 60):
         return Agent(
             config_loader=lambda: self.config,
             probe=probe,
@@ -209,7 +214,103 @@ class AgentLoopTests(unittest.TestCase):
             snapshot_path=self.snapshot_path,
             logger=self.logger,
             boot_id=boot_id,
+            updater=updater,
+            update_interval_seconds=update_interval_seconds,
         )
+
+    def test_an_update_request_returns_immediately_and_reports_the_result(self):
+        # 检查加下载可能几分钟，而指令走在三秒超时的 named pipe 上：必须先回。
+        started, finish = threading.Event(), threading.Event()
+
+        class SlowUpdater:
+            def run_cycle(inner):
+                started.set()
+                finish.wait(3)
+                return auto_update.UpdateStatus(state='installed', current_version='1.9.0',
+                                                latest_version='1.9.0', progress=100,
+                                                message='已自动更新到 v1.9.0。')
+
+        agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]), updater=SlowUpdater())
+        try:
+            snapshot = agent.request_update_check()
+            self.assertTrue(started.wait(2), 'the update must actually start')
+            # 回来的时候更新还没结束 —— 这就是「不阻塞指令通道」。
+            self.assertNotEqual(snapshot.update.get('state'), 'installed')
+            finish.set()
+            deadline = time.monotonic() + 3
+            while agent.snapshot.update.get('state') != 'installed' and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(agent.snapshot.update.get('state'), 'installed')
+            # 状态经同一条运行时快照通道发布，界面照原样读。
+            written = agent_ipc.read_snapshot(self.snapshot_path)
+            self.assertEqual(written.update.get('state'), 'installed')
+        finally:
+            finish.set()
+
+    def test_a_second_request_while_one_is_running_is_ignored(self):
+        entered, release = threading.Event(), threading.Event()
+
+        class BlockingUpdater:
+            def __init__(inner):
+                inner.calls = 0
+
+            def run_cycle(inner):
+                inner.calls += 1
+                entered.set()
+                release.wait(3)
+                return auto_update.UpdateStatus(state='up_to_date', message='已是最新。')
+
+        updater = BlockingUpdater()
+        agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]), updater=updater)
+        try:
+            agent.request_update_check()
+            self.assertTrue(entered.wait(2))
+            agent.request_update_check()
+            agent.request_update_check()
+            release.set()
+            deadline = time.monotonic() + 3
+            while updater.calls < 1 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            time.sleep(0.1)
+            self.assertEqual(updater.calls, 1, 'concurrent checks must collapse into one')
+        finally:
+            release.set()
+
+    def test_the_update_command_is_accepted_and_carries_no_arguments(self):
+        # 指令里不能有参数：提权端自己决定下载和安装什么。
+        command = agent_ipc.AgentCommand.parse({'command': 'check-update'})
+        self.assertEqual(command.command, 'check-update')
+        self.assertEqual(command.to_payload(), {'command': 'check-update'})
+        for payload in ({'command': 'check-update', 'path': 'C:\\evil.msi'},
+                        {'command': 'check-update', 'version': '9.9.9'}):
+            with self.subTest(payload=payload), self.assertRaises(agent_ipc.InvalidAgentCommand):
+                agent_ipc.AgentCommand.parse(payload)
+
+    def test_an_agent_without_an_updater_never_checks(self):
+        # 源码运行时没有可安装的包，agent 照常做认证，只是不碰更新。
+        agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]))
+        self.assertFalse(agent.update_due())
+        before = agent.snapshot.update
+        self.assertEqual(agent.request_update_check().update, before)
+        self.assertEqual(agent.periodic_update_check().update, before)
+
+    def test_the_periodic_schedule_is_set_before_the_work_so_a_restart_cannot_loop(self):
+        class CountingUpdater:
+            def __init__(inner):
+                inner.calls = 0
+
+            def run_cycle(inner):
+                inner.calls += 1
+                return auto_update.UpdateStatus(state='up_to_date', message='已是最新。')
+
+        updater = CountingUpdater()
+        agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]), updater=updater,
+                                update_interval_seconds=300)
+        self.assertTrue(agent.update_due(), 'the first check is due immediately')
+        agent.periodic_update_check()
+        self.assertEqual(updater.calls, 1)
+        # 下一次被排到 300 秒之后：安装会杀掉进程，重启后不该马上又装一遍。
+        self.assertFalse(agent.update_due())
 
     def test_hotspot_connection_skips_portal_login(self):
         authenticator = FakeAuthenticator([AuthAttempt(AttemptKind.REJECTED, "no")])

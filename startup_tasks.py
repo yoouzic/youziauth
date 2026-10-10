@@ -180,6 +180,41 @@ def configure_system_startup(
     legacy_shortcut.unlink(missing_ok=True)
 
 
+def install_dir_for_current_process(executable: Path | None = None) -> Path | None:
+    """The directory this process was installed into, or ``None`` when it is not installed.
+
+    A frozen build lives next to its own executable; a source checkout has no installed
+    MSI, and ``None`` is how callers find that out (the background updater is skipped).
+    """
+    if executable is None:
+        if not getattr(sys, "frozen", False):
+            return None
+        executable = Path(sys.executable)
+    candidate = Path(executable).resolve().parent
+    return candidate if candidate.is_dir() else None
+
+
+def run_tray_task(
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> bool:
+    """Ask Task Scheduler to start the tray in the signed-in user's session.
+
+    The privileged side may be unable to draw on the interactive desktop itself, and the
+    tray task was created for exactly this: it runs as the user with an interactive
+    token, so triggering it puts the window back where the user can see it.
+    """
+    try:
+        result = runner(
+            ["schtasks.exe", "/Run", "/TN", TRAY_TASK_NAME],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
 def current_user_sid() -> str:
     result = subprocess.run(
         ["whoami.exe", "/user", "/fo", "csv", "/nh"],

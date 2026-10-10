@@ -377,10 +377,34 @@ def file_digest(path):
     return hasher.hexdigest()
 
 
+# 提权端发布的更新状态允许出现的字段。多一个都不收：快照是外部数据，界面只渲染
+# 它认识的形状。与 auto_update.UpdateStatus 保持一致。
+_AGENT_UPDATE_FIELDS = frozenset({
+    'state', 'current_version', 'latest_version', 'progress', 'checked', 'message',
+    'detail', 'changes',
+})
+
+# 提权端会用的全部状态词，界面按这个词表校验。
+_AGENT_UPDATE_STATES = frozenset({
+    'idle', 'checking', 'downloading', 'verifying', 'ready', 'up_to_date',
+    'installing', 'installed', 'error',
+})
+
+
 class UpdateController:
-    def __init__(self, current_version, cache_dir, executable=None):
+    """Holds the update state the interface shows.
+
+    In the installed product the state is **sourced from the SYSTEM agent**
+    (``auto_update``), which owns checking, verifying and silently installing; the
+    interface is a passive reader. ``manual=False`` disables the network paths below so a
+    desktop process can never start a second, competing download -- and it has no business
+    installing anything itself, because that is what used to cost a UAC prompt per release.
+    """
+
+    def __init__(self, current_version, cache_dir, executable=None, manual=True):
         self._cache = Path(cache_dir)
         self._executable = executable
+        self._manual = bool(manual)
         self._lock = threading.RLock()
         self._gate = threading.Lock()
         self._closed = threading.Event()
@@ -390,9 +414,58 @@ class UpdateController:
                           downloaded_bytes=0, total_bytes=0, checked='', changes=_no_changes(),
                           message='启动后自动检查 GitHub 正式版；有更新时自动下载，安装前会征求确认。')
 
+    def adopt(self, block, current_version=None):
+        """Take the state the privileged agent published.
+
+        The block is the privileged agent's own ``UpdateStatus``; every field is
+        shape-checked here so a corrupt or hostile snapshot cannot inject unknown keys
+        into what the interface renders. Returns ``True`` when it was accepted.
+        """
+        if not isinstance(block, dict):
+            return False
+        if set(block) - _AGENT_UPDATE_FIELDS:
+            return False
+        state = block.get('state')
+        if state not in _AGENT_UPDATE_STATES:
+            return False
+        progress = block.get('progress', 0)
+        if type(progress) is not int or not 0 <= progress <= 100:
+            progress = 0
+        changes = block.get('changes')
+        text = lambda name: block.get(name) if isinstance(block.get(name), str) else ''
+        values = dict(
+            state=state, latest_version=text('latest_version'), progress=progress,
+            checked=text('checked'), message=text('message'),
+            changes=changes if isinstance(changes, dict) else _no_changes(),
+        )
+        if isinstance(current_version, str) and current_version:
+            values['current_version'] = current_version
+        self._set(**values)
+        return True
+
+    def disconnect(self, message='后台自动更新未在运行，请先开启后台检测。'):
+        """The agent is gone: stop showing a stale "ready" the interface cannot act on."""
+        self._package = None
+        self._set(state='idle', latest_version='', progress=0, downloaded_bytes=0,
+                  total_bytes=0, changes=_no_changes(), message=message)
+        return True
+
     def snapshot(self):
         with self._lock:
             return dict(self._data, busy=self._gate.locked())
+
+    def package(self):
+        """The verified installer this controller downloaded, as ``(path, version, digest, signature)``.
+
+        Only the privileged self-updater calls this, and only after a check reported
+        ``ready``. The tuple is what the worker locks and re-verifies before installing,
+        so handing it on does not weaken anything: the digest and signature are inputs to
+        a check that runs again, not a claim of trust.
+        """
+        with self._lock:
+            if self._package is None or self._data['state'] != 'ready':
+                raise RuntimeError('安装包尚未下载并校验，无法安装。')
+            return self._package
 
     def _set(self, **values):
         with self._lock:
@@ -416,11 +489,15 @@ class UpdateController:
             raise
 
     def check(self):
+        if not self._manual:
+            raise RuntimeError('更新由后台代理负责，请在「校园网」页开启后台检测。')
         with self._lock:
             self._start(self._check, 'checking', '正在检查 GitHub 最新正式版…')
         return '正在后台检查；发现新版本后会自动下载，不影响正常使用。'
 
     def install(self, confirmed, version):
+        if not self._manual:
+            raise RuntimeError('更新由后台代理静默完成，这里无需手动安装。')
         with self._lock:
             if confirmed is not True or self._data['state'] != 'ready' or version != self._data['latest_version'] or not self._package:
                 raise RuntimeError('请等待下载校验完成，并重新确认要安装的版本。')
