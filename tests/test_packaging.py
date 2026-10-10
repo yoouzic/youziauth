@@ -23,8 +23,12 @@ class PackagingWorkflowTests(unittest.TestCase):
         ]
         # numpy 是验证码识别（captcha_ocr.py）的推理依赖：模型为纯 NumPy 前向，
         # 不带深度学习框架。仍要求精确固定版本，避免构建产物随上游漂移。
+        # PyYAML 是 proxy_rules.py 读取 Clash Verge 配置（YAML）的依赖：它在本机
+        # 只是别的包的传递依赖，不写在这里 CI 就装不到，测试会以
+        # No module named yaml 失败（实测踩过）。
         self.assertEqual(
-            lines, ["Pillow==12.2.0", "PyInstaller==6.16.0", "numpy==2.4.4"]
+            lines,
+            ["Pillow==12.2.0", "PyInstaller==6.16.0", "numpy==2.4.4", "PyYAML==6.0.3"],
         )
         self.assertTrue(all("==" in line for line in lines))
 

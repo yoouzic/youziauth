@@ -24,7 +24,28 @@ import shutil
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
-import yaml
+# Imported defensively: proxy_rules is imported by desktop_bridge, which the whole
+# UI depends on, so a missing PyYAML must degrade this one card rather than stop
+# the app from starting. requirements-build.txt pins it for CI and the MSI build.
+try:
+    import yaml
+
+    CONFIG_ERRORS: tuple = (OSError, yaml.YAMLError)
+except ModuleNotFoundError:  # pragma: no cover - only on a broken install
+    yaml = None
+    CONFIG_ERRORS = (OSError,)
+
+MISSING_YAML = "PyYAML is not installed, so the proxy configuration cannot be read"
+
+# A config that needs a module we do not have is a "cannot read this" outcome, not
+# a crash: every caller turns it into blocked_by and degrades one card.
+CONFIG_ERRORS: tuple = tuple(CONFIG_ERRORS) + (ModuleNotFoundError,)
+
+
+def _require_yaml():
+    if yaml is None:
+        raise ModuleNotFoundError(MISSING_YAML)
+    return yaml
 
 
 CLASH_VERGE_DIR_NAMES = ("io.github.clash-verge-rev.clash-verge-rev",)
@@ -138,7 +159,7 @@ def clash_verge_root(appdata: Optional[Path] = None) -> Optional[Path]:
 
 def _load_yaml(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
+        return _require_yaml().safe_load(handle)
 
 
 def _rules_extension_for_current_profile(root: Path) -> tuple[str, Optional[Path], str]:
@@ -148,7 +169,7 @@ def _rules_extension_for_current_profile(root: Path) -> tuple[str, Optional[Path
         return "", None, "profiles.yaml is missing"
     try:
         data = _load_yaml(profiles_path)
-    except (OSError, yaml.YAMLError) as exc:
+    except CONFIG_ERRORS as exc:
         return "", None, f"profiles.yaml could not be read: {exc}"
     if not isinstance(data, Mapping):
         return "", None, "profiles.yaml is not a mapping"
@@ -198,7 +219,7 @@ def applied_rules(root: Path) -> list[Rule]:
         return []
     try:
         data = _load_yaml(path)
-    except (OSError, yaml.YAMLError):
+    except CONFIG_ERRORS:
         return []
     if not isinstance(data, Mapping):
         return []
@@ -222,7 +243,7 @@ def inspect(appdata: Optional[Path] = None) -> ProxyRuleReport:
 
     try:
         data = _load_yaml(rules_file)
-    except (OSError, yaml.YAMLError) as exc:
+    except CONFIG_ERRORS as exc:
         return ProxyRuleReport(
             client="clash-verge-rev",
             root=root,
@@ -291,7 +312,7 @@ def apply(report: ProxyRuleReport) -> Path:
 
     # Verify on the text we are about to write: every rule that was there must
     # still be there, plus ours, and nothing else may have changed.
-    after = yaml.safe_load(updated)
+    after = _require_yaml().safe_load(updated)
     expected = dict(before) if isinstance(before, Mapping) else {}
     expected["prepend"] = list(additions) + list(expected.get("prepend") or [])
     if after != expected:

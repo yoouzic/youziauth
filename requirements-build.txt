@@ -3,3 +3,7 @@ PyInstaller==6.16.0
 # 验证码识别模型（captcha_ocr.py）的推理依赖：纯 NumPy 前向，无需深度学习框架。
 # 版本与开发机实测一致；仅 GUI 应用需要（后台 agent 不涉及验证码）。
 numpy==2.4.4
+# proxy_rules.py 读取 Clash Verge 的 profiles.yaml 与规则扩展（都是 YAML）。
+# 必须显式钉住：它在开发机上只是别的包的传递依赖，CI 只装本文件，缺了它
+# proxy_rules 会读不了配置，程序会降级成「代理配置无法读取」。
+PyYAML==6.0.3
