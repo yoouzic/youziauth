@@ -54,7 +54,7 @@ NO_CHANGES = '没能自动获取这次更新的说明。'
 _NOTES_HEADING = re.compile(r'^#{1,6}\s+v?(?P<version>[0-9]+\.[0-9]+\.[0-9]+)\s*$')
 _NOTES_TITLE = re.compile(r'^#{1,6}\s+(?P<title>\S.*)$')
 _NOTES_BULLET = re.compile(r'^\s*(?:[-*+]|\d+[.)])\s+(?P<text>\S.*)$')
-_NOTES_HIGHLIGHT = re.compile(r'^\*\*(?P<label>[^*]{1,12})\*\*[：:、,，]?\s*(?P<text>.*)$')
+_NOTES_HIGHLIGHT = re.compile(r'^\*\*(?P<label>[^*\s]{1,8})\*\*[：:、,，]?\s*(?P<text>.*)$')
 _LONG_ENTRY = 200
 
 _CHANGELOG_FAILURES = (HTTPError, URLError, TimeoutError, ConnectionError, OSError,
@@ -297,6 +297,8 @@ def read_notes(raw, version):
         if not raw_entry:
             continue
         # 先认粗体标签，再去标记：反过来 `**重点**：…` 的星号会先被删掉，标签就丢了。
+        # 标签只认短词（`\S{1,8}`）——`**一整句话**：…` 是作者的强调，不是分类，把整句
+        # 当成标签会在界面上显示成「一整句话 · 剩下的内容」。
         kind, subject = '', raw_entry
         if (highlight := _NOTES_HIGHLIGHT.match(raw_entry)) is not None:
             kind, subject = _plain(highlight.group('label')), _plain(highlight.group('text'))

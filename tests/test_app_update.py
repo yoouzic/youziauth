@@ -299,6 +299,21 @@ class UpdaterTests(unittest.TestCase):
         self.assertIn('\n', NOTES)      # the fixture really does carry multiple lines
         self.assertTrue(all('\n' not in item['subject'] for item in block['entries']))
 
+    def test_only_a_short_bold_word_is_a_label(self):
+        # `**重点**：…` 是分类；`**一整句话**：…` 是作者的强调，整句必须留在正文里，
+        # 否则界面上会出现「一整句话 · 剩下的内容」这种读不通的条目。
+        text = ('## 1.5.0\n\n'
+                '- **重点**：短标签照旧\n'
+                '- **这一版需要手动装一次**：静默更新能力本身在新版里\n'
+                '- **注意** 没有冒号也算标签\n').encode('utf-8')
+        block = self.update.read_notes(text, '1.5.0')
+        self.assertEqual(
+            [(entry['kind'], entry['subject']) for entry in block['entries']],
+            [('重点', '短标签照旧'),
+             ('', '这一版需要手动装一次：静默更新能力本身在新版里'),
+             ('注意', '没有冒号也算标签')],
+        )
+
     def test_a_notes_asset_that_cannot_be_fetched_does_not_block_the_update(self):
         self.data = release(notes=NOTES)
         original = self.open
