@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const titles = {overview:'今日概览',network:'校园网',dorm:'寝室打卡',records:'运行记录',updates:'软件更新'};
-let state = null, logType = 'network', pending = false, refreshTask = null, epoch = 0, syncedEpoch = -1, timer;
+let state = null, logType = 'network', pending = false, refreshTask = null, epoch = 0, syncedEpoch = -1, timer, proxyIgnored = false;
 const dirty = {network:false, dorm:false};
 const revisions = {network:0, dorm:0};
 let sourceDirty = false, sourceRevision = 0;
@@ -52,6 +52,22 @@ function requireSavedLocationSource(){
   location.hash='dorm';$('location-source').focus();
   return false;
 }
+// 代理直连规则提示。只在「能修」或「写了但还没生效」时出现，且用户点了「暂不处理」
+// 之后本次运行不再打扰 —— 这是别人的代理配置，只在用户同意时才动。
+function renderProxyHint(p){
+  const hint=$('proxy-hint');
+  if(!hint)return;
+  const show=!!p&&!proxyIgnored&&(p.can_apply||p.needs_reload);
+  hint.hidden=!show;
+  if(!show)return;
+  const proxy=p.client||'代理';
+  $('proxy-hint-title').textContent=p.can_apply?'代理可能让「能不能上网」判断失真':'规则已写入，等待代理重新加载';
+  $('proxy-hint-text').textContent=p.can_apply
+    ? `检测到 ${proxy} 没有把 Windows 的连通性探测域名直连。探测因此测的是代理、而不是校园链路，会出现「显示已连接却打不开网页」。补写两条直连规则即可修复，会先备份原文件。`
+    : `${p.message}。请到 ${proxy} 重新加载配置后生效。`;
+  const apply=$('proxy-apply');
+  if(apply)apply.hidden=!p.can_apply;
+}
 function render() {
   if(!state) return;
   const n=state.network,d=state.dorm,simulation=savedLocationSource()==='simulation';
@@ -72,6 +88,7 @@ function render() {
   $('location-checked').textContent=locationState.checked ? (simulation?'最近模拟检测 · ':'最近检测 · ')+locationState.checked : '仅检测定位，不会提交打卡';
   $('network-status').textContent=n.message;
   $('network-summary').textContent=n.message;
+  renderProxyHint(state.proxy);
   $('checked-label').textContent=n.checked ? '最近检测 · '+n.checked : '尚未执行连接检测';
   const names={online:'网络已连接',offline:'需要重新连接',checking:'正在检测',stopped:'尚未检测',error:'需要检查设置'};
   $('network-headline').textContent=names[n.state] || '等待检测';
@@ -191,6 +208,8 @@ document.querySelectorAll('[data-action]').forEach(button=>button.addEventListen
   const action=button.dataset.action;
   if(['network_check','network_start'].includes(action)&&dirty.network){notify('校园网设置尚未保存，请先保存再检测。',true);location.hash='network';return;}
   if(action==='location_authorize'&&!requireSavedLocationSource())return;
+  // 代理规则提示是本地决定，不问后台：点了不再打扰，直到下次启动。
+  if(action==='proxy_rules_ignore'){proxyIgnored=true;$('proxy-hint').hidden=true;return;}
   act(action);
 }));
 $('network-form').addEventListener('submit',async event=>{

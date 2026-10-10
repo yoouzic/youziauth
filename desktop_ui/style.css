@@ -104,3 +104,10 @@
 .login-danger-row{flex-direction:column;align-items:stretch;gap:6px}
 .login-danger-row .text-button{text-align:left}
 }
+
+/* 代理规则提示：改的是别人程序的配置，语气要像提醒而不是报错，所以用左侧色条而不是红色卡片。
+   只在「能修」或「已写入待生效」时出现。 */
+.proxy-hint{border-left:4px solid var(--blue);background:linear-gradient(90deg,rgba(72,110,155,.07),transparent 46%)}
+.proxy-hint h2{font-size:17px}
+.proxy-hint .stack-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;flex:0 0 auto}
+@media(max-width:760px){.proxy-hint{flex-direction:column;align-items:flex-start}.proxy-hint .stack-actions{width:100%}}
