@@ -181,7 +181,9 @@ class UpdaterTests(unittest.TestCase):
         updater._installer = exploding
         status = updater.run_cycle()
         self.assertEqual(status.state, 'error')
-        self.assertEqual(status.detail, 'KeyError')
+        # detail 现在带上出错位置：只有类型名的话，真实安装上根本定位不了。
+        self.assertTrue(status.detail.startswith('KeyError'), status.detail)
+        self.assertIn('.py:', status.detail)
         self.assertIn('重试', status.message)
 
     def test_the_relaunch_path_reaches_the_users_session_and_is_reported(self):
