@@ -42,6 +42,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from app_update import UpdateController
@@ -51,6 +52,11 @@ from windows_update import UpdateVerificationError
 STATUS_FILE = "update-status.json"
 STATUS_LIMIT = 64 * 1024
 MSI_LOG = "msi-install.log"
+
+# 一次「自动更新」尝试里，对「压根没拿到版本信息」的传输失败重试几次。66 MB 的包在
+# 弱网下开头就断很常见；一次断开就等于这一整轮白跑，而下一轮要等几个小时。
+_CHECK_ATTEMPTS = 3
+_CHECK_BACKOFF = 20
 
 # 界面已有的状态词表，沿用它们而不是另造一套；多出来的三个是后台自动更新自己的阶段。
 STATES = ("idle", "checking", "downloading", "verifying", "ready", "up_to_date",
@@ -227,15 +233,24 @@ class Updater:
 
         controller = self._controller_factory(current, self.cache_dir, self.executable)
         try:
-            controller.check()
-            worker = getattr(controller, "_worker", None)
-            if worker is not None:
-                # 安装包下载要几分钟。趁它在下，把「发现新版本 + 更新内容」先报出去，
-                # 而不是等下完再一次性告诉用户。
-                self._report_interim(controller, progress, current)
-                worker.join(600)
-            snapshot = controller.snapshot()
-            status = self._status_from_check(snapshot, current)
+            status = None
+            for attempt in range(_CHECK_ATTEMPTS):
+                controller.check()
+                worker = getattr(controller, "_worker", None)
+                if worker is not None:
+                    # 安装包下载要几分钟。趁它在下，把「发现新版本 + 更新内容」先报出去，
+                    # 而不是等下完再一次性告诉用户。
+                    self._report_interim(controller, progress, current)
+                    worker.join(600)
+                snapshot = controller.snapshot()
+                status = self._status_from_check(snapshot, current)
+                # 只重试「压根没拿到版本信息」这一种：那是传输没走通。已经知道有新版本
+                # 之后的失败（校验、安装）都是明确结论，重试没有意义。
+                transport_only = (status.state == "error" and not status.latest_version
+                                  and not snapshot.get("progress"))
+                if not transport_only or attempt + 1 >= _CHECK_ATTEMPTS:
+                    break
+                time.sleep(_CHECK_BACKOFF * (attempt + 1))
             if status.state != "ready":
                 return _report(self._report, status)
 

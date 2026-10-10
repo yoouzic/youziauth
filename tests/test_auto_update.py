@@ -289,5 +289,95 @@ class StatusFileTests(unittest.TestCase):
                 self.assertEqual(auto_update.read_installed_version(install), '')
 
 
+class RetryTests(unittest.TestCase):
+    """A flaky link must not cost a whole update cycle.
+
+    The controller reports transport failures as an "error" state with no version at all.
+    Without a retry, one dropped connection meant waiting for the next scheduled check,
+    which is hours away.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.install = self.root / "install"
+        self.install.mkdir()
+        (self.install / "VERSION").write_text("1.8.11\n", encoding="utf-8")
+        self.cache = self.root / "cache"
+        self.cache.mkdir()
+        self.statuses = []
+
+    TRANSPORT_ERROR = {
+        "state": "error", "latest_version": "", "progress": 0,
+        "checked": "", "message": "无法连接 GitHub 或下载超时，请检查网络后重新检查。",
+        "changes": {},
+    }
+    READY = {
+        "state": "ready", "latest_version": "1.8.14", "progress": 100,
+        "checked": "2026-10-10 20:30", "message": "已下载并校验通过。", "changes": {},
+    }
+
+    def make(self, snapshots, install_result=None):
+        outcomes = list(snapshots)
+
+        class Flaky:
+            calls = 0
+
+            def __init__(inner, *args, **kwargs):
+                pass
+
+            def check(inner):
+                inner.calls += 1
+
+            def snapshot(inner):
+                index = min(inner.calls - 1, len(outcomes) - 1)
+                return dict(outcomes[index], busy=False)
+
+            def package(inner):
+                return Path("pkg.msi"), "1.8.14", "a" * 64, "b" * 128
+
+            def close(inner):
+                pass
+
+        holder = {}
+
+        def factory(*args, **kwargs):
+            holder["controller"] = Flaky(*args, **kwargs)
+            return holder["controller"]
+
+        installer = lambda *a, **k: (install_result or {"code": 0, "healthy": True, "relaunched": True})
+        updater = Updater(install_dir=self.install, cache_dir=self.cache,
+                          executable=self.install / "youziauth.exe",
+                          controller_factory=factory, installer=installer,
+                          report=self.statuses.append)
+        return updater, holder
+
+    def test_a_transport_failure_is_retried_and_can_still_succeed(self):
+        updater, holder = self.make([self.TRANSPORT_ERROR, self.READY])
+        with patch.object(auto_update, "_CHECK_BACKOFF", 0):
+            status = updater.run_cycle()
+        self.assertEqual(holder["controller"].calls, 2, "the check must be retried once")
+        self.assertEqual(status.state, "installed")
+
+    def test_retries_stop_at_the_attempt_limit(self):
+        updater, holder = self.make([self.TRANSPORT_ERROR])
+        with patch.object(auto_update, "_CHECK_BACKOFF", 0):
+            status = updater.run_cycle()
+        self.assertEqual(status.state, "error")
+        self.assertEqual(holder["controller"].calls, auto_update._CHECK_ATTEMPTS)
+
+    def test_a_real_verification_failure_is_not_retried(self):
+        # 已经知道有新版本之后的失败是明确结论：重试等于反复撞同一堵墙。
+        failure = dict(self.READY, state="error", latest_version="1.8.14",
+                       progress=100, message="MSI 安装包签名未通过校验，已拒绝更新。")
+        updater, holder = self.make([failure])
+        with patch.object(auto_update, "_CHECK_BACKOFF", 0):
+            status = updater.run_cycle()
+        self.assertEqual(holder["controller"].calls, 1, "a decided failure must be reported at once")
+        self.assertEqual(status.state, "error")
+        self.assertIn("签名", status.message)
+
+
 if __name__ == '__main__':
     unittest.main()
