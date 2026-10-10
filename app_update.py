@@ -179,16 +179,30 @@ def _proxy_from_hive(winreg, sid):
     if not isinstance(server, str) or not server.strip():
         return None
     server = server.strip()
-    # ProxyServer 可能是 "host:port" 或按协议分列（"http=h:p;https=h:p"）。
-    for scheme in ("https", "http"):
-        for part in server.split(";"):
-            part = part.strip()
-            if part.startswith(scheme + "="):
-                server = part.split("=", 1)[1].strip()
-                break
     if not server:
         return None
-    if "=" in server or ";" in server:
+    # ProxyServer 有两种写法，而且第二种常带绕过列表：
+    #   "host:port"                        —— 有的客户端把绕过列表另存 ProxyOverride
+    #   "http=h:p;https=h:p"               —— 按协议分列
+    #   "host:port;localhost;192.168.*"    —— 主机 + 绕过列表挤在同一个值里（很常见）
+    # 只有「分段是 k=v 形式」才是按协议分列；否则整串就是一个代理地址，分号后的
+    # 是绕过项，必须忽略而不是放弃整个代理 —— 那会静默退回直连，等于没修。
+    parts = [part.strip() for part in server.split(";") if part.strip()]
+    per_scheme = bool(parts) and all("=" in part for part in parts)
+    if per_scheme:
+        chosen = ""
+        for scheme in ("https", "http"):
+            for part in parts:
+                key, _, value = part.partition("=")
+                if key.strip().lower() == scheme and value.strip():
+                    chosen = value.strip()
+                    break
+            if chosen:
+                break
+        server = chosen
+    else:
+        server = parts[0] if parts else ""
+    if not server:
         return None
     if not server.startswith(("http://", "https://")):
         server = "http://" + server

@@ -818,8 +818,16 @@ class ProxyTests(unittest.TestCase):
             ({"ProxyEnable": 1, "ProxyServer": "http://127.0.0.1:7897"}, "http://127.0.0.1:7897"),
             ({"ProxyEnable": 1, "ProxyServer": "http=127.0.0.1:8080;https=127.0.0.1:8443"},
              "http://127.0.0.1:8443"),
+            # 很常见：主机和绕过列表挤在同一个值里。必须取主机、忽略绕过项 ——
+            # 放弃整串就等于静默退回直连，那正是「代理开着却照样失败」的原因。
+            ({"ProxyEnable": 1, "ProxyServer": "127.0.0.1:7897;<local>;localhost;192.168.*"},
+             "http://127.0.0.1:7897"),
+            ({"ProxyEnable": 1, "ProxyServer": "127.0.0.1:7897;localhost"},
+             "http://127.0.0.1:7897"),
+            ({"ProxyEnable": 1, "ProxyServer": "http=127.0.0.1:8080"}, "http://127.0.0.1:8080"),
             ({"ProxyEnable": 0, "ProxyServer": "127.0.0.1:7897"}, None),
             ({"ProxyEnable": 1, "ProxyServer": "   "}, None),
+            ({"ProxyEnable": 1, "ProxyServer": ";"}, None),
         )
         for values, expected in cases:
             with self.subTest(values=values):
