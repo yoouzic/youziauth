@@ -309,7 +309,7 @@ class RetryTests(unittest.TestCase):
         self.statuses = []
 
     TRANSPORT_ERROR = {
-        "state": "error", "latest_version": "", "progress": 0,
+        "state": "error", "latest_version": "", "progress": 0, "transient": True,
         "checked": "", "message": "无法连接 GitHub 或下载超时，请检查网络后重新检查。",
         "changes": {},
     }
@@ -367,9 +367,19 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(status.state, "error")
         self.assertEqual(holder["controller"].calls, auto_update._CHECK_ATTEMPTS)
 
+    def test_a_transport_failure_during_the_download_is_retried_too(self):
+        # 下载中途断开同样是传输问题：包没下完，重试才有意义。
+        dropped = dict(self.TRANSPORT_ERROR)
+        dropped.update(latest_version="1.8.14", progress=0)
+        updater, holder = self.make([dropped, self.READY])
+        with patch.object(auto_update, "_CHECK_BACKOFF", 0):
+            status = updater.run_cycle()
+        self.assertEqual(holder["controller"].calls, 2)
+        self.assertEqual(status.state, "installed")
+
     def test_a_real_verification_failure_is_not_retried(self):
-        # 已经知道有新版本之后的失败是明确结论：重试等于反复撞同一堵墙。
-        failure = dict(self.READY, state="error", latest_version="1.8.14",
+        # 校验失败是明确结论：重试等于反复撞同一堵墙。
+        failure = dict(self.READY, state="error", latest_version="1.8.14", transient=False,
                        progress=100, message="MSI 安装包签名未通过校验，已拒绝更新。")
         updater, holder = self.make([failure])
         with patch.object(auto_update, "_CHECK_BACKOFF", 0):

@@ -244,11 +244,9 @@ class Updater:
                     worker.join(600)
                 snapshot = controller.snapshot()
                 status = self._status_from_check(snapshot, current)
-                # 只重试「压根没拿到版本信息」这一种：那是传输没走通。已经知道有新版本
-                # 之后的失败（校验、安装）都是明确结论，重试没有意义。
-                transport_only = (status.state == "error" and not status.latest_version
-                                  and not snapshot.get("progress"))
-                if not transport_only or attempt + 1 >= _CHECK_ATTEMPTS:
+                # 只重试传输类失败：控制器为这类失败打了 transient 标记。校验、安装
+                # 之类是明确结论，重试等于反复撞同一堵墙。
+                if not snapshot.get("transient") or attempt + 1 >= _CHECK_ATTEMPTS:
                     break
                 time.sleep(_CHECK_BACKOFF * (attempt + 1))
             if status.state != "ready":

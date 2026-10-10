@@ -417,7 +417,7 @@ class UpdateController:
         self._worker = None
         self._package = None
         self._data = dict(state='idle', current_version=current_version, latest_version='', progress=0,
-                          downloaded_bytes=0, total_bytes=0, checked='', changes=_no_changes(),
+                          downloaded_bytes=0, total_bytes=0, checked='', changes=_no_changes(), transient=False, detail='',
                           message='启动后自动检查 GitHub 正式版；有更新时自动下载，安装前会征求确认。')
 
     def adopt(self, block, current_version=None):
@@ -517,17 +517,23 @@ class UpdateController:
             exc.close()
             message = ('GitHub 请求频率受限，请稍后重新检查。' if exc.code in (403, 429) else
                        'GitHub 更新请求失败，请稍后重新检查。')
-            self._set(state='error', message=message)
-        except (URLError, TimeoutError, ConnectionError):
-            self._set(state='error', message='无法连接 GitHub 或下载超时，请检查网络后重新检查；其他功能不受影响。')
+            self._set(state='error', message=message, transient=True)
+        except (URLError, TimeoutError, ConnectionError) as exc:
+            # 标记成「传输问题」：后台自动更新据此决定要不要在本次尝试内重试。
+            # 靠错误文案去猜是不可靠的，而且文案是给人看的，随时会改。
+            self._set(state='error', transient=True, detail=type(exc).__name__,
+                      message='无法连接 GitHub 或下载超时，请检查网络后重新检查；其他功能不受影响。')
         except RuntimeError as exc:
-            self._set(state='error', message=str(exc))
+            self._set(state='error', transient=False, message=str(exc))
         except (ValueError, TypeError, KeyError):
-            self._set(state='error', message='云端版本或校验信息无效，已停止更新，请稍后重新检查。')
+            self._set(state='error', transient=False,
+                      message='云端版本或校验信息无效，已停止更新，请稍后重新检查。')
         except OSError:
-            self._set(state='error', message='无法保存或读取更新文件，请检查磁盘空间和本机权限后重试。')
+            self._set(state='error', transient=False,
+                      message='无法保存或读取更新文件，请检查磁盘空间和本机权限后重试。')
         except Exception:
-            self._set(state='error', message='更新未完成，请重新检查；校园网和寝室功能不受影响。')
+            self._set(state='error', transient=False,
+                      message='更新未完成，请重新检查；校园网和寝室功能不受影响。')
         finally:
             if self._data['state'] == 'error':
                 self._package = None
