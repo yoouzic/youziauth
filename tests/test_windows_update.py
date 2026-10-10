@@ -400,7 +400,7 @@ class InstallGuardsTests(unittest.TestCase):
     def test_verifier_runs_before_the_worker_starts(self):
         events = []
         with patch.object(update, "_run_verifier", side_effect=lambda *a: events.append("verify") or 0), \
-             patch.object(update, "_start_worker", side_effect=lambda *a: events.append("worker") or 4321), \
+             patch.object(update, "_start_worker", side_effect=lambda *a, **k: events.append("worker") or 4321), \
              patch.object(update, "_observe_worker", side_effect=lambda *a: events.append("observe") or 3010):
             self.assertEqual(self.install(), 3010)
         self.assertEqual(events, ["verify", "worker", "observe"])

@@ -248,7 +248,17 @@ try {
     $stage = 19
     $start = New-Object Diagnostics.ProcessStartInfo
     $start.FileName = [IO.Path]::Combine([Environment]::SystemDirectory, 'msiexec.exe')
-    $start.Arguments = '/i "' + $env:YOUZIAUTH_UPDATE_MSI + '" /norestart'
+    # 无人值守时必须静默：/qn 不弹任何界面，/l*v 留一份可事后核对的日志。
+# 注意这里必须用单引号块里的双引号，PowerShell 才不会把 /qn 当成位置参数。
+$quiet = [bool]$env:YOUZIAUTH_UPDATE_SILENT
+$start.Arguments = '/i "' + $env:YOUZIAUTH_UPDATE_MSI + '" /norestart'
+if ($quiet) {
+    $start.Arguments = $start.Arguments + ' /qn'
+    $log = [string]$env:YOUZIAUTH_UPDATE_LOG
+    if ($log) {
+        $start.Arguments = $start.Arguments + ' /l*v "' + $log + '"'
+    }
+}
     $start.UseShellExecute = $false
     $installer = [Diagnostics.Process]::Start($start)
     if ($null -eq $installer) { throw 'installer-start' }
@@ -639,13 +649,14 @@ def verify_msi(path, executable, version, sha256, signature=None) -> None:
 
 
 def _start_worker(msi: Path, anchor: Path, version: str, size: int, digest: str,
-                  signature: bytes, payload: bytes, directory: Path) -> int:
+                  signature: bytes, payload: bytes, directory: Path,
+                  silent: bool = False, log_path=None) -> int:
     powershell = _system_tool("WindowsPowerShell/v1.0/powershell.exe")
     request_path, report_path = _write_request(msi, version, size, digest, signature, payload)
     request = {
         "directory": str(directory), "sha256": digest, "signature": signature.hex(),
         "payload": payload.decode("ascii"), "properties": _expected_properties(version),
-        "deadline": int(time.time()) + 90,
+        "deadline": int(time.time()) + 90, "silent": bool(silent),
     }
     environment = os.environ.copy()
     environment.update({
@@ -654,6 +665,8 @@ def _start_worker(msi: Path, anchor: Path, version: str, size: int, digest: str,
         "YOUZIAUTH_UPDATE_REQUEST_FILE": str(request_path), "YOUZIAUTH_UPDATE_RESPONSE_FILE": str(report_path),
         "YOUZIAUTH_UPDATE_REQUEST": base64.b64encode(json.dumps(request).encode("utf-8")).decode("ascii"),
         "YOUZIAUTH_UPDATE_VERIFY": _ENCODED_COMMAND, "YOUZIAUTH_UPDATE_WORKER": _ENCODED_WORKER,
+        "YOUZIAUTH_UPDATE_SILENT": "1" if silent else "",
+        "YOUZIAUTH_UPDATE_LOG": str(log_path) if log_path else "",
         "PSModulePath": str(powershell.parent / "Modules"),
     })
     try:
@@ -742,7 +755,8 @@ def _observe_worker(pid: int, directory: Path, on_launch: Callable[[], None]) ->
             shutil.rmtree(directory, ignore_errors=True)
 
 
-def install_msi(path, executable, version, sha256, on_launch, signature=None) -> int:
+def install_msi(path, executable, version, sha256, on_launch, signature=None,
+                silent=False, log_dir=None) -> int:
     if not callable(on_launch):
         raise UpdateVerificationError("安装启动通知回调无效。")
     msi, anchor, version, sha256, signature, size = _validate_inputs(
@@ -763,5 +777,13 @@ def install_msi(path, executable, version, sha256, on_launch, signature=None) ->
         directory = Path(tempfile.mkdtemp(prefix="youziauth-update-")).resolve()
     except OSError:
         raise UpdateVerificationError("无法创建更新私有状态目录，已取消更新。") from None
-    pid = _start_worker(msi, anchor, version, size, digest, signature, payload, directory)
+    log_path = None
+    if silent and log_dir is not None:
+        try:
+            Path(log_dir).mkdir(parents=True, exist_ok=True)
+            log_path = Path(log_dir) / "msi-install.log"
+        except OSError:
+            log_path = None
+    pid = _start_worker(msi, anchor, version, size, digest, signature, payload, directory,
+                        silent=silent, log_path=log_path)
     return _observe_worker(pid, directory, on_launch)
