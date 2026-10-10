@@ -36,12 +36,18 @@ function harness(source='windows',extras={}){
       checked:/\schecked(?:\s|$)/.test(match[2]),
       hidden:/\shidden(?:\s|$)/.test(match[2]),disabled:/\sdisabled(?:\s|$)/.test(match[2]),open:false,
       textContent:'',firstChild:{textContent:''},dataset:action?{action}:{},attributes,hash:attributes.href||'',
-      options:[],children:[],
+      options:[],children:[],style:{},
+      // 运行记录要把「用户滚到哪」当真：桩里给死数字，比在真浏览器里断言更稳。
+      scrollTop:0,scrollHeight:900,clientHeight:500,
+      scrollTo({top}){this.scrollTop=top;},
       appendChild(child){this.children.push(child);if(child.tagName==='OPTION')this.options.push(child);return child;},
       replaceChildren(...nodes){this.children=nodes;this.options=nodes.filter(node=>node.tagName==='OPTION');},
       set innerHTML(value){assert.fail('Backend text must never be rendered as HTML: '+value);},
       classList:{toggle(name,on){if(on)classes.add(name);else classes.delete(name);},contains(name){return classes.has(name);}},
       listeners:{},addEventListener(event,fn){this.listeners[event]=fn;},
+      fire(event){this.listeners[event]?.({});},
+      // 运行记录的提示胶囊按这个矩形贴到日志框下缘；桩里给个固定值就够断言位置被算过。
+      getBoundingClientRect(){return {bottom:700,top:200,left:0,right:600,width:600,height:500};},
       setAttribute(name,value){this.attributes[name]=value;},removeAttribute(name){delete this.attributes[name];},
       focus(){},showModal(){this.open=true;},close(){this.open=false;this.listeners.close?.();},
     };
@@ -62,7 +68,7 @@ function harness(source='windows',extras={}){
   if(canvas)canvas.getContext=()=>stubContext();
   if(canvas&&extras.canvasRect)canvas.getBoundingClientRect=()=>extras.canvasRect;
   const stop=actions.find(button=>button.dataset.action==='network_stop');
-  const data={preview:true,update:updateFixture(),location:{state:'idle',message:'尚未检测',accuracy:null,checked:'',busy:false},network:{username:'saved',interval:60,startup:false,monitoring:true,busy:false,state:'online',message:'online',checked:'',has_password:true},dorm:{state:'idle',message:'pending',busy:false,task:null,settings:{enabled:false,start:'21:00',end:'23:30',interval:300,location_source:source},schedule:'off'},logs:{network:'',dorm:''}};
+  const data={preview:true,update:updateFixture(),location:{state:'idle',message:'尚未检测',accuracy:null,checked:'',busy:false},network:{username:'saved',interval:60,startup:false,monitoring:true,busy:false,state:'online',message:'online',checked:'',has_password:true},dorm:{state:'idle',message:'pending',busy:false,task:null,settings:{enabled:false,start:'21:00',end:'23:30',interval:300,location_source:source},schedule:'off'},logs:{network:extras.logs?.network||'',dorm:extras.logs?.dorm||''}};
   // 老快照没有账号层；accounts:false 就是那种机器，别的 extras 只覆盖清单里的字段。
   if(extras.accounts!==false)data.accounts={...accountsFixture(),...(extras.accounts||{})};
   // 每个账号在 state.dorm 里各有一份设置：切换后整份内容跟着换，测试靠这个差异证明表单真的换过来了。
@@ -170,7 +176,12 @@ function harness(source='windows',extras={}){
     }},
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../desktop_ui/app.js'),'utf8'),context);
-  return {el,data,api,map,calls,context,stop,navigation,refresh:()=>vm.runInContext('refresh()',context),navigate(page){context.location.hash='#'+page;vm.runInContext('navigate()',context);}};
+  return {el,data,api,map,calls,context,stop,navigation,refresh:()=>vm.runInContext('refresh()',context),
+    // 日志滚动的状态在 app.js 里，测试只读地检查它，不去碰界面逻辑。
+    logView:()=>vm.runInContext('logView',context),
+    // 用户滚动：位置和滚动事件要一起发生，否则 1.5 秒心跳那边看到的还是旧位置。
+    scrolled(top){const log=el('log-output');log.scrollTop=top;log.fire('scroll');},
+    navigate(page){context.location.hash='#'+page;vm.runInContext('navigate()',context);}};
 }
 const settle=()=>new Promise(resolve=>setImmediate(resolve));
 function pickSource(h,source){h.el('location-source').value=source;h.el('location-source').listeners.change();}function saveSource(h){return h.el('save-location-source').listeners.click();}
@@ -1788,4 +1799,94 @@ test('a snapshot without the per-account status fields still renders the bar',as
   for(const id of ACCOUNT_CONTROLS)assert.equal(h.el(id).disabled,false);
   h.el('account-add').onclick();await settle();await settle();
   assert.deepEqual(h.calls.map(call=>call.action),['account_add'],'账号栏照常能用');
+});
+
+/* 运行记录的滚动落点 --------------------------------------------------------------------------
+   日志是升序的（最旧在上），人点开它多半想看「刚才那一下为什么失败」，也就是最后几行。 */
+const LOG_STATUS=min=>`2026-10-10 11:${min}:01 INFO current auth status: authenticated`;
+const LOG_ERROR=min=>`2026-10-10 11:${min}:05 ERROR login failed: 设备未注册,请在ePortal上添加认证设备`;
+function recordsHarness(network=[LOG_STATUS('00'),LOG_ERROR('02')].join('\n')){
+  return harness('windows',{logs:{network}});
+}
+
+test('opening the records page lands on the newest line instead of the oldest',async()=>{
+  const h=recordsHarness('');
+  h.navigate('records');await h.refresh();
+  assert.equal(h.el('records').hidden,false);
+  assert.equal(h.logView().showNewest,true,'打开这一页的意图就是看最新，先记下来');
+  h.data.logs.network=LOG_ERROR('02');await h.refresh();
+  assert.equal(h.el('log-output').scrollTop,h.el('log-output').scrollHeight,'打开就必须落在最新一行');
+  assert.equal(h.el('log-jump').hidden,true,'已经在最新一行，不该出现提示');
+  // 「刷新记录」和切换校园网 / 寝室打卡是同一类意图：直接给最新。
+  h.scrolled(0);
+  h.el('refresh-records').onclick();await h.refresh();
+  assert.equal(h.el('log-output').scrollTop,h.el('log-output').scrollHeight,'点刷新后要回到最新一行');
+  assert.equal(h.logView().unread,0);
+});
+
+test('reading older records is never interrupted, not even by the 1.5s snapshot',async()=>{
+  const h=recordsHarness();
+  h.navigate('records');await h.refresh();
+  await h.refresh();
+  h.scrolled(0);
+  h.data.logs.network+='\n'+LOG_ERROR('10');
+  await h.refresh();
+  assert.equal(h.el('log-output').scrollTop,0,'正在翻旧记录时不能被拽回底部');
+  assert.equal(h.el('log-jump').hidden,false,'有新记录时要出现提示');
+  assert.equal(h.el('log-jump-count').textContent,'1','只算新增的那一条');
+  await h.refresh();
+  assert.equal(h.el('log-jump-count').textContent,'1','同一段内容再渲染一遍不能重复计数');
+  assert.equal(h.el('log-output').scrollTop,0);
+});
+
+test('routine status lines never ring the unread counter',async()=>{
+  const h=recordsHarness();
+  h.navigate('records');await h.refresh();
+  await h.refresh();
+  h.scrolled(0);
+  h.data.logs.network+='\n'+LOG_ERROR('11')+'\n'+LOG_STATUS('12')+'\n'+LOG_ERROR('13');
+  await h.refresh();
+  assert.equal(h.el('log-jump-count').textContent,'2','每分钟一条的 status 行不算新记录');
+  assert.equal(h.el('log-output').scrollTop,0);
+});
+
+test('scrolling back to the bottom clears the prompt and resumes following',async()=>{
+  const h=recordsHarness();
+  h.navigate('records');await h.refresh();
+  await h.refresh();
+  h.scrolled(0);
+  h.data.logs.network+='\n'+LOG_ERROR('10');
+  await h.refresh();
+  assert.equal(h.el('log-jump').hidden,false);
+  h.scrolled(h.el('log-output').scrollHeight);
+  assert.equal(h.el('log-jump').hidden,true,'回到底部后提示要收起');
+  h.data.logs.network+='\n'+LOG_ERROR('11');
+  await h.refresh();
+  assert.equal(h.el('log-output').scrollTop,h.el('log-output').scrollHeight,'在底部时继续跟随最新一行');
+});
+
+test('the unread prompt jumps to the newest line when clicked',async()=>{
+  const h=recordsHarness();
+  h.navigate('records');await h.refresh();
+  await h.refresh();
+  h.scrolled(0);
+  h.data.logs.network+='\n'+LOG_ERROR('10');
+  await h.refresh();
+  h.el('log-jump').onclick();
+  assert.equal(h.el('log-output').scrollTop,h.el('log-output').scrollHeight,'点提示要回到底部');
+  assert.equal(h.el('log-jump').hidden,true);
+  assert.equal(h.logView().unread,0);
+});
+
+test('the records page still renders text and hides the prompt when there is nothing to show',async()=>{
+  const h=recordsHarness('');
+  h.navigate('records');await h.refresh();
+  assert.equal(h.el('log-output').hidden,true);
+  assert.equal(h.el('empty-records').hidden,false);
+  assert.equal(h.el('log-jump').hidden,true,'没有日志时不该留着提示');
+  h.data.logs.network=LOG_ERROR('02');
+  await h.refresh();
+  assert.equal(h.el('log-output').hidden,false);
+  assert.equal(h.el('log-output').textContent,LOG_ERROR('02'),'日志照旧按纯文本渲染');
+  assert.equal(h.el('empty-records').hidden,true);
 });

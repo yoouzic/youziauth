@@ -12,6 +12,106 @@ const MAP_TILE = 256, MAP_MIN_ZOOM = 13, MAP_MAX_ZOOM = 19;
 const MAP_TILE_TRIES = 3, MAP_TILE_BACKOFF = [1200, 4000];  // ms before each retry of one tile
 const MAP_TILE_STALL = 8000;   // ms with nothing drawn before the next provider takes the frame
 
+/* 运行记录的滚动位置 --------------------------------------------------------------------------
+   日志是升序的（最旧在上），但人点开它多半是想看「刚才那一下为什么失败」，也就是最后几行。
+   所以打开、切标签、点刷新都落在最新一行；已经手动上滚翻旧记录时不再打断，只在角上累计
+   「N 条新记录」。status 行是每分钟一次的例行检测，不吵醒这个计数。 */
+// 边界要写死：\s+\w+ 这种「量词接量词」在只有一个空格时会让 \s+ 把空格吃光，永远匹配不上。
+const LOG_STATUS_LINE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} +\w+ current auth status:/;
+const logView = {showNewest:false, stick:true, unread:0, upto:0};
+function logText(){return (state && state.logs && state.logs[logType]) || '';}
+// 例行 status 行每分钟一条，不该被算成「新记录」。
+function isStatusLine(line){return LOG_STATUS_LINE.test(line);}
+// 用户眼里「一条记录」的数量：非空、且不是例行 status 的行。
+function logTold(text){return text.split('\n').filter(line=>line.trim()&&!isStatusLine(line)).length;}
+// 元素没有渲染出来（还没显示 / 测试桩）时按「在底部」处理：只有真正能滚动时才谈打断。
+function logsAtEnd(el){
+  if(!el || !('scrollTop' in el))return true;
+  const height=Number(el.clientHeight)||0;
+  if(!height)return true;
+  return el.scrollHeight-(el.scrollTop+height)<=4;
+}
+function clearLogJump(){
+  logView.unread=0;
+  const badge=$('log-jump');
+  if(badge)badge.hidden=true;
+}
+function scrollLogsToEnd(fast=false){
+  const el=$('log-output');
+  if(!el || !('scrollTop' in el))return;
+  const to=el.scrollHeight;
+  if(!fast && typeof el.scrollTo==='function')el.scrollTo({top:to,behavior:'smooth'});
+  else el.scrollTop=to;
+  // 平滑滚动期间 scroll 事件还没到，先把状态摆对：否则紧接着的一次快照会把「新记录」又数一遍。
+  logView.stick=true;
+  clearLogJump();
+}
+function placeLogJump(){
+  const el=$('log-output'), jump=$('log-jump');
+  if(!el || !jump || !jump.style)return;
+  if(typeof el.getBoundingClientRect!=='function')return;
+  jump.style.top=(el.getBoundingClientRect().bottom-46)+'px';
+}
+function showLogJump(){
+  const jump=$('log-jump');
+  if(!jump)return;
+  $('log-jump-count').textContent=String(logView.unread);
+  jump.hidden=false;   // 先让它可见，再算位置：定位只是锦上添花，不该挡住提示本身
+  placeLogJump();
+}
+function applyLogView(el, text){
+  // 内容没变就不要重写 textContent：整体替换文本会把滚动条弹回顶部，1.5 秒一次的快照足以
+  // 让人永远读不完一段旧记录。
+  const change=text!==el.textContent;
+  if(change)el.textContent=text;
+  // 追不追最新，只看用户此刻滚到哪（和显式的「切标签 / 点刷新」）。判断必须排在写回 stick
+  // 之前，否则刚上滚的人会被当成「还在底部」被拽回去；「有未读」同理不能当成追底的理由，
+  // 否则提示胶囊一出现，后面每次空刷新都会把正在读旧记录的人拽走。
+  const shot=logView.showNewest;
+  logView.showNewest=false;
+  if(!('scrollTop' in el))return;
+  const priorStick=logView.stick;
+  const atEnd=logsAtEnd(el);
+  const told=logTold(text);
+  const follow=shot||priorStick||atEnd;
+  // 先在「追底之前」结算：这时多出来的记录才是用户还没看到的。基线只在内容真的变了之后前进，
+  // 所以 1.5 秒一次的心跳空转不会动它；日志被轮转、条数变少时基线跟着回退，下一次才不会把
+  // 整段旧日志都当成新的。
+  if(change&&!follow)logView.unread+=Math.max(0,told-logView.upto);
+  logView.stick=follow;
+  if(change)logView.upto=told;
+  if(follow){
+    el.scrollTop=el.scrollHeight;
+    clearLogJump();
+    return;
+  }
+  if(logView.unread)showLogJump();
+}
+function renderLogs(){
+  if(!state)return;
+  const text=logText(), el=$('log-output');
+  el.hidden=!text.trim();
+  $('empty-records').hidden=!!text.trim();
+  if(el.hidden){
+    logView.unread=0;
+    logView.stick=true;
+    if($('log-jump'))$('log-jump').hidden=true;
+    return;
+  }
+  applyLogView(el,text);
+}
+if($('log-output') && typeof $('log-output').addEventListener === 'function'){
+  $('log-output').addEventListener('scroll',()=>{
+    const atEnd=logsAtEnd($('log-output'));
+    logView.stick=atEnd;
+    if(atEnd)clearLogJump();
+  });
+}
+if($('log-jump')){
+  $('log-jump').onclick=()=>scrollLogsToEnd();
+  window.addEventListener('resize',()=>{if(!$('log-jump').hidden)placeLogJump();});
+}
+
 function notify(message, error=false) {
   clearTimeout(timer);
   $('toast').textContent = message;
@@ -28,6 +128,8 @@ function navigate() {
     if(active) link.setAttribute('aria-current','page'); else link.removeAttribute('aria-current');
   });
   $('page-context').textContent = titles[page];
+  // 从别处进「运行记录」时直接落在最新一行：这是这一页最常见的来意，翻旧记录靠往上滚。
+  if(page === 'records') logView.showNewest = true;
   window.scrollTo(0,0);
 }
 window.addEventListener('hashchange', navigate);
@@ -134,7 +236,6 @@ function render() {
   renderUpdates();
   renderLogs();
 }
-function renderLogs(){if(!state)return;const text=state.logs[logType]||'';$('log-output').textContent=text;$('log-output').hidden=!text.trim();$('empty-records').hidden=!!text.trim();}
 function updateSize(bytes){
   if(bytes<1024)return bytes+' B';
   if(bytes<1048576)return (bytes/1024).toFixed(1)+' KiB';
@@ -493,8 +594,8 @@ $('account-delete').onclick=()=>{
   });
 };
 $('quit').onclick=()=>confirmAction('退出 youziauth？','退出将停止本程序的后台检测和自动打卡。已启用的系统认证代理仍会运行。',()=>act('quit'));
-$('refresh-records').onclick=async()=>{await refresh();if($('connection-error').hidden)notify('运行记录已刷新');};
-document.querySelectorAll('[data-log]').forEach(button=>button.onclick=()=>{logType=button.dataset.log;document.querySelectorAll('[data-log]').forEach(b=>{b.classList.toggle('selected',b===button);b.setAttribute('aria-pressed',String(b===button));});renderLogs();});
+$('refresh-records').onclick=async()=>{logView.showNewest=true;await refresh();if($('connection-error').hidden)notify('运行记录已刷新');};
+document.querySelectorAll('[data-log]').forEach(button=>button.onclick=()=>{logType=button.dataset.log;document.querySelectorAll('[data-log]').forEach(b=>{b.classList.toggle('selected',b===button);b.setAttribute('aria-pressed',String(b===button));});logView.showNewest=true;renderLogs();});
 
 /* Simulation map picker ---------------------------------------------------------------------
    The one place this UI renders coordinates: the point the user chooses to submit, and the
