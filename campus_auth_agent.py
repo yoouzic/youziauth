@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
+import auto_update
 import campus_auth
 from agent_ipc import AgentCommand, NamedPipeServer, RuntimeSnapshot, read_snapshot, write_snapshot
 from auth_runtime import AgentState, AuthAttempt, AttemptKind, RetryPolicy
@@ -70,6 +71,7 @@ class Agent:
         boot_id: Optional[str] = None,
         updater=None,
         update_interval_seconds: int = 6 * 60 * 60,
+        update_reason: str = "",
     ):
         self.config_loader = config_loader
         self.config = config_loader()
@@ -85,6 +87,8 @@ class Agent:
         # 后台自动更新：这是 SYSTEM 常驻进程存在的意义之一 —— 它已经提权，所以
         # 检查、下载、验签、静默安装都不需要再弹一次 UAC。
         self.updater = updater
+        # 更新器没启用时说明原因：界面要能区分「后台没在跑」和「已经是最新」。
+        self.update_reason = str(update_reason or "")
         self.update_interval_seconds = max(300, int(update_interval_seconds))
         self._next_update_at = 0.0
         self._update_lock = threading.Lock()
@@ -297,6 +301,13 @@ class Agent:
             pass
         return self.snapshot
 
+    def _publish_disabled_reason(self) -> RuntimeSnapshot:
+        """把「为什么没有后台更新」写进快照，让界面说出来而不是什么都不显示。"""
+        if self.updater is not None or not self.update_reason:
+            return self.snapshot
+        return self._publish_update(auto_update.UpdateStatus(
+            state="error", message=self.update_reason, detail="updater unavailable"))
+
     def _run_update_check(self, reason: str) -> RuntimeSnapshot:
         """跑一次后台更新。任何异常都只降级为错误状态，绝不能让 agent 退出。
 
@@ -383,6 +394,8 @@ class Agent:
                     self.logger.error("agent command channel failed: %s", exc)
 
         threading.Thread(target=command_loop, name="youziauth-agent-ipc", daemon=True).start()
+        # 更新器没启用就先把原因写进快照：不必等到「有更新要检查」才让用户知道。
+        self._publish_disabled_reason()
         delay = 0
         while not stop_event.wait(delay):
             if self.update_due():
@@ -440,30 +453,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_updater(program_data: Path):
-    """后台自动更新的实装：只在冻结的正式安装版里启用。
+def build_updater(app_dir: Path) -> tuple:
+    """后台自动更新的实装。返回 ``(updater, reason)``：拿到更新器时 reason 为空。
 
-    源码运行时没有可安装的 MSI，也没有稳定的安装目录，所以返回 None —— agent 照常
-    做校园网认证，只是不碰更新。这样开发机上跑 agent 不会误装什么东西。
+    只在冻结的正式安装版里启用：源码运行时没有可安装的 MSI，也没有稳定的安装目录，
+    所以返回 ``None`` —— agent 照常做校园网认证，只是不碰更新。
+
+    **为什么要把原因带出来**：这里原本只在失败时返回 ``None``。真实安装上它就一直返回
+    ``None``（判断 VERSION 时只看安装根目录），而自动更新「没在跑」和「没什么可更新」
+    在界面上长得一模一样 —— 这个功能整整一个版本都没生效却没人发现。原因必须能被说出来。
     """
     if not getattr(sys, "frozen", False):
-        return None
+        return None, "源码运行：后台自动更新只在安装版里启用"
     try:
         import auto_update
         from startup_tasks import install_dir_for_current_process, run_tray_task
 
         install_dir = install_dir_for_current_process()
-        if install_dir is None or not (install_dir / "VERSION").is_file():
-            return None
-        return auto_update.Updater(
+        if install_dir is None:
+            return None, "找不到安装目录，后台自动更新未启用"
+        # 版本文件的位置交给 auto_update 判断：冻结的 one-folder 构建把 VERSION 放在
+        # _internal 里，**不在**安装根目录。
+        if not auto_update.read_installed_version(install_dir):
+            return None, "读不到已安装版本，后台自动更新未启用"
+        updater = auto_update.Updater(
             install_dir=install_dir,
-            cache_dir=Path(program_data) / "updates",
+            # app_dir 是 **app 数据目录**（%ProgramData%\youziauth），不是它的父目录。
+            cache_dir=Path(app_dir) / "updates",
             executable=install_dir / "youziauth.exe",
             relaunch=run_tray_task,
-            log_dir=Path(program_data) / "updates",
+            log_dir=Path(app_dir) / "updates",
         )
-    except Exception:  # noqa: BLE001 - an unavailable updater must not stop the agent
-        return None
+        return updater, ""
+    except Exception as exc:  # noqa: BLE001 - an unavailable updater must not stop the agent
+        return None, f"后台自动更新不可用（{type(exc).__name__}）"
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -477,6 +500,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     snapshot_path = (program_data_root(args.config.parent.parent) / "runtime.json"
                      if args.config == machine_config_path(args.config.parent.parent)
                      else args.config.parent / "runtime.json")
+    # snapshot_path.parent 就是 app 数据目录（%ProgramData%\youziauth）；更新缓存与
+    # MSI 日志都放在它下面，不能放到安装目录（Program Files）里去。
+    updater, update_reason = build_updater(snapshot_path.parent)
+    if update_reason:
+        logger.warning("automatic update disabled: %s", update_reason)
     agent = Agent(
         config_loader=lambda: load_agent_config(args.config),
         probe=NetworkProbe(),
@@ -489,7 +517,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
         snapshot_path=snapshot_path,
         logger=logger,
-        updater=build_updater(snapshot_path.parent),
+        updater=updater,
+        update_reason=update_reason,
     )
     if args.once:
         result = agent.run_cycle()

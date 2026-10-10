@@ -1,5 +1,6 @@
 import logging
 import tempfile
+import sys
 import threading
 import time
 import unittest
@@ -210,7 +211,7 @@ class AgentLoopTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def make_agent(self, probe, authenticator, boot_id="boot-1", updater=None,
-                   update_interval_seconds=6 * 60 * 60):
+                   update_interval_seconds=6 * 60 * 60, update_reason=""):
         agent = Agent(
             config_loader=lambda: self.config,
             probe=probe,
@@ -220,6 +221,7 @@ class AgentLoopTests(unittest.TestCase):
             boot_id=boot_id,
             updater=updater,
             update_interval_seconds=update_interval_seconds,
+            update_reason=update_reason,
         )
         self._agents.append(agent)
         return agent
@@ -542,6 +544,112 @@ class AgentLoopTests(unittest.TestCase):
 
         self.assertFalse(agent.snapshot.notifications_suppressed)
         self.assertEqual(read_snapshot(self.snapshot_path).boot_id, "new-boot")
+
+
+class BuildUpdaterTests(unittest.TestCase):
+    """build_updater is the switch for the whole unattended update path.
+
+    It used to fail silently on every real install: it gated on VERSION sitting in the
+    install root, which a frozen one-folder build does not do (VERSION lives in
+    _internal). Nothing reported that, so the feature shipped permanently off.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.install = Path(self.temporary.name) / "install"
+        (self.install / "_internal").mkdir(parents=True)
+        (self.install / "_internal" / "VERSION").write_text("1.9.0\n", encoding="utf-8")
+        (self.install / "youziauth.exe").write_bytes(b"stub")
+        self.app_dir = Path(self.temporary.name) / "appdata"
+
+    def build(self):
+        import campus_auth_agent
+
+        real_frozen, real_exe = getattr(sys, "frozen", None), sys.executable
+        sys.frozen = True
+        sys.executable = str(self.install / "youziauth-agent.exe")
+        try:
+            return campus_auth_agent.build_updater(self.app_dir)
+        finally:
+            sys.executable = real_exe
+            if real_frozen is None:
+                del sys.frozen
+            else:
+                sys.frozen = real_frozen
+
+    def test_the_frozen_one_folder_layout_enables_the_updater(self):
+        updater, reason = self.build()
+        self.assertEqual(reason, "")
+        self.assertIsNotNone(updater, "VERSION inside _internal must still enable updates")
+        self.assertEqual(updater.install_dir, self.install)
+        self.assertEqual(updater.executable, self.install / "youziauth.exe")
+
+    def test_the_update_cache_and_logs_stay_out_of_the_install_directory(self):
+        # 缓存写进 Program Files 有个实际毛病：MSI 修复/卸载会连它一起动，而往安装目录
+        # 写日志还会把安装包弄成「需要修复」。
+        updater, _ = self.build()
+        self.assertEqual(updater.cache_dir, self.app_dir / "updates")
+        self.assertEqual(updater.log_dir, self.app_dir / "updates")
+        self.assertNotIn(str(self.install), str(updater.cache_dir))
+        self.assertNotIn(str(self.install), str(updater.log_dir))
+
+    def test_source_runs_get_no_updater_and_say_why(self):
+        import campus_auth_agent
+
+        updater, reason = campus_auth_agent.build_updater(self.app_dir)
+        self.assertIsNone(updater)
+        self.assertIn("安装版", reason)
+
+    def test_a_missing_version_reports_a_reason_instead_of_failing_silently(self):
+        (self.install / "_internal" / "VERSION").unlink()
+        updater, reason = self.build()
+        self.assertIsNone(updater)
+        self.assertIn("读不到已安装版本", reason)
+
+
+class AgentUpdateStatusTests(unittest.TestCase):
+    """The interface must be able to tell "updater off" from "nothing to update"."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.snapshot_path = Path(self.temporary.name) / "runtime.json"
+        config = campus_auth.AuthConfig(username="u", password="p", check_interval_seconds=60)
+        logger = logging.getLogger(f"agent-status-{id(self)}")
+        logger.addHandler(logging.NullHandler())
+        self.make = lambda **kw: Agent(
+            config_loader=lambda: config,
+            probe=FakeProbe([]),
+            authenticator=FakeAuthenticator([]),
+            snapshot_path=self.snapshot_path,
+            logger=logger,
+            boot_id="boot-1",
+            **kw,
+        )
+
+    def test_an_agent_without_an_updater_publishes_the_reason(self):
+        agent = self.make(update_reason="读不到已安装版本，后台自动更新未启用")
+        self.assertEqual(agent.snapshot.update, {})
+        agent._publish_disabled_reason()
+        published = agent.snapshot.update
+        self.assertEqual(published["state"], "error")
+        self.assertIn("读不到已安装版本", published["message"])
+        self.assertEqual(read_snapshot(self.snapshot_path).update["state"], "error")
+
+    def test_a_healthy_updater_publishes_no_disabled_reason(self):
+        class Quiet:
+            def run_cycle(inner, progress=None):
+                return auto_update.UpdateStatus(state="up_to_date", message="已是最新。")
+
+        agent = self.make(updater=Quiet(), update_reason="")
+        agent._publish_disabled_reason()
+        self.assertEqual(agent.snapshot.update, {})
+
+    def test_the_reason_can_be_absent(self):
+        agent = self.make()
+        agent._publish_disabled_reason()
+        self.assertEqual(agent.snapshot.update, {})
 
 
 if __name__ == "__main__":
