@@ -769,5 +769,91 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(destination.read_bytes(), self.PACKAGE)
 
 
+class ProxyTests(unittest.TestCase):
+    """The updater runs as SYSTEM and must use the proxy the user configured.
+
+    SYSTEM has its own registry hive, so it cannot see the interactive user's
+    HKCU Internet Settings - which is where Clash Verge and friends write their
+    setting. WinHTTP is typically left at direct, so without this the unattended
+    updater goes straight to the Internet while the user's browser next to it goes
+    through the proxy. That is a plausible reason the agent could never download.
+    """
+
+    def test_an_explicit_setting_wins_over_detection(self):
+        with patch.dict(app_update.os.environ, {"YOUZIAUTH_UPDATE_PROXY": "http://10.0.0.1:8080"}):
+            with patch.object(app_update, "interactive_user_proxy", return_value="http://127.0.0.1:7897"):
+                self.assertEqual(app_update.configured_proxy(), "http://10.0.0.1:8080")
+
+    def test_an_empty_setting_forces_direct(self):
+        # 显式置空是「别用探测到的代理」的逃生口。
+        with patch.dict(app_update.os.environ, {"YOUZIAUTH_UPDATE_PROXY": ""}):
+            with patch.object(app_update, "interactive_user_proxy", return_value="http://127.0.0.1:7897"):
+                self.assertIsNone(app_update.configured_proxy())
+
+    def test_detection_is_used_when_nothing_is_pinned(self):
+        with patch.dict(app_update.os.environ, {}, clear=False):
+            app_update.os.environ.pop("YOUZIAUTH_UPDATE_PROXY", None)
+            with patch.object(app_update, "interactive_user_proxy", return_value="http://127.0.0.1:7897"):
+                self.assertEqual(app_update.configured_proxy(), "http://127.0.0.1:7897")
+
+    def test_proxy_server_forms_are_normalised(self):
+        real = app_update._proxy_from_hive
+
+        class Key:
+            def __init__(self, values): self.values = values
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_winreg(values):
+            class W:
+                HKEY_USERS = object()
+                def OpenKey(self, root, path): return Key(values)
+                # 真实 winreg.QueryValueEx 返回 (value, type)，别把签名写错。
+                def QueryValueEx(self, key, name): return key.values[name], 1
+                def CloseKey(self, key): pass
+            return W()
+
+        cases = (
+            ({"ProxyEnable": 1, "ProxyServer": "127.0.0.1:7897"}, "http://127.0.0.1:7897"),
+            ({"ProxyEnable": 1, "ProxyServer": "http://127.0.0.1:7897"}, "http://127.0.0.1:7897"),
+            ({"ProxyEnable": 1, "ProxyServer": "http=127.0.0.1:8080;https=127.0.0.1:8443"},
+             "http://127.0.0.1:8443"),
+            ({"ProxyEnable": 0, "ProxyServer": "127.0.0.1:7897"}, None),
+            ({"ProxyEnable": 1, "ProxyServer": "   "}, None),
+        )
+        for values, expected in cases:
+            with self.subTest(values=values):
+                self.assertEqual(app_update._proxy_from_hive(fake_winreg(values), "S-1-5-21-1-2-3-1001"),
+                                 expected)
+
+    def test_a_missing_or_unreadable_setting_is_not_an_error(self):
+        class FakeWinreg:
+            HKEY_USERS = object()
+            def OpenKey(self, root, path): raise OSError("no such key")
+            def CloseKey(self, key): pass
+
+        self.assertIsNone(app_update._proxy_from_hive(FakeWinreg(), "S-1-5-21-1-2-3-1001"))
+
+    def test_the_real_open_url_keeps_working_with_a_proxy_configured(self):
+        # 不联网：只确认构造出来的 opener 带上/不带代理都成立。
+        with patch.object(app_update, "configured_proxy", return_value="http://127.0.0.1:7897"):
+            with patch.object(app_update, "build_opener") as builder:
+                builder.return_value.open.side_effect = OSError("stop before the network")
+                with self.assertRaises(OSError):
+                    app_update.open_url("https://api.github.com/repos/youziauth/x")
+                handlers = builder.call_args.args
+                kinds = [type(h).__name__ for h in handlers]
+                self.assertIn("ProxyHandler", kinds)
+                proxy = [h for h in handlers if type(h).__name__ == "ProxyHandler"][0]
+                self.assertEqual(proxy.proxies.get("https"), "http://127.0.0.1:7897")
+        with patch.object(app_update, "configured_proxy", return_value=None):
+            with patch.object(app_update, "build_opener") as builder:
+                builder.return_value.open.side_effect = OSError("stop before the network")
+                with self.assertRaises(OSError):
+                    app_update.open_url("https://api.github.com/repos/youziauth/x")
+                proxy = [h for h in builder.call_args.args if type(h).__name__ == "ProxyHandler"][0]
+                self.assertEqual(proxy.proxies, {}, "no proxy means an explicit direct connection")
+
+
 if __name__ == '__main__':
     unittest.main()

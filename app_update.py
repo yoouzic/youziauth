@@ -4,13 +4,15 @@ import datetime as dt
 import hashlib
 import inspect
 import json
+import os
 import re
+import sys
 import tempfile
 import threading
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from windows_update import install_msi, verify_msi
 
@@ -110,6 +112,101 @@ class GitHubRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def interactive_user_proxy():
+    """The proxy the signed-in user actually configured, if any.
+
+    A service running as SYSTEM has its own registry hive: it cannot see the interactive
+    user's ``HKCU Internet Settings``, and that is where a desktop proxy client
+    (Clash Verge, v2rayN, ...) writes its setting. WinHTTP is usually left at "direct", so
+    such a process goes straight to the Internet -- which on a domestic link is exactly
+    where GitHub is least reliable. The unattended updater runs as SYSTEM, so without this
+    it downloads over a path nobody configured while the user's own browser flies through
+    the proxy next to it.
+
+    Reads the loaded users' hives through HKEY_USERS. Returns ``None`` when there is
+    nothing usable, so the caller behaves exactly as before when no proxy is configured.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+    try:
+        users = winreg.OpenKey(winreg.HKEY_USERS, "")
+    except OSError:
+        return None
+    try:
+        index = 0
+        candidates = []
+        while True:
+            try:
+                sid = winreg.EnumKey(users, index)
+            except OSError:
+                break
+            index += 1
+            # 只认交互用户的 SID：S-1-5-21-<机器>-<用户 RID>，且不是服务账户。
+            if not sid.startswith("S-1-5-21-") or sid.endswith(("-18", "-19", "-20")):
+                continue
+            candidates.append(sid)
+        # 多个已登录用户时取第一个有可用代理的（单用户机器上只有一个）。
+        for sid in candidates:
+            server = _proxy_from_hive(winreg, sid)
+            if server:
+                return server
+    except OSError:
+        return None
+    finally:
+        winreg.CloseKey(users)
+    return None
+
+
+def _proxy_from_hive(winreg, sid):
+    key_path = sid + "\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
+    try:
+        key = winreg.OpenKey(winreg.HKEY_USERS, key_path)
+    except OSError:
+        return None
+    try:
+        enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+        if not enabled:
+            return None
+        server, _ = winreg.QueryValueEx(key, "ProxyServer")
+    except OSError:
+        return None
+    finally:
+        winreg.CloseKey(key)
+    if not isinstance(server, str) or not server.strip():
+        return None
+    server = server.strip()
+    # ProxyServer 可能是 "host:port" 或按协议分列（"http=h:p;https=h:p"）。
+    for scheme in ("https", "http"):
+        for part in server.split(";"):
+            part = part.strip()
+            if part.startswith(scheme + "="):
+                server = part.split("=", 1)[1].strip()
+                break
+    if not server:
+        return None
+    if "=" in server or ";" in server:
+        return None
+    if not server.startswith(("http://", "https://")):
+        server = "http://" + server
+    return server
+
+
+def configured_proxy():
+    """Proxy for our outbound requests: explicit setting, else the user's, else system.
+
+    ``YOUZIAUTH_UPDATE_PROXY`` wins so an operator can pin one; ``""`` (set but empty)
+    forces direct, which is also the escape hatch if a detected proxy is unwanted.
+    """
+    override = os.environ.get("YOUZIAUTH_UPDATE_PROXY")
+    if override is not None:
+        return override.strip() or None
+    return interactive_user_proxy()
+
+
 def open_url(url, headers=None):
     validate_url(url)
     # 每一个 api.github.com 端点都要 JSON 的 Accept —— 只认 LATEST_RELEASE_URL 的话，
@@ -122,7 +219,14 @@ def open_url(url, headers=None):
         # 断点续传要带 Range；调用方只能追加，不能改写上面这几个固定头。
         request_headers.update(headers)
     request = Request(url, headers=request_headers)
-    return build_opener(GitHubRedirectHandler()).open(request, timeout=20)
+    proxy = configured_proxy()
+    handlers = [GitHubRedirectHandler()]
+    if proxy:
+        handlers.append(ProxyHandler({'http': proxy, 'https': proxy}))
+    else:
+        # 显式声明直连：默认 ProxyHandler 会去读本进程环境里的代理设置。
+        handlers.append(ProxyHandler({}))
+    return build_opener(*handlers).open(request, timeout=20)
 
 
 def _open(url, headers=None):
