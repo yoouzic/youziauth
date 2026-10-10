@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import inspect
 import json
 import re
 import tempfile
@@ -109,15 +110,38 @@ class GitHubRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def open_url(url):
+def open_url(url, headers=None):
     validate_url(url)
     # 每一个 api.github.com 端点都要 JSON 的 Accept —— 只认 LATEST_RELEASE_URL 的话，
     # compare 端点会直接回 415 Unsupported Media Type（实测）。附件下载仍走 octet-stream。
     json_api = url.startswith('https://api.github.com/')
-    request = Request(url, headers={'User-Agent': 'youziauth-updater',
-                                   'Accept': 'application/vnd.github+json' if json_api else 'application/octet-stream',
-                                   'X-GitHub-Api-Version': '2022-11-28'})
+    request_headers = {'User-Agent': 'youziauth-updater',
+                       'Accept': 'application/vnd.github+json' if json_api else 'application/octet-stream',
+                       'X-GitHub-Api-Version': '2022-11-28'}
+    if headers:
+        # 断点续传要带 Range；调用方只能追加，不能改写上面这几个固定头。
+        request_headers.update(headers)
+    request = Request(url, headers=request_headers)
     return build_opener(GitHubRedirectHandler()).open(request, timeout=20)
+
+
+def _open(url, headers=None):
+    """``open_url`` with optional request headers, tolerating a one-argument double.
+
+    Tests replace ``open_url`` with a simple ``def open(url)``. Passing a Range header
+    positionally would break every one of them for no reason, so the extra argument is
+    offered only to callables that can accept it.
+    """
+    if headers:
+        try:
+            if inspect.signature(open_url).parameters:
+                accepts = inspect.signature(open_url)
+                if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in accepts.parameters.values()) \
+                        or "headers" in accepts.parameters:
+                    return open_url(url, headers=headers)
+        except (TypeError, ValueError):
+            pass
+    return open_url(url)
 
 
 def read_small(url, limit):
@@ -641,37 +665,95 @@ class UpdateController:
 
     def _download(self, url, size, destination, version, digest, signature):
         self._set(state='downloading', message=f'发现 v{version}，正在后台下载安装包…')
-        temporary = None
+        # 断点续传。66 MB 的包在这条线路上要下几分钟，中途断一次很常见；从头再来等于
+        # 每次都在赌整段传输不断。半成品固定放在一个文件里，并配一份小元数据记录「这是谁
+        # 的半成品」——换了版本或换了包就必须丢掉，否则会把上一版的字节拼进这一版。
+        # 后缀刻意不是 .msi：半成品绝不能被当成「一个可安装的包」被别处看见。
+        partial = self._cache / f'.partial-{version}.msi.part'
+        meta = self._cache / f'.partial-{version}.meta.json'
+        resume_from = self._resume_offset(partial, meta, url, size, digest)
+        stream = None
         try:
-            with tempfile.NamedTemporaryFile(dir=self._cache, prefix='.download-', suffix='.msi', delete=False) as stream:
-                temporary = Path(stream.name)
+            if resume_from:
+                stream = partial.open('ab')
+                received = resume_from
+            else:
+                partial.unlink(missing_ok=True)
+                stream = partial.open('wb')
                 received = 0
-                hasher = hashlib.sha256()
-                with open_url(url) as response:
-                    if response.status != 200:
-                        raise RuntimeError('下载响应不完整，请重新检查。')
-                    while True:
-                        self._ensure_open()
-                        chunk = response.read(128 * 1024)
-                        self._ensure_open()
-                        if not chunk:
-                            break
-                        received += len(chunk)
-                        if received > size:
-                            raise RuntimeError('安装包大小与发布信息不符，已停止下载，请重新检查。')
-                        stream.write(chunk)
-                        hasher.update(chunk)
-                        self._set(downloaded_bytes=received, progress=received * 100 // size)
-                if received != size or hasher.hexdigest() != digest:
-                    raise RuntimeError('安装包不完整或 SHA-256 校验失败，请重新检查以下载完整文件。')
+                self._write_partial_meta(meta, url, size, digest)
+            hasher = hashlib.sha256()
+            if received:
+                # 已有的前缀必须进哈希，最后才能对上整包的摘要。
+                with partial.open('rb') as prefix:
+                    for block in iter(lambda: prefix.read(1024 * 1024), b''):
+                        hasher.update(block)
+            headers = {'Range': f'bytes={received}-'} if received else None
+            with _open(url, headers) as response:
+                if received and response.status == 200:
+                    # 服务器忽略了 Range：只能从头来，把已有字节丢掉重写。
+                    stream.close()
+                    stream = partial.open('wb')
+                    received = 0
+                    hasher = hashlib.sha256()
+                elif response.status not in ((206,) if received else (200,)):
+                    raise RuntimeError('下载响应不完整，请重新检查。')
+                self._set(downloaded_bytes=received, progress=received * 100 // size)
+                while True:
+                    self._ensure_open()
+                    chunk = response.read(128 * 1024)
+                    self._ensure_open()
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                    if received > size:
+                        raise RuntimeError('安装包大小与发布信息不符，已停止下载，请重新检查。')
+                    stream.write(chunk)
+                    hasher.update(chunk)
+                    self._set(downloaded_bytes=received, progress=received * 100 // size)
+            stream.close()
+            stream = None
+            if received != size or hasher.hexdigest() != digest:
+                raise RuntimeError('安装包不完整或 SHA-256 校验失败，请重新检查以下载完整文件。')
             self._ensure_open()
             self._set(state='verifying', message='下载完成，正在校验发布者签名和安装包版本…')
-            verify_msi(temporary, self._executable, version, digest, signature)
+            verify_msi(partial, self._executable, version, digest, signature)
             self._ensure_open()
-            temporary.replace(destination)
+            partial.replace(destination)
+            meta.unlink(missing_ok=True)
         finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+    def _resume_offset(self, partial, meta, url, size, digest):
+        """How many bytes of ``partial`` may be trusted, or 0 to start over.
+
+        只有「同一个 URL、同一个大小、同一个摘要」的半成品才敢接着下：任何一项不同都
+        意味着这是别的包留下的字节，拼起来就是坏文件。
+        """
+        try:
+            if not partial.is_file():
+                return 0
+            recorded = json.loads(Path(meta).read_text(encoding='utf-8'))
+            if not isinstance(recorded, dict):
+                return 0
+            if (recorded.get('url') != url or recorded.get('bytes') != size
+                    or recorded.get('sha256') != digest):
+                return 0
+            have = partial.stat().st_size
+        except (OSError, ValueError, TypeError, RecursionError):
+            return 0
+        return have if 0 < have < size else 0
+
+    def _write_partial_meta(self, meta, url, size, digest):
+        try:
+            Path(meta).write_text(json.dumps({'url': url, 'bytes': size, 'sha256': digest}),
+                                  encoding='utf-8')
+        except OSError:
+            pass
 
     def _install(self):
         path, version, digest, signature = self._package

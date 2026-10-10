@@ -8,6 +8,8 @@ import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import app_update
 from urllib.error import HTTPError, URLError
 
 
@@ -660,6 +662,111 @@ class UpdaterTests(unittest.TestCase):
         result = handler.redirect_request(request, None, 302, 'Found', {},
                                           'https://release-assets.githubusercontent.com/asset?token=example')
         self.assertEqual(result.host, 'release-assets.githubusercontent.com')
+
+
+class ResumeTests(unittest.TestCase):
+    """A dropped transfer must continue instead of restarting 66 MB.
+
+    Measured on the real link: the package takes minutes to fetch and the connection
+    drops mid-flight often enough that restarting every time means it never finishes.
+    """
+
+    PACKAGE = b"the whole package, in parts"
+    DIGEST = hashlib.sha256(PACKAGE).hexdigest()
+    URL = "https://github.com/yoouzic/youziauth/releases/download/v1.5.0/youziauth.msi"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cache = Path(self.tmp.name)
+        self.controller = app_update.UpdateController("1.4.4", self.cache, Path("youziauth.exe"))
+        self.addCleanup(self.controller.close)
+        self.partial = self.cache / ".partial-1.5.0.msi.part"
+        self.meta = self.cache / ".partial-1.5.0.meta.json"
+
+    def write_partial(self, data, url=None, size=None, sha256=None):
+        # 参数名与元数据字段一致，测试才能用 **{field: value} 逐个字段去改。
+        self.partial.write_bytes(data)
+        self.meta.write_text(json.dumps({
+            "url": url or self.URL, "bytes": len(self.PACKAGE) if size is None else size,
+            "sha256": sha256 or self.DIGEST}), encoding="utf-8")
+
+    def offset(self):
+        return self.controller._resume_offset(self.partial, self.meta, self.URL,
+                                              len(self.PACKAGE), self.DIGEST)
+
+    def test_a_matching_partial_is_resumable(self):
+        self.write_partial(self.PACKAGE[:9])
+        self.assertEqual(self.offset(), 9)
+
+    def test_a_partial_from_another_package_is_discarded(self):
+        # 任何一项不同都意味着这是别的包留下的字节：拼起来就是坏文件。
+        mismatches = (
+            {"url": "https://github.com/other/repo/x.msi"},
+            {"size": len(self.PACKAGE) + 1},
+            {"sha256": "0" * 64},
+        )
+        for mismatch in mismatches:
+            with self.subTest(field=next(iter(mismatch))):
+                self.write_partial(self.PACKAGE[:9], **mismatch)
+                self.assertEqual(self.offset(), 0)
+
+    def test_a_complete_or_absent_partial_is_not_a_resume_point(self):
+        self.write_partial(self.PACKAGE)
+        self.assertEqual(self.offset(), 0, "a full file is the finished product, not a partial")
+        self.partial.unlink()
+        self.assertEqual(self.offset(), 0)
+        self.partial.write_bytes(b"")
+        self.assertEqual(self.offset(), 0)
+
+    def test_a_corrupt_metadata_file_is_ignored_rather_than_trusted(self):
+        self.partial.write_bytes(self.PACKAGE[:9])
+        for junk in ("{ not json", "[]", '{"url": 1}', '""'):
+            with self.subTest(junk=junk):
+                self.meta.write_text(junk, encoding="utf-8")
+                self.assertEqual(self.offset(), 0)
+
+    def test_a_resumed_download_produces_the_identical_package(self):
+        # 端到端：前半段已经在盘上，第二次连接只取剩下的，最后必须是同一个整包。
+        head, tail = self.PACKAGE[:9], self.PACKAGE[9:]
+        self.write_partial(head)
+        requested = []
+
+        class PartialResponse(io.BytesIO):
+            def __init__(self, data):
+                super().__init__(data)
+                self.status = 206
+
+        def served(url, headers=None):
+            requested.append(headers)
+            return PartialResponse(tail)
+
+        destination = self.cache / "youziauth-1.5.0.msi"
+        with patch("app_update._open", side_effect=served), patch("app_update.verify_msi"):
+            self.controller._download(self.URL, len(self.PACKAGE), destination, "1.5.0",
+                                      self.DIGEST, "ab" * 64)
+        self.assertEqual(requested, [{"Range": f"bytes={len(head)}-"}],
+                         "the resume request must ask only for the missing bytes")
+        self.assertEqual(destination.read_bytes(), self.PACKAGE)
+        self.assertFalse(self.partial.exists(), "the partial must be consumed")
+        self.assertFalse(self.meta.exists(), "and so must its metadata")
+
+    def test_a_server_that_ignores_the_range_still_yields_a_correct_package(self):
+        # 忽略 Range 的服务器会回 200 + 全量。这时必须丢掉已有字节重写，而不是把
+        # 全量追加到半成品后面 —— 那会得到一个两倍长的坏文件。
+        self.write_partial(self.PACKAGE[:9])
+
+        class FullResponse(io.BytesIO):
+            def __init__(self, data):
+                super().__init__(data)
+                self.status = 200
+
+        destination = self.cache / "youziauth-1.5.0.msi"
+        with patch("app_update._open", side_effect=lambda url, headers=None: FullResponse(self.PACKAGE)), \
+                patch("app_update.verify_msi"):
+            self.controller._download(self.URL, len(self.PACKAGE), destination, "1.5.0",
+                                      self.DIGEST, "ab" * 64)
+        self.assertEqual(destination.read_bytes(), self.PACKAGE)
 
 
 if __name__ == '__main__':
