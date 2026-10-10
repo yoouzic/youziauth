@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import dorm_points
+import proxy_rules
 from desktop_bridge import DesktopBridge, PreviewBridge
 from campus_auth_gui import GuiSettings
 from dorm_accounts import DormAccounts
@@ -98,6 +99,80 @@ class DesktopBridgeTests(unittest.TestCase):
         state = self.bridge.snapshot()
         self.assertIs(state['dorm']['has_session'], False)
         self.assertEqual(state['network']['username'], 'student')
+
+    def test_proxy_section_is_present_and_shaped_for_the_ui(self):
+        state = self.bridge.snapshot()
+        proxy = state['proxy']
+        for key in ('found', 'client', 'file', 'missing', 'pending', 'ok',
+                    'blocked_by', 'message', 'can_apply', 'needs_reload', 'rules'):
+            self.assertIn(key, proxy)
+        self.assertIsInstance(proxy['message'], str)
+
+    def test_a_broken_proxy_config_does_not_break_the_panel(self):
+        """读不动别人的代理配置，只能是这块降级，绝不能让整个面板变成「后台连不上」。"""
+        import proxy_rules
+
+        with patch('desktop_bridge.proxy_rules.inspect', side_effect=OSError('读取被拒绝')):
+            self.bridge._proxy_cache = None
+            proxy = self.bridge.snapshot()['proxy']
+
+        self.assertFalse(proxy['found'])
+        self.assertFalse(proxy['can_apply'])
+        self.assertEqual(proxy['missing'], [])
+        self.assertEqual(proxy['blocked_by'], '代理配置无法读取')
+
+    def test_apply_is_refused_when_there_is_nothing_to_write(self):
+        import proxy_rules
+
+        clean = proxy_rules.ProxyRuleReport(
+            client='clash-verge-rev', root=Path(self.tmp.name), profile='p',
+            rules_file=Path(self.tmp.name) / 'RULES01.yaml',
+        )
+        with patch('desktop_bridge.proxy_rules.inspect', return_value=clean):
+            self.bridge._proxy_cache = None
+            result = self.bridge.dispatch('proxy_rules_apply')
+
+        self.assertTrue(result['ok'])
+        self.assertIn('already go DIRECT', result['message'])
+
+    def test_apply_writes_and_says_a_reload_is_needed(self):
+        import proxy_rules
+
+        needs_rule = proxy_rules.ProxyRuleReport(
+            client='clash-verge-rev', root=Path(self.tmp.name), profile='p',
+            rules_file=Path(self.tmp.name) / 'RULES01.yaml',
+            missing_hosts=proxy_rules.NCSI_SUFFIXES,
+        )
+        pending = proxy_rules.ProxyRuleReport(
+            client='clash-verge-rev', root=Path(self.tmp.name), profile='p',
+            rules_file=Path(self.tmp.name) / 'RULES01.yaml',
+            pending_hosts=proxy_rules.NCSI_SUFFIXES,
+        )
+        written = Path(self.tmp.name) / 'RULES01.yaml'
+        with patch('desktop_bridge.proxy_rules.inspect', side_effect=[needs_rule, pending]), \
+                patch('desktop_bridge.proxy_rules.apply', return_value=written) as apply:
+            self.bridge._proxy_cache = None
+            result = self.bridge.dispatch('proxy_rules_apply')
+
+        apply.assert_called_once()
+        self.assertTrue(result['ok'])
+        # Written but not in the running config: the user has to reload Clash.
+        self.assertIn('重新加载', result['message'])
+
+    def test_apply_reports_nothing_to_do_without_a_rules_extension(self):
+        import proxy_rules
+
+        blocked = proxy_rules.ProxyRuleReport(
+            client='clash-verge-rev', root=Path(self.tmp.name),
+            missing_hosts=proxy_rules.NCSI_SUFFIXES,
+            blocked_by='the current profile has no Rules extension',
+        )
+        with patch('desktop_bridge.proxy_rules.inspect', return_value=blocked):
+            self.bridge._proxy_cache = None
+            result = self.bridge.dispatch('proxy_rules_apply')
+
+        self.assertFalse(result['ok'])
+        self.assertIn('Rules extension', result['message'])
 
     def test_blank_password_is_preserved_by_existing_storage_contract(self):
         with patch('desktop_bridge.gui.save_gui_settings') as save:
@@ -273,6 +348,19 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertIn('模拟', preview.snapshot()['location']['message'])
         self.assertFalse(preview.dispatch('location_source_save', {'location_source': 'unknown'})['ok'])
         self.assertEqual(preview.snapshot()['dorm']['settings']['location_source'], 'simulation')
+
+    def test_preview_bridge_offers_the_proxy_hint_without_touching_anything(self):
+        preview = PreviewBridge()
+        proxy = preview.snapshot()['proxy']
+
+        # 演示必须能看见这条提示，但绝不能真的去读写别人的代理配置。
+        self.assertTrue(proxy['can_apply'])
+        self.assertEqual(proxy['missing'], list(proxy_rules.NCSI_SUFFIXES))
+
+        self.assertTrue(preview.dispatch('proxy_rules_apply')['ok'])
+        self.assertFalse(preview.snapshot()['proxy']['can_apply'])
+        # 再点一次就没有可写的了，不能重复「补写」。
+        self.assertFalse(preview.dispatch('proxy_rules_apply')['ok'])
 
     def test_valid_save_can_recover_corrupt_settings(self):
         self.controller.store = Store(Path(self.tmp.name))

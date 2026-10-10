@@ -17,6 +17,7 @@ import agent_ipc
 import campus_auth
 import campus_auth_gui as gui
 import dorm_points
+import proxy_rules
 import windows_notifications
 from dorm_accounts import MAX_ACCOUNTS, AccountError, DormAccounts
 from dorm_checkin import Settings, now
@@ -48,6 +49,10 @@ TILE_URL = TILE_PROVIDERS[0]['url']
 TILE_ATTRIBUTION = TILE_PROVIDERS[0]['attribution']
 TILE_MAX_ZOOM = TILE_PROVIDERS[0]['max_zoom']
 SIMULATION_SAMPLE = 'location-sample.json'
+# Reading the proxy's config means parsing the generated config too, so it is
+# cached. The UI polls the snapshot often and the answer changes only when the
+# user edits their proxy.
+PROXY_REPORT_TTL_SECONDS = 60
 
 
 def tile_providers():
@@ -224,6 +229,7 @@ class DesktopBridge(LocationProbe):
         self._notice = None
         self._notification_tracker = windows_notifications.NotificationTracker()
         self._last_agent = None
+        self._proxy_cache = None
         self._window_action = lambda action: None
         self._updates = UpdateController(read_current_version(gui.resource_path('VERSION')),
                                          self._config.parent / 'updates',
@@ -323,6 +329,45 @@ class DesktopBridge(LocationProbe):
 
         return IdmCredentialStore()
 
+    def _proxy_report(self, force=False):
+        """Cached: does the local proxy route the Windows probe hosts DIRECT?
+
+        On a machine whose traffic goes through a proxy, those two hostnames
+        decide both Windows' captive-portal verdict and whether this app can tell
+        a healthy uplink from a broken one. When the rules are absent we can offer
+        to add them -- but only ever with the user's agreement, and only from the
+        UI process, because the config lives in the user's own AppData.
+        """
+        now = time.monotonic()
+        with self._lock:
+            cached = self._proxy_cache
+            if not force and cached is not None and now - cached[0] < PROXY_REPORT_TTL_SECONDS:
+                return cached[1]
+        try:
+            report = proxy_rules.inspect()
+        except Exception:  # noqa: BLE001 - a broken proxy config must not break the panel.
+            report = proxy_rules.ProxyRuleReport(blocked_by='代理配置无法读取')
+        with self._lock:
+            self._proxy_cache = (now, report)
+        return report
+
+    def _proxy_snapshot(self):
+        report = self._proxy_report()
+        return {
+            'found': report.found,
+            'client': report.client,
+            'file': str(report.rules_file) if report.rules_file else '',
+            'missing': list(report.missing_hosts),
+            'pending': list(report.pending_hosts),
+            'ok': report.ok,
+            'blocked_by': report.blocked_by,
+            'message': proxy_rules.describe(report),
+            # Only worth offering when there is something we can actually write.
+            'can_apply': report.needs_rule,
+            'needs_reload': report.needs_reload,
+            'rules': list(report.existing_rules),
+        }
+
     def snapshot(self):
         """Read only. Never expose passwords, tokens, coordinates or raw school payloads."""
         with self._lock:
@@ -391,6 +436,7 @@ class DesktopBridge(LocationProbe):
                     'network': gui.tail_log(gui.resolve_log_path(self._config, settings.log_file)),
                     'dorm': dorm_log,
                 },
+                'proxy': self._proxy_snapshot(),
             }
 
     def dispatch(self, action, payload=None):
@@ -472,6 +518,23 @@ class DesktopBridge(LocationProbe):
             if self._agent:
                 self._agent_command('reload-config')
             return '校园网设置已保存'
+        if action == 'proxy_rules_check':
+            return proxy_rules.describe(self._proxy_report(force=True))
+        if action == 'proxy_rules_apply':
+            # Only ever reached because the user pressed the button. The write
+            # happens here, in the UI process, so the file keeps belonging to the
+            # user rather than to the SYSTEM agent.
+            report = self._proxy_report(force=True)
+            if report.blocked_by:
+                raise RuntimeError(report.blocked_by)
+            if not report.needs_rule:
+                return proxy_rules.describe(report)
+            written = proxy_rules.apply(report)
+            after = self._proxy_report(force=True)
+            if after.needs_reload:
+                return (f'已写入 {written.name}，并备份了原文件；'
+                        '请到 Clash Verge 重新加载配置后才会生效')
+            return f'已写入 {written.name}，并备份了原文件；规则已生效'
         if action in ('network_check', 'network_start'):
             if self._agent:
                 self._agent_command('retry' if action == 'network_check' else 'reload-config')
@@ -821,6 +884,11 @@ class PreviewBridge(LocationProbe):
             'network': {'username':'2026000000', 'interval':60, 'startup':False,
                         'monitoring':False, 'busy':False, 'state':'stopped',
                         'message':'尚未检测，点击即可查看连接状态', 'checked':'', 'has_password':True},
+            # 演示里默认演「检测到代理缺少直连规则」，好让这条提示能被看见和点。
+            'proxy': {'found':True, 'client':'clash-verge-rev', 'file':'演示/RULES01.yaml',
+                      'missing':['msftconnecttest.com', 'msftncsi.com'], 'pending':[],
+                      'ok':False, 'blocked_by':'', 'can_apply':True, 'needs_reload':False,
+                      'rules':[], 'message':'演示：检测到代理缺少 Windows 探测域名的直连规则'},
             'dorm': {'state':'idle', 'message':'查询今日任务，开始今晚的安排', 'busy':False,
                      'settings':dataclasses.asdict(Settings()), 'schedule':'自动打卡：关闭', 'task':None,
                      # 真实 bridge 会补上这三项；演示里也让它们跟着账号走，界面文案才自洽。
@@ -953,6 +1021,15 @@ class PreviewBridge(LocationProbe):
         payload = payload or {}
         n, d = self._data['network'], self._data['dorm']
         try:
+            if action == 'proxy_rules_apply':
+                proxy = self._data['proxy']
+                if not proxy['can_apply']:
+                    return {'ok': False, 'message': proxy['message']}
+                proxy.update(can_apply=False, ok=True, missing=[],
+                             message='演示：已模拟补写直连规则（没有读写任何代理配置）。')
+                return {'ok': True, 'message': '演示：已补写直连规则，并备份了原文件。'}
+            if action == 'proxy_rules_check':
+                return {'ok': True, 'message': self._data['proxy']['message']}
             if action == 'update_check':
                 if self._data['update']['busy']:
                     return {'ok': False, 'message': '演示更新正在进行，请稍候。'}
