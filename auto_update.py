@@ -42,6 +42,7 @@ import json
 import os
 import sys
 import tempfile
+import traceback
 import time
 from pathlib import Path
 
@@ -276,10 +277,17 @@ class Updater:
                 state="error", current_version=current, checked=_timestamp(),
                 message=str(exc), detail="verification failed"))
         except Exception as exc:  # noqa: BLE001 - the agent must survive any update failure
+            # 只留异常类型名是不够的：真实安装上出过一次 TypeError，日志里只有「TypeError」
+            # 三个字，既不知道在哪一行，也不知道哪个值不对。把最后一段调用栈压缩进 detail，
+            # 下次再出问题就能直接读出来。detail 会进状态文件和日志，所以只取帧位置。
+            where = " > ".join(
+                "{0}:{1}".format(Path(frame.filename).name, frame.lineno)
+                for frame in traceback.extract_tb(exc.__traceback__)[-3:])
             return _report(self._report, UpdateStatus(
                 state="error", current_version=current, checked=_timestamp(),
                 message="后台自动更新未完成，将在下次检查时重试。",
-                detail=type(exc).__name__))
+                detail=("{0} @ {1}".format(type(exc).__name__, where) if where
+                        else type(exc).__name__)))
         finally:
             controller.close()
 
