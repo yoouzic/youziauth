@@ -7,6 +7,12 @@ import unittest
 from pathlib import Path
 
 import agent_ipc
+
+# 这些等待只在「测试自己放行之后」才需要走完，所以给得足够宽：
+# 在 CI 上线程调度比开发机慢得多，卡着 3 秒会让状态发布落在轮询窗口之外 —— 
+# 测试失败的原因就成了机器快慢，而不是被测行为。
+UPDATE_RELEASE_TIMEOUT = 30
+UPDATE_SETTLE_TIMEOUT = 30
 import auto_update
 import campus_auth
 import network_probe
@@ -233,7 +239,7 @@ class AgentLoopTests(unittest.TestCase):
         class SlowUpdater:
             def run_cycle(inner, progress=None):
                 started.set()
-                finish.wait(3)
+                finish.wait(UPDATE_RELEASE_TIMEOUT)
                 return auto_update.UpdateStatus(state='installed', current_version='1.9.0',
                                                 latest_version='1.9.0', progress=100,
                                                 message='已自动更新到 v1.9.0。')
@@ -245,7 +251,7 @@ class AgentLoopTests(unittest.TestCase):
             # 回来的时候更新还没结束 —— 这就是「不阻塞指令通道」。
             self.assertNotEqual(snapshot.update.get('state'), 'installed')
             finish.set()
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + UPDATE_SETTLE_TIMEOUT
             while agent.snapshot.update.get('state') != 'installed' and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertEqual(agent.snapshot.update.get('state'), 'installed')
@@ -265,7 +271,7 @@ class AgentLoopTests(unittest.TestCase):
             def run_cycle(inner, progress=None):
                 inner.calls += 1
                 entered.set()
-                release.wait(3)
+                release.wait(UPDATE_RELEASE_TIMEOUT)
                 return auto_update.UpdateStatus(state='up_to_date', message='已是最新。')
 
         updater = BlockingUpdater()
@@ -276,7 +282,7 @@ class AgentLoopTests(unittest.TestCase):
             agent.request_update_check()
             agent.request_update_check()
             release.set()
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + UPDATE_SETTLE_TIMEOUT
             while updater.calls < 1 and time.monotonic() < deadline:
                 time.sleep(0.02)
             time.sleep(0.1)
