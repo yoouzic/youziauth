@@ -183,6 +183,7 @@ class Updater:
         *,
         controller_factory=UpdateController,
         installer=None,
+        agent_relaunch=None,
         report=None,
         relaunch=None,
         log_dir: Path | None = None,
@@ -195,6 +196,7 @@ class Updater:
         self._installer = installer
         self._report = report
         self._relaunch = relaunch
+        self._relaunch_agent = agent_relaunch
 
     def _install(self, package, version, digest, signature, on_launch):
         from windows_update import install_msi
@@ -202,6 +204,20 @@ class Updater:
         installer = self._installer or install_msi
         return installer(package, self.executable, version, digest, on_launch,
                          signature, silent=True, log_dir=self.log_dir)
+
+    def _restart_agent(self) -> bool:
+        """Start the privileged agent again after the installer stopped it.
+
+        The window coming back is not enough: the agent is the half that performs the
+        *next* update, and its task only fires at boot. Leaving it down turns a working
+        unattended update into a one-shot.
+        """
+        if self._relaunch_agent is None:
+            return False
+        try:
+            return bool(self._relaunch_agent())
+        except Exception:  # noqa: BLE001 - a failed restart is reported, not raised
+            return False
 
     def _relaunch_tray(self) -> bool:
         """Put the window back in the user's session after the installer killed it.
@@ -271,7 +287,13 @@ class Updater:
 
             result = self._install(package, version, digest, signature, on_launch)
             tray = self._relaunch_tray()
-            return _report(self._report, self._status_from_install(result, version, tray))
+            agent = self._restart_agent()
+            status = self._status_from_install(result, version, tray)
+            if agent:
+                # 两个进程都由安装器停掉：窗口回来了、agent 也必须回来，
+                # 否则下一次自动更新不会发生（它的任务只在开机时触发）。
+                status = dataclasses.replace(status, detail="agent restarted")
+            return _report(self._report, status)
         except UpdateVerificationError as exc:
             return _report(self._report, UpdateStatus(
                 state="error", current_version=current, checked=_timestamp(),

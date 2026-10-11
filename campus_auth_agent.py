@@ -467,7 +467,8 @@ def build_updater(app_dir: Path) -> tuple:
         return None, "源码运行：后台自动更新只在安装版里启用"
     try:
         import auto_update
-        from startup_tasks import install_dir_for_current_process, run_tray_task
+        from startup_tasks import (install_dir_for_current_process, run_agent_task,
+                               run_tray_task)
 
         install_dir = install_dir_for_current_process()
         if install_dir is None:
@@ -482,6 +483,7 @@ def build_updater(app_dir: Path) -> tuple:
             cache_dir=Path(app_dir) / "updates",
             executable=install_dir / "youziauth.exe",
             relaunch=run_tray_task,
+        agent_relaunch=run_agent_task,
             log_dir=Path(app_dir) / "updates",
         )
         return updater, ""

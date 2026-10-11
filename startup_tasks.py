@@ -194,6 +194,31 @@ def install_dir_for_current_process(executable: Path | None = None) -> Path | No
     return candidate if candidate.is_dir() else None
 
 
+def run_agent_task(
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> bool:
+    """Ask Task Scheduler to start the privileged agent again.
+
+    The installer stops both processes, so a successful silent update leaves the machine
+    with the window back but no agent -- and the agent is what performs the *next*
+    update. The task only fires at boot, so without this a machine would update once and
+    then never again until it restarted. Observed live: after 1.8.25 -> 1.8.26 the agent
+    was gone and the named pipe answered nothing until it was started by hand.
+    """
+    try:
+        result = runner(
+            [
+                str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "schtasks.exe"),
+                "/Run", "/TN", SYSTEM_TASK_NAME,
+            ],
+            shell=False, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(getattr(result, "returncode", 1) == 0)
+
+
 def run_tray_task(
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> bool:

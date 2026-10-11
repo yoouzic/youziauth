@@ -391,5 +391,102 @@ class RetryTests(unittest.TestCase):
         self.assertIn("签名", status.message)
 
 
+class AgentRecoveryTests(unittest.TestCase):
+    """A successful update must leave the agent running.
+
+    The installer stops both processes. Relaunching only the window turns unattended
+    updating into a one-shot: the agent is what performs the next update, and its task
+    only fires at boot. Observed live - after 1.8.25 -> 1.8.26 the window was back but
+    the agent was gone, and nine hours later (no reboot) it still had not returned.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.install = self.root / "install"
+        self.install.mkdir()
+        (self.install / "VERSION").write_text("1.8.25\n", encoding="utf-8")
+        self.cache = self.root / "cache"
+        self.cache.mkdir()
+
+    READY = {
+        "state": "ready", "latest_version": "1.8.26", "progress": 100,
+        "checked": "2026-10-11 01:00", "message": "ok", "changes": {},
+    }
+
+    def build(self, agent_relaunch):
+        class Controller:
+            _worker = None
+            def __init__(inner, *a, **k): pass
+            def check(inner): pass
+            def snapshot(inner): return dict(self.READY)
+            def package(inner): return Path("p.msi"), "1.8.26", "a" * 64, "b" * 128
+            def close(inner): pass
+
+        return Updater(install_dir=self.install, cache_dir=self.cache,
+                       executable=self.install / "youziauth.exe",
+                       controller_factory=lambda *a, **k: Controller(),
+                       installer=lambda *a, **k: {"code": 0, "healthy": True, "relaunched": True},
+                       relaunch=lambda: True,
+                       agent_relaunch=agent_relaunch)
+
+    def test_the_agent_is_started_again_after_a_successful_install(self):
+        calls = []
+        status = self.build(lambda: calls.append("agent") or True).run_cycle()
+        self.assertEqual(calls, ["agent"], "the agent must be started again")
+        self.assertEqual(status.state, "installed")
+        self.assertEqual(status.detail, "agent restarted")
+
+    def test_a_failed_restart_is_reported_but_does_not_fail_the_update(self):
+        # 更新已经装好了，agent 没拉起来不该让整件事变成失败。
+        def boom():
+            raise OSError("schtasks is unavailable")
+
+        status = self.build(boom).run_cycle()
+        self.assertEqual(status.state, "installed")
+        self.assertNotEqual(status.detail, "agent restarted")
+
+    def test_no_runner_configured_is_not_an_error(self):
+        self.assertFalse(self.build(None)._restart_agent())
+
+
+class AgentTaskRunnerTests(unittest.TestCase):
+    """run_agent_task asks Task Scheduler for the agent's own task."""
+
+    def test_it_runs_the_system_agent_task(self):
+        import startup_tasks
+        seen = {}
+
+        class Result:
+            returncode = 0
+
+        def runner(command, **kwargs):
+            seen["command"] = command
+            seen["kwargs"] = kwargs
+            return Result()
+
+        self.assertTrue(startup_tasks.run_agent_task(runner=runner))
+        self.assertEqual(seen["command"][1:], ["/Run", "/TN", startup_tasks.SYSTEM_TASK_NAME])
+        self.assertTrue(seen["command"][0].lower().endswith("schtasks.exe"))
+        self.assertFalse(seen["kwargs"].get("check", True), "a failure is returned, not raised")
+
+    def test_a_failing_runner_returns_false(self):
+        import startup_tasks
+
+        class Result:
+            returncode = 1
+
+        self.assertFalse(startup_tasks.run_agent_task(runner=lambda *a, **k: Result()))
+
+    def test_an_unavailable_schtasks_returns_false(self):
+        import startup_tasks
+
+        def runner(*args, **kwargs):
+            raise OSError("not found")
+
+        self.assertFalse(startup_tasks.run_agent_task(runner=runner))
+
+
 if __name__ == '__main__':
     unittest.main()
