@@ -13,9 +13,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -405,6 +408,222 @@ class InstallGuardsTests(unittest.TestCase):
             self.assertEqual(self.install(), 3010)
         self.assertEqual(events, ["verify", "worker", "observe"])
 
+    def test_silent_install_preserves_the_workers_complete_result(self):
+        result = {"code": 0, "relaunched": True, "healthy": True, "agent_restarted": True}
+        with patch.object(update, "_run_verifier", return_value=0), \
+             patch.object(update, "_start_worker", return_value=4321) as start, \
+             patch.object(update, "_observe_worker", return_value=result) as observe:
+            self.assertEqual(self.install(silent=True, log_dir=self.root), result)
+        self.assertTrue(observe.call_args.kwargs.get("full_result"),
+                        "the SYSTEM caller needs recovery and health fields, not only an exit code")
+        self.assertEqual(start.call_args.kwargs.get("result_path"), self.root / "install-result.json")
+
+
+class WorkerResultTests(unittest.TestCase):
+    def observe(self, result, *, full_result=False):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api = Mock()
+            api.OpenProcess.return_value = 0
+            def statuses(path):
+                return result if path.name == "final.json" else {"pid": 123}
+            with patch.object(update, "_kernel32", return_value=api), \
+                 patch.object(update, "_read_status", side_effect=statuses):
+                if full_result:
+                    return update._observe_worker(123, root, lambda: None, full_result=True)
+                return update._observe_worker(123, root, lambda: None)
+
+    def test_manual_install_accepts_relaunch_fields_but_still_returns_an_integer(self):
+        self.assertEqual(self.observe({"code": 0, "relaunched": True}), 0)
+
+    def test_silent_observer_returns_health_and_recovery_fields(self):
+        result = {"code": 0, "relaunched": True, "healthy": False,
+                  "agent_restarted": True, "launch_exit_code": 3221225477}
+        self.assertEqual(self.observe(result, full_result=True), result)
+
+    def test_malformed_optional_fields_and_unknown_fields_are_refused(self):
+        for result in ({"code": 0, "healthy": "false"}, {"code": 0, "relaunched": 1},
+                       {"code": 0, "agent_restarted": None},
+                       {"code": 0, "launch_exit_code": True},
+                       {"code": 0, "launch_exit_code": 0x100000000},
+                       {"code": 0, "unexpected": True}, {"code": 0, "error": 20},
+                       {"code": True}, {"code": 0x100000000}):
+            with self.subTest(result=result):
+                with self.assertRaises(update.UpdateVerificationError):
+                    self.observe(result)
+
+
+class DetachedRecoveryTests(unittest.TestCase):
+    """Exercise completion in a real PowerShell process without an installer or tasks."""
+
+    def run_script(self, body, *, environment=None):
+        self.assertTrue(hasattr(update, "_WORKER_RECOVERY"),
+                        "a detached worker must own persistence and recovery after its parent dies")
+        script = ("$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n"
+                  "[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)\n" +
+                  update._WORKER_RECOVERY + "\n" + body)
+        env = os.environ.copy()
+        env.update(environment or {})
+        completed = subprocess.run(
+            [str(update._system_tool("WindowsPowerShell/v1.0/powershell.exe")),
+             "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded(script)],
+            env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+            creationflags=0x08000000,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def completion(self, code, *, healthy=True, quiet=True):
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "install-result.json"
+            body = r'''
+$script:calls = @()
+$script:before = @()
+function Start-UpdateTask($name) {
+    $script:before += (Get-Content -LiteralPath $env:YOUZIAUTH_UPDATE_RESULT -Raw | ConvertFrom-Json)
+    $script:calls += $name
+    return $true
+}
+function Test-AgentHealthy { return ($env:TEST_HEALTHY -eq '1') }
+$quiet = ($env:TEST_QUIET -eq '1')
+$request = [pscustomobject]@{ properties = [pscustomobject]@{ ProductVersion = '1.2.3' } }
+$final = @{ code = [int]$env:TEST_INSTALL_CODE }
+Complete-Install $final
+@{ result = $final; calls = @($script:calls); before = @($script:before);
+   record = (Get-Content -LiteralPath $env:YOUZIAUTH_UPDATE_RESULT -Raw | ConvertFrom-Json) } |
+    ConvertTo-Json -Compress -Depth 6
+'''
+            return self.run_script(body, environment={
+                "YOUZIAUTH_UPDATE_RESULT": str(record), "TEST_INSTALL_CODE": str(code),
+                "TEST_HEALTHY": "1" if healthy else "0",
+                "TEST_QUIET": "1" if quiet else "0",
+            })
+
+    def test_surviving_worker_records_success_before_running_tasks(self):
+        value = self.completion(0)
+        self.assertEqual(value["calls"], [r"\youziauth\SystemAgent", r"\youziauth\Tray"])
+        self.assertEqual(value["before"][0]["result"], {"code": 0})
+        self.assertEqual(value["record"]["version"], "1.2.3")
+        self.assertRegex(value["record"]["checked"], r"^\d{4}-\d{2}-\d{2}T.*(?:Z|\+00:00)$")
+        self.assertEqual(value["record"]["result"],
+                         {"code": 0, "relaunched": True, "healthy": True, "agent_restarted": True})
+
+    def test_an_unresponsive_agent_is_not_reported_as_healthy(self):
+        value = self.completion(0, healthy=False)
+        self.assertFalse(value["record"]["result"]["healthy"])
+        self.assertTrue(value["record"]["result"]["agent_restarted"])
+
+    def test_failed_and_cancelled_silent_installs_restore_tasks_and_keep_original_exit_code(self):
+        for code in (1603, 1618, 1602):
+            with self.subTest(code=code):
+                value = self.completion(code)
+                self.assertEqual(value["calls"], [r"\youziauth\SystemAgent", r"\youziauth\Tray"])
+                self.assertEqual(value["before"][0]["result"], {"code": code})
+                self.assertEqual(value["record"]["result"], {
+                    "code": code, "relaunched": True, "healthy": True, "agent_restarted": True})
+
+    def test_failed_silent_install_does_not_replace_its_exit_code_when_recovery_is_unhealthy(self):
+        value = self.completion(1603, healthy=False)
+        self.assertEqual(value["record"]["result"]["code"], 1603)
+        self.assertFalse(value["record"]["result"]["healthy"])
+
+    def test_reboot_required_install_is_persisted_without_starting_pending_payload(self):
+        value = self.completion(3010)
+        self.assertEqual(value["calls"], [])
+        self.assertEqual(value["record"]["result"], {"code": 3010})
+
+    def test_failed_interactive_install_does_not_launch_the_application(self):
+        value = self.completion(1603, quiet=False)
+        self.assertEqual(value["calls"], [])
+        self.assertEqual(value["record"]["result"], {"code": 1603})
+
+    def test_status_probe_uses_the_real_message_pipe_protocol(self):
+        import agent_ipc
+        name = "youziauth-test-health-" + os.urandom(8).hex()
+        seen = []
+        server = agent_ipc.NamedPipeServer(name, lambda command: seen.append(command.command) or {
+            "ok": True, "snapshot": {"boot_id": "test-boot", "state": "waiting_for_network"}})
+        thread = threading.Thread(target=server.serve_once, daemon=True)
+        thread.start()
+        value = self.run_script(
+            "@{ healthy = (Test-AgentHealthy -pipeName $env:TEST_PIPE -timeoutMs 1500) } | ConvertTo-Json",
+            environment={"TEST_PIPE": name},
+        )
+        thread.join(2)
+        self.assertFalse(thread.is_alive(), "the probe must consume the reply and disconnect")
+        self.assertEqual(seen, ["status"])
+        self.assertTrue(value["healthy"])
+
+    def test_absent_pipe_is_not_healthy(self):
+        value = self.run_script(
+            "@{ healthy = (Test-AgentHealthy -pipeName $env:TEST_PIPE -timeoutMs 200) } | ConvertTo-Json",
+            environment={"TEST_PIPE": "youziauth-test-missing-" + os.urandom(8).hex()},
+        )
+        self.assertFalse(value["healthy"])
+
+    def test_a_reply_without_a_valid_agent_snapshot_is_not_healthy(self):
+        import agent_ipc
+        name = "youziauth-test-invalid-health-" + os.urandom(8).hex()
+        server = agent_ipc.NamedPipeServer(name, lambda command: {
+            "ok": True, "snapshot": {"boot_id": "test-boot", "state": "invented-state"}})
+        thread = threading.Thread(target=server.serve_once, daemon=True)
+        thread.start()
+        value = self.run_script(
+            "@{ healthy = (Test-AgentHealthy -pipeName $env:TEST_PIPE -timeoutMs 400) } | ConvertTo-Json",
+            environment={"TEST_PIPE": name},
+        )
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(value["healthy"])
+
+    def test_an_agent_that_connects_but_never_replies_is_bounded(self):
+        import agent_ipc
+        name = "youziauth-test-stalled-health-" + os.urandom(8).hex()
+        def slow_reply(command):
+            time.sleep(1)
+            return {"ok": True, "snapshot": {"boot_id": "test", "state": "waiting_for_network"}}
+        server = agent_ipc.NamedPipeServer(name, slow_reply)
+        def serve():
+            try:
+                server.serve_once()
+            except OSError:
+                pass  # The probe disconnects before this deliberately late reply.
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        value = self.run_script(
+            "@{ healthy = (Test-AgentHealthy -pipeName $env:TEST_PIPE -timeoutMs 200) } | ConvertTo-Json",
+            environment={"TEST_PIPE": name},
+        )
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(value["healthy"])
+
+    def test_verification_errors_are_persisted_without_running_tasks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "install-result.json"
+            value = self.run_script(r'''
+$quiet = $true
+$request = [pscustomobject]@{ properties = [pscustomobject]@{ ProductVersion = '1.2.3' } }
+function Start-UpdateTask { throw 'verification-must-not-start-a-task' }
+Complete-Install @{ error = 15 }
+Get-Content -LiteralPath $env:YOUZIAUTH_UPDATE_RESULT -Raw
+''', environment={"YOUZIAUTH_UPDATE_RESULT": str(record)})
+            self.assertEqual(value["result"], {"error": 15})
+
+    def test_all_shipped_scripts_parse_in_windows_powershell(self):
+        value = self.run_script(r'''
+$scripts = $env:TEST_SCRIPTS | ConvertFrom-Json
+$failures = @()
+foreach ($script in $scripts) {
+    $tokens = $null
+    $errors = $null
+    $null = [Management.Automation.Language.Parser]::ParseInput($script, [ref]$tokens, [ref]$errors)
+    $failures += @($errors | ForEach-Object { $_.Message })
+}
+@{ failures = @($failures) } | ConvertTo-Json -Compress
+''', environment={"TEST_SCRIPTS": json.dumps([update._WORKER, update._LAUNCHER, update._POWERSHELL])})
+        self.assertEqual(value["failures"], [])
+
 
 class ProcessBoundaryTests(unittest.TestCase):
     """Script and command construction must stay fixed and path-free."""
@@ -446,6 +665,7 @@ class ProcessBoundaryTests(unittest.TestCase):
         self.assertEqual(command[1:4], ["-NoProfile", "-NonInteractive", "-EncodedCommand"])
         self.assertEqual(len(command), 5)
         self.assertIs(options["shell"], False)
+        self.assertEqual(options["stdin"], subprocess.DEVNULL)
         self.assertLessEqual(options["timeout"], 20)
         self.assertEqual(options["creationflags"], 0x08000000)
         self.assertEqual(options["env"]["YOUZIAUTH_UPDATE_MSI"], str(self.release.msi))
@@ -462,6 +682,19 @@ class ProcessBoundaryTests(unittest.TestCase):
         self.assertTrue(directory.is_absolute())
         self.assertNotEqual(directory, self.root)
 
+    def test_msi_metadata_reader_does_not_inherit_a_windowless_process_stdin(self):
+        completed = subprocess.CompletedProcess([], 0, json.dumps({"properties": PROPERTIES}), "")
+        with patch.object(update.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(update._msi_properties(self.release.msi), PROPERTIES)
+        command = run.call_args.args[0]
+        options = run.call_args.kwargs
+        self.assertEqual(command[1:4], ["-NoProfile", "-NonInteractive", "-EncodedCommand"])
+        self.assertEqual(options["stdin"], subprocess.DEVNULL)
+        self.assertEqual(options["stdout"], subprocess.PIPE)
+        self.assertEqual(options["stderr"], subprocess.DEVNULL)
+        self.assertEqual(options["env"]["YOUZIAUTH_UPDATE_MSI"], str(self.release.msi))
+        self.assertNotIn(str(self.release.msi), base64.b64decode(command[4]).decode("utf-16le"))
+
     def test_worker_calls_the_verifier_by_request_file(self):
         # The MSI path and payload travel through a file, so no externally
         # controlled text can become part of a command line.
@@ -469,6 +702,25 @@ class ProcessBoundaryTests(unittest.TestCase):
         self.assertIn("YOUZIAUTH_UPDATE_REQUEST_FILE", update._WORKER)
         self.assertIn("YOUZIAUTH_UPDATE_RESPONSE_FILE", update._WORKER)
         self.assertNotIn("YOUZIAUTH_UPDATE_PAYLOAD", update._WORKER)
+
+    def test_silent_worker_receives_log_and_persistent_result_paths_as_data(self):
+        directory = Path(tempfile.mkdtemp(prefix="youziauth-update-", dir=self.root)).resolve()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        log = self.root / "updates" / "msi-install.log"
+        result = self.root / "updates" / "install-result.json"
+        completed = subprocess.CompletedProcess([], 0, '{"pid":321}', "")
+        with patch.object(update.subprocess, "run", return_value=completed) as run:
+            update._start_worker(self.release.msi, self.anchor, VERSION, self.release.size,
+                                 self.release.sha256, self.release.signature,
+                                 self.release.payload, directory, silent=True,
+                                 log_path=log, result_path=result)
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["YOUZIAUTH_UPDATE_SILENT"], "1")
+        self.assertEqual(environment["YOUZIAUTH_UPDATE_LOG"], str(log))
+        self.assertEqual(environment["YOUZIAUTH_UPDATE_RESULT"], str(result))
+        source = base64.b64decode(run.call_args.args[0][4]).decode("utf-16le")
+        self.assertNotIn(str(log), source)
+        self.assertNotIn(str(result), source)
 
     def test_worker_and_launcher_scripts_are_encoded_once(self):
         self.assertEqual(base64.b64decode(update._ENCODED_WORKER).decode("utf-16le"), update._WORKER)

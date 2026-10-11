@@ -362,10 +362,24 @@ def tail_log(path: Path, max_lines: int = DEFAULT_LOG_LINES) -> str:
 
 
 def resolve_log_path(config_path: Path, log_file: str) -> Path:
+    if Path(config_path).resolve() == Path(DEFAULT_CONFIG_PATH).resolve():
+        from system_storage import default_system_storage_path
+        protected_log = default_system_storage_path() / "logs" / "agent.log"
+        if protected_log.is_file():
+            return protected_log
     path = Path(log_file or "campus_auth.log")
     if path.is_absolute():
         return path
     return config_path.parent / path
+
+
+def agent_runtime_path(config_path: Path) -> Path:
+    if Path(config_path).resolve() == Path(DEFAULT_CONFIG_PATH).resolve():
+        from system_storage import default_system_storage_path
+        protected = default_system_storage_path() / "runtime.json"
+        if protected.is_file():
+            return protected
+    return Path(config_path).parent / "runtime.json"
 
 
 def default_startup_dir() -> Path:
@@ -662,7 +676,7 @@ class CampusAuthGui:
             snapshot = None
             try:
                 snapshot = agent_ipc.read_snapshot(
-                    self.config_path.parent / "runtime.json"
+                    agent_runtime_path(self.config_path)
                 )
             except (OSError, ValueError):
                 pass

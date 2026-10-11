@@ -1,0 +1,138 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Fragment>
+    <!-- Native MSI dialogs run only in InstallUISequence. /qn updates retain the
+         Windows Installer silent path and never launch a separate UI process. -->
+    <UI Id="YouziauthInstallerUI">
+      <TextStyle Id="YouziauthNormal" FaceName="Microsoft YaHei" Size="9" />
+      <TextStyle Id="YouziauthTitle" FaceName="Microsoft YaHei" Size="12" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="YouziauthNormal" />
+      <Property Id="ErrorDialog" Value="YouziauthErrorDlg" />
+
+      <Dialog Id="YouziauthProgressDlg" Width="370" Height="230"
+              Title="[ProductName] 安装" Modeless="yes">
+        <Control Id="Title" Type="Text" X="20" Y="18" Width="330" Height="22"
+                 Text="{\YouziauthTitle}正在安装 [ProductName] [ProductVersion]"
+                 HideCondition="REMOVE~=&quot;ALL&quot;" />
+        <Control Id="RemoveTitle" Type="Text" X="20" Y="18" Width="330" Height="22"
+                 Text="{\YouziauthTitle}正在卸载 [ProductName]" Hidden="yes"
+                 ShowCondition="REMOVE~=&quot;ALL&quot;" />
+        <Control Id="Description" Type="Text" X="20" Y="55" Width="330" Height="35"
+                 Text="请稍候，安装程序正在处理文件和后台任务。完成后会显示结果。" />
+        <Control Id="ActionText" Type="Text" X="20" Y="102" Width="330" Height="18">
+          <Subscribe Event="ActionText" Attribute="Text" />
+        </Control>
+        <Control Id="Progress" Type="ProgressBar" X="20" Y="126" Width="330" Height="13"
+                 ProgressBlocks="yes" Text="安装进度">
+          <Subscribe Event="SetProgress" Attribute="Progress" />
+        </Control>
+        <Control Id="BottomLine" Type="Line" X="0" Y="187" Width="370" Height="0" />
+        <Control Id="Cancel" Type="PushButton" X="294" Y="199" Width="56" Height="18"
+                 Default="yes" Cancel="yes" Text="取消">
+          <Publish Event="SpawnDialog" Value="YouziauthCancelConfirmDlg" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="YouziauthCancelConfirmDlg" Width="290" Height="120"
+              Title="取消安装" NoMinimize="yes">
+        <Control Id="Description" Type="Text" X="20" Y="20" Width="250" Height="40"
+                 Text="确定取消当前操作？安装程序会撤销本次尚未完成的更改。" />
+        <Control Id="Yes" Type="PushButton" X="144" Y="85" Width="56" Height="18"
+                 Text="确定取消">
+          <Publish Event="EndDialog" Value="Exit" />
+        </Control>
+        <Control Id="No" Type="PushButton" X="210" Y="85" Width="56" Height="18"
+                 Default="yes" Cancel="yes" Text="继续">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="YouziauthSuccessDlg" Width="370" Height="230"
+              Title="[ProductName] 操作完成" NoMinimize="yes">
+        <Control Id="Title" Type="Text" X="20" Y="20" Width="330" Height="25"
+                 Text="{\YouziauthTitle}安装完成" HideCondition="REMOVE~=&quot;ALL&quot;" />
+        <Control Id="RemoveTitle" Type="Text" X="20" Y="20" Width="330" Height="25"
+                 Text="{\YouziauthTitle}卸载完成" Hidden="yes"
+                 ShowCondition="REMOVE~=&quot;ALL&quot;" />
+        <Control Id="Description" Type="Text" X="20" Y="65" Width="330" Height="70"
+                 Text="[ProductName] [ProductVersion] 已安装完成。可从桌面或开始菜单打开应用。"
+                 HideCondition="REMOVE~=&quot;ALL&quot;" />
+        <Control Id="RemoveDescription" Type="Text" X="20" Y="65" Width="330" Height="70"
+                 Text="[ProductName] 已卸载完成。" Hidden="yes"
+                 ShowCondition="REMOVE~=&quot;ALL&quot;" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="187" Width="370" Height="0" />
+        <Control Id="Finish" Type="PushButton" X="294" Y="199" Width="56" Height="18"
+                 Default="yes" Cancel="yes" Text="完成">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="YouziauthFailureDlg" Width="370" Height="230"
+              Title="[ProductName] 操作失败" NoMinimize="yes">
+        <Control Id="Title" Type="Text" X="20" Y="20" Width="330" Height="25"
+                 Text="{\YouziauthTitle}操作未完成" />
+        <Control Id="Description" Type="Text" X="20" Y="65" Width="330" Height="90"
+                 Text="安装程序遇到错误，未能完成操作。请根据前面的错误提示处理后重试。若问题持续，请向维护者反馈错误内容。" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="187" Width="370" Height="0" />
+        <Control Id="Finish" Type="PushButton" X="294" Y="199" Width="56" Height="18"
+                 Default="yes" Cancel="yes" Text="关闭">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="YouziauthCancelledDlg" Width="370" Height="230"
+              Title="[ProductName] 操作已取消" NoMinimize="yes">
+        <Control Id="Title" Type="Text" X="20" Y="20" Width="330" Height="25"
+                 Text="{\YouziauthTitle}操作已取消" />
+        <Control Id="Description" Type="Text" X="20" Y="65" Width="330" Height="70"
+                 Text="你已取消本次操作。如需继续，请重新打开安装包。" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="187" Width="370" Height="0" />
+        <Control Id="Finish" Type="PushButton" X="294" Y="199" Width="56" Height="18"
+                 Default="yes" Cancel="yes" Text="关闭">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
+
+      <!-- Windows Installer selects/repositions these standard button IDs to match
+           the error's requested response set (OK, retry/cancel, yes/no, etc.). -->
+      <Dialog Id="YouziauthErrorDlg" Width="330" Height="165"
+              Title="[ProductName] 安装错误" ErrorDialog="yes">
+        <Control Id="ErrorText" Type="Text" X="20" Y="18" Width="290" Height="110"
+                 NoPrefix="yes" Text="[ErrorText]" />
+        <Control Id="Y" Type="PushButton" X="137" Y="135" Width="56" Height="18" Text="是">
+          <Publish Event="EndDialog" Value="ErrorYes" />
+        </Control>
+        <Control Id="A" Type="PushButton" X="137" Y="135" Width="56" Height="18" Text="中止">
+          <Publish Event="EndDialog" Value="ErrorAbort" />
+        </Control>
+        <Control Id="C" Type="PushButton" X="137" Y="135" Width="56" Height="18" Text="取消">
+          <Publish Event="EndDialog" Value="ErrorCancel" />
+        </Control>
+        <Control Id="I" Type="PushButton" X="137" Y="135" Width="56" Height="18" Text="忽略">
+          <Publish Event="EndDialog" Value="ErrorIgnore" />
+        </Control>
+        <Control Id="N" Type="PushButton" X="137" Y="135" Width="56" Height="18" Text="否">
+          <Publish Event="EndDialog" Value="ErrorNo" />
+        </Control>
+        <Control Id="O" Type="PushButton" X="137" Y="135" Width="56" Height="18" Text="确定">
+          <Publish Event="EndDialog" Value="ErrorOk" />
+        </Control>
+        <Control Id="R" Type="PushButton" X="137" Y="135" Width="56" Height="18" Text="重试">
+          <Publish Event="EndDialog" Value="ErrorRetry" />
+        </Control>
+      </Dialog>
+
+      <ProgressText Action="InstallFiles" Message="正在复制应用文件…" />
+      <ProgressText Action="RemoveFiles" Message="正在移除旧文件…" />
+      <ProgressText Action="CreateShortcuts" Message="正在创建快捷方式…" />
+      <ProgressText Action="RegisterProduct" Message="正在登记安装信息…" />
+      <ProgressText Action="InstallFinalize" Message="正在完成安装…" />
+
+      <InstallUISequence>
+        <Show Dialog="YouziauthProgressDlg" Before="ExecuteAction" Condition="UILevel &gt;= 4" />
+        <Show Dialog="YouziauthSuccessDlg" OnExit="success" Condition="UILevel &gt;= 4" />
+        <Show Dialog="YouziauthFailureDlg" OnExit="error" Condition="UILevel &gt;= 4" />
+        <Show Dialog="YouziauthCancelledDlg" OnExit="cancel" Condition="UILevel &gt;= 4" />
+      </InstallUISequence>
+    </UI>
+  </Fragment>
+</Wix>

@@ -861,7 +861,7 @@ class DesktopBridge(LocationProbe):
         self._collect_dorm()
         if self._agent:
             try:
-                snapshot = agent_ipc.read_snapshot(self._config.parent / 'runtime.json')
+                snapshot = agent_ipc.read_snapshot(gui.agent_runtime_path(self._config))
                 state = {'online_external':'online', 'online_campus':'online',
                          'waiting_for_network':'checking', 'auth_failed':'offline'}.get(snapshot.state, 'error')
                 with self._lock:

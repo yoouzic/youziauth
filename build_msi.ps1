@@ -219,6 +219,7 @@ Assert-WixManifestIsComplete -ManifestPath $GeneratedWxs -AppDir $AppDir
 
 & $Wix --acceptEula wix7 build `
     (Join-Path $PackagingDir "youziauth.wxs") `
+    (Join-Path $PackagingDir "installer-ui.wxs") `
     $GeneratedWxs `
     -d ProductVersion=$Version `
     -out $MsiPath

@@ -43,8 +43,9 @@
 
 1. **安装后健康检查**：worker 在 `msiexec /qn` 返回 0 之后启动新版本，观察 8 秒；只有进程还活着
    才写 `healthy = true`。这个结果一路上报成界面上的状态。
-2. **持久 MSI 日志**：静默安装写 `/l*v` 到 `%ProgramData%\youziauth\updates\msi-install.log`。
-   没有向导，失败现场就在这里。
+2. **持久 MSI 日志**：静默安装写 `/l*v` 到受保护的 `%ProgramData%\youziauth-system\updates\msi-install.log`。
+   没有向导，失败现场就在日志中。1.8.28 的 SYSTEM 写入移至 Windows 已知目录
+   `%ProgramData%\youziauth-system\updates`；旧的用户可修改目录不再存放更新缓存或日志。
 3. **不会反复重装**：每次尝试前都重新读安装目录里的 `VERSION`；目标版本已经装上了就直接收工。
    于是一个「装得上但起不来」的版本只被报一次，不会变成每次检查都重装一遍的死循环。
 4. **失败保留痕迹**：健康检查失败时状态写明「已安装但程序没能启动」，并带上子进程退出码，
@@ -56,7 +57,7 @@
 auto_update.Updater.run_cycle() → UpdateStatus
         │  写进 agent 的运行时快照（agent_ipc.RuntimeSnapshot.update）
         ▼
-%ProgramData%\youziauth\runtime.json   （agent 已经在写这个文件）
+%ProgramData%\youziauth-system\runtime.json   （受保护的机器状态目录）
         ▼
 desktop_bridge._tick() 读 agent_ipc.read_snapshot()
         ▼
@@ -65,7 +66,11 @@ UpdateController.adopt(block)  ← 校验字段与状态词，多一个字段都
 app.js renderUpdates() 只读显示
 ```
 
-沿用 agent 已有的状态文件，不新增通道，也不新增运行时依赖。
+仍使用运行时快照通道。独立 worker 将安装结果写到受保护更新目录的 `install-result.json`，
+新 agent 恢复到快照，避免安装终止旧 agent 后丢失终态。界面兼容读取旧快照供迁移显示。
+
+1.8.28 的安装器在提交时恢复已启用的任务；存活 worker 也会恢复任务并通过只读 status
+命名管道核查 agent。不能依赖旧 agent 在 MSI 返回后执行收尾，因为它已经被安装器终止。
 
 ## 界面上的变化
 
@@ -82,6 +87,8 @@ app.js renderUpdates() 只读显示
   开发机上跑 agent 不会误装什么东西。
 - 需要 agent 在运行，也就是「校园网」页开启了后台自启动（SYSTEM 计划任务）。
   代理读不到时会明确写「后台自动更新未在运行」，而不是留一个永远装不上的「可以安装」状态。
+- 1.8.28 首次 MSI 在已有 SYSTEM 安装授权中默认创建两项任务，不再要求先进入界面再次提权。
+  未保存账号时仍运行更新检查，认证等待用户设置。后续升级和修复不会重新启用已关闭的后台。
 - 周期是 6 小时（`Agent.update_interval_seconds`，下限 5 分钟）。安装会终止 agent 进程本身，
   所以下一次检查的时间戳在动手**之前**就排好，重启后不会立刻又跑一遍。
 
@@ -92,6 +99,11 @@ app.js renderUpdates() 只读显示
   校园网认证也会中断十几秒。没有做「用户空闲时才装」的时间窗 —— 需要的话可以加。
 - 安装目录仍然是 perMachine，所以**首次安装**和「手动重装」仍需提权。要彻底去掉 UAC 需要改成
   perUser 安装（另一个方向的选择，见 `docs/release-signing.md` 的讨论）。
+- 用户主动关闭后台后重新启用仍需授权；首次安装的默认配置已由 MSI 完成。
+  代理核心未运行、纯 SOCKS/PAC 配置及真实连续升级验收有明确边界，详见
+  `docs/auto-update-architecture-audit.md`。
+- 更新下载每 60 秒检查一次线程与进度，整次下载最长等待一小时。超时明确失败并保留半成品，
+  后续检查可续传；不会在旧下载还忙时发起第二个下载。
 
 ## 测试覆盖
 

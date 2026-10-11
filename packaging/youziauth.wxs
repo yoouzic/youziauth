@@ -4,10 +4,15 @@
     Manufacturer="yoouzic"
     Version="$(var.ProductVersion)"
     UpgradeCode="{D029E636-7E7E-42EE-8B38-C2D455AD2AA1}"
+    Language="2052"
+    Codepage="936"
     Scope="perMachine">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of youziauth is already installed." />
+    <!-- Payload components keep their per-path GUIDs across releases. Execute
+         the elevated stop/file-copy script before removing the older product. -->
+    <MajorUpgrade Schedule="afterInstallExecute" IgnoreLanguage="yes" DowngradeErrorMessage="A newer version of youziauth is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <UIRef Id="YouziauthInstallerUI" />
     <Icon Id="YuzuAppIcon" SourceFile="assets\yuzu_app.ico" />
     <Property Id="ARPPRODUCTICON" Value="YuzuAppIcon" />
 
@@ -31,8 +36,38 @@
       Impersonate="no"
       Return="ignore" />
     <InstallExecuteSequence>
+      <Custom Action="StopYouziauthProcessesElevated" Before="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="ConfigureFirstInstallTasks" Before="InstallFinalize" Condition="NOT REMOVE AND NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+      <Custom Action="RepairInstalledTasks" Before="InstallFinalize" Condition="NOT REMOVE AND (Installed OR WIX_UPGRADE_DETECTED)" />
       <Custom Action="StopYouziauthProcesses" Before="InstallValidate" Condition="NOT REMOVE" />
     </InstallExecuteSequence>
+
+    <!-- Immediate actions cannot elevate via Impersonate=no. Stop the SYSTEM
+         process again inside the elevated transaction before file replacement. -->
+    <CustomAction
+      Id="StopYouziauthProcessesElevated"
+      Directory="SystemFolder"
+      ExeCommand="cmd.exe /c taskkill /f /t /im youziauth-agent.exe &gt;nul 2&gt;nul &amp; taskkill /f /t /im youziauth.exe &gt;nul 2&gt;nul &amp; ping -n 2 127.0.0.1 &gt;nul"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <!-- Only a committed payload may register/start its privileged agent. The
+         helper recovers the original interactive SID and preserves opt-out. -->
+    <CustomAction
+      Id="ConfigureFirstInstallTasks"
+      Directory="INSTALLFOLDER"
+      ExeCommand="&quot;[INSTALLFOLDER]youziauth-agent.exe&quot; --repair-install-tasks --first-install --install-user-sid &quot;[UserSID]&quot;"
+      Execute="commit"
+      Impersonate="no"
+      Return="check" />
+    <CustomAction
+      Id="RepairInstalledTasks"
+      Directory="INSTALLFOLDER"
+      ExeCommand="&quot;[INSTALLFOLDER]youziauth-agent.exe&quot; --repair-install-tasks --install-user-sid &quot;[UserSID]&quot;"
+      Execute="commit"
+      Impersonate="no"
+      Return="check" />
 
     <StandardDirectory Id="ProgramFilesFolder">
       <Directory Id="INSTALLFOLDER" Name="youziauth" />

@@ -153,9 +153,123 @@ try {
 """
 _ENCODED_COMMAND = base64.b64encode(_POWERSHELL.encode("utf-16le")).decode("ascii")
 
-_WORKER = r"""
+_WORKER_RECOVERY = r"""
+function Write-InstallResult($result) {
+    $target = [string]$env:YOUZIAUTH_UPDATE_RESULT
+    if (-not $target -or $null -eq $request) { return }
+    $temporary = $target + '.tmp.' + [Guid]::NewGuid().ToString('N')
+    try {
+        $record = @{ version = $request.properties.ProductVersion; result = $result;
+                     checked = [DateTimeOffset]::UtcNow.ToString('o') }
+        $bytes = [Text.Encoding]::UTF8.GetBytes(($record | ConvertTo-Json -Depth 5 -Compress))
+        $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew,
+                                  [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        } finally { $stream.Dispose() }
+        if ([IO.File]::Exists($target)) {
+            # PowerShell turns $null into an empty string for this .NET overload.
+            [IO.File]::Replace($temporary, $target, [NullString]::Value)
+        }
+        else { [IO.File]::Move($temporary, $target) }
+    } catch {
+        # Persistence failure must not replace the actual Windows Installer outcome.
+    } finally {
+        try {
+            if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+        } catch { }
+    }
+}
+function Start-UpdateTask($name) {
+    try {
+        $start = New-Object Diagnostics.ProcessStartInfo
+        $start.FileName = [IO.Path]::Combine([Environment]::SystemDirectory, 'schtasks.exe')
+        $start.Arguments = '/Run /TN "' + $name + '"'
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $task = [Diagnostics.Process]::Start($start)
+        if ($null -eq $task) { return $false }
+        try {
+            $output = $task.StandardOutput.ReadToEndAsync()
+            $errors = $task.StandardError.ReadToEndAsync()
+            if (-not $task.WaitForExit(5000)) { return $false }
+            return ($task.ExitCode -eq 0)
+        } finally { $task.Dispose() }
+    } catch { return $false }
+}
+function Test-AgentHealthy([string]$pipeName = 'youziauth-agent', [int]$timeoutMs = 15000) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $pipe = $null
+        $pending = $null
+        try {
+            $pipe = New-Object IO.Pipes.NamedPipeClientStream('.', $pipeName,
+                [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
+            $remaining = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            $pipe.Connect([Math]::Min(500, $remaining))
+            $pipe.ReadMode = [IO.Pipes.PipeTransmissionMode]::Message
+            $message = [Text.Encoding]::UTF8.GetBytes('{"command":"status"}')
+            $pipe.Write($message, 0, $message.Length)
+            $buffer = New-Object byte[] 16384
+            $pending = $pipe.BeginRead($buffer, 0, $buffer.Length, $null, $null)
+            $remaining = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            if (-not $pending.AsyncWaitHandle.WaitOne([Math]::Min(1500, $remaining))) {
+                throw 'status-timeout'
+            }
+            $count = $pipe.EndRead($pending)
+            if ($count -le 0 -or -not $pipe.IsMessageComplete) { throw 'status-incomplete' }
+            $response = [Text.Encoding]::UTF8.GetString($buffer, 0, $count) | ConvertFrom-Json
+            if ($response.ok -is [bool] -and $response.ok -and
+                $response.snapshot.boot_id -is [string] -and $response.snapshot.boot_id -and
+                @('online_external', 'online_campus', 'waiting_for_network', 'auth_failed', 'error') -ccontains
+                    $response.snapshot.state) { return $true }
+        } catch {
+            # A scheduled-task launch is only a request; wait for a real IPC reply.
+        } finally {
+            if ($null -ne $pipe) { $pipe.Dispose() }
+            if ($null -ne $pending) { $pending.AsyncWaitHandle.Close() }
+        }
+        $remaining = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+        if ($remaining -gt 0) { Start-Sleep -Milliseconds ([Math]::Min(100, $remaining)) }
+    }
+    return $false
+}
+function Complete-Install($result) {
+    # This worker outlives the application stopped by MSI. Save the outcome before
+    # starting the new agent, then replace it with the observed recovery outcome.
+    Write-InstallResult $result
+    if ($result.ContainsKey('code')) {
+        if ($quiet -and $result.code -ne 3010) {
+            # SYSTEM cannot put a window on the signed-in user's desktop. The Tray
+            # task owns an InteractiveToken; the agent task owns the SYSTEM token.
+            # The MSI stops both processes before replacement. A failed install
+            # can roll its payload back without restarting them, so recover the
+            # registered tasks after any completed attempt. Keep the actual MSI
+            # exit code even if recovery fails. 3010 leaves files pending reboot;
+            # starting that incomplete payload before reboot is unsafe.
+            $result.agent_restarted = Start-UpdateTask '\youziauth\SystemAgent'
+            $result.relaunched = Start-UpdateTask '\youziauth\Tray'
+            $result.healthy = Test-AgentHealthy
+        } elseif (-not $quiet -and $result.code -eq 0) {
+            try {
+                $target = $env:YOUZIAUTH_UPDATE_EXE
+                Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target) | Out-Null
+                $result.relaunched = $true
+            } catch { $result.relaunched = $false }
+        }
+    }
+    Write-InstallResult $result
+}
+"""
+
+_WORKER = _WORKER_RECOVERY + r"""
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$quiet = [bool]$env:YOUZIAUTH_UPDATE_SILENT
+$request = $null
 $directory = $null
 $lock = $null
 $installer = $null
@@ -249,16 +363,14 @@ try {
     $start = New-Object Diagnostics.ProcessStartInfo
     $start.FileName = [IO.Path]::Combine([Environment]::SystemDirectory, 'msiexec.exe')
     # 无人值守时必须静默：/qn 不弹任何界面，/l*v 留一份可事后核对的日志。
-# 注意这里必须用单引号块里的双引号，PowerShell 才不会把 /qn 当成位置参数。
-$quiet = [bool]$env:YOUZIAUTH_UPDATE_SILENT
-$start.Arguments = '/i "' + $env:YOUZIAUTH_UPDATE_MSI + '" /norestart'
-if ($quiet) {
-    $start.Arguments = $start.Arguments + ' /qn'
-    $log = [string]$env:YOUZIAUTH_UPDATE_LOG
-    if ($log) {
-        $start.Arguments = $start.Arguments + ' /l*v "' + $log + '"'
+    $start.Arguments = '/i "' + $env:YOUZIAUTH_UPDATE_MSI + '" /norestart'
+    if ($quiet) {
+        $start.Arguments = $start.Arguments + ' /qn'
+        $log = [string]$env:YOUZIAUTH_UPDATE_LOG
+        if ($log) {
+            $start.Arguments = $start.Arguments + ' /l*v "' + $log + '"'
+        }
     }
-}
     $start.UseShellExecute = $false
     $installer = [Diagnostics.Process]::Start($start)
     if ($null -eq $installer) { throw 'installer-start' }
@@ -266,28 +378,13 @@ if ($quiet) {
     try { Publish-Status 'launch' @{ pid = $installer.Id } }
     finally { $installer.WaitForExit() }
     $final = @{ code = $installer.ExitCode }
-    # 装完把程序重新拉起来。MSI 在 InstallValidate 之前就 taskkill 掉了原来的进程（见
-    # packaging/youziauth.wxs），不重启的话用户装完只看到一片空白，还得自己去找快捷方式。
-    # 只在 0 时重启：3010 表示有文件要等重启才能落盘，这时启动会因缺文件直接挂掉；
-    # 1602 是用户取消了安装，当然也不该启动。
-    # 这个工作进程是以当前用户身份运行的（提权发生在 msiexec 自己弹的那个 UAC 上），
-    # 所以这里拉起的是普通权限的进程，不会把程序变成以管理员运行。
-    # 不带参数启动 = 不隐藏窗口（campus_auth_gui.should_start_hidden(False, "show") 为假）。
-    if ($installer.ExitCode -eq 0) {
-        try {
-            $target = $env:YOUZIAUTH_UPDATE_EXE
-            Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target) | Out-Null
-            $final.relaunched = $true
-        } catch {
-            $final.relaunched = $false
-        }
-    }
 } catch {
     $final = @{ error = $stage }
 } finally {
     if ($null -ne $installer) { $installer.Dispose() }
     if ($null -ne $lock) { $lock.Dispose() }
 }
+Complete-Install $final
 try { Publish-Status 'final' $final }
 catch { exit 1 }
 """
@@ -611,7 +708,8 @@ def _msi_properties(msi: Path) -> dict:
     try:
         result = subprocess.run(
             [str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand", _ENCODED_COMMAND],
-            env=environment, shell=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            env=environment, shell=False, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
             encoding="utf-8", timeout=60, creationflags=0x08000000,
         )
     except subprocess.TimeoutExpired:
@@ -650,7 +748,7 @@ def verify_msi(path, executable, version, sha256, signature=None) -> None:
 
 def _start_worker(msi: Path, anchor: Path, version: str, size: int, digest: str,
                   signature: bytes, payload: bytes, directory: Path,
-                  silent: bool = False, log_path=None) -> int:
+                  silent: bool = False, log_path=None, result_path=None) -> int:
     powershell = _system_tool("WindowsPowerShell/v1.0/powershell.exe")
     request_path, report_path = _write_request(msi, version, size, digest, signature, payload)
     request = {
@@ -667,12 +765,14 @@ def _start_worker(msi: Path, anchor: Path, version: str, size: int, digest: str,
         "YOUZIAUTH_UPDATE_VERIFY": _ENCODED_COMMAND, "YOUZIAUTH_UPDATE_WORKER": _ENCODED_WORKER,
         "YOUZIAUTH_UPDATE_SILENT": "1" if silent else "",
         "YOUZIAUTH_UPDATE_LOG": str(log_path) if log_path else "",
+        "YOUZIAUTH_UPDATE_RESULT": str(result_path) if result_path else "",
         "PSModulePath": str(powershell.parent / "Modules"),
     })
     try:
         result = subprocess.run(
             [str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand", _ENCODED_LAUNCHER],
-            env=environment, shell=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            env=environment, shell=False, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
             encoding="utf-8", timeout=20, creationflags=0x08000000,
         )
         status = json.loads(result.stdout)
@@ -700,7 +800,8 @@ def _read_status(path: Path) -> dict | None:
         raise UpdateVerificationError("更新辅助进程状态无效，请检查安装向导状态。") from None
 
 
-def _observe_worker(pid: int, directory: Path, on_launch: Callable[[], None]) -> int:
+def _observe_worker(pid: int, directory: Path, on_launch: Callable[[], None],
+                    *, full_result: bool = False) -> int | dict:
     api = _kernel32()
     handle = None
     finished = False
@@ -724,19 +825,25 @@ def _observe_worker(pid: int, directory: Path, on_launch: Callable[[], None]) ->
                     except BaseException as exc:
                         notification_error = exc
             if final is not None:
-                if (set(final) not in ({"code"}, {"error"}) or
-                        type(next(iter(final.values()))) is not int):
+                if set(final) == {"error"} and type(final["error"]) is int:
+                    finished = True
+                    raise UpdateVerificationError(_ERRORS.get(final["error"], _ERRORS[21]))
+                allowed = {"code", "relaunched", "healthy", "launch_exit_code", "agent_restarted"}
+                if (not set(final) <= allowed or type(final.get("code")) is not int or
+                        not -0x80000000 <= final["code"] <= 0xFFFFFFFF or
+                        any(type(final[key]) is not bool for key in
+                            ("relaunched", "healthy", "agent_restarted") if key in final) or
+                        ("launch_exit_code" in final and
+                         (type(final["launch_exit_code"]) is not int or
+                          not -0x80000000 <= final["launch_exit_code"] <= 0xFFFFFFFF)) or
+                        not notified):
                     raise UpdateVerificationError(_ERRORS[20])
                 finished = True
-                if "error" in final:
-                    raise UpdateVerificationError(_ERRORS.get(final["error"], _ERRORS[21]))
-                if not notified or not -0x80000000 <= final["code"] <= 0xFFFFFFFF:
-                    raise UpdateVerificationError(_ERRORS[20])
                 if notification_error is not None:
                     if not isinstance(notification_error, Exception):
                         raise notification_error
                     raise UpdateVerificationError("安装向导已启动，但启动通知失败；请检查安装结果。") from None
-                return final["code"]
+                return dict(final) if full_result else final["code"]
             if exited:
                 finished = bool(handle)
                 raise UpdateVerificationError("更新辅助进程意外退出或无法观察，请检查安装向导状态。")
@@ -756,7 +863,7 @@ def _observe_worker(pid: int, directory: Path, on_launch: Callable[[], None]) ->
 
 
 def install_msi(path, executable, version, sha256, on_launch, signature=None,
-                silent=False, log_dir=None) -> int:
+                silent=False, log_dir=None) -> int | dict:
     if not callable(on_launch):
         raise UpdateVerificationError("安装启动通知回调无效。")
     msi, anchor, version, sha256, signature, size = _validate_inputs(
@@ -778,12 +885,16 @@ def install_msi(path, executable, version, sha256, on_launch, signature=None,
     except OSError:
         raise UpdateVerificationError("无法创建更新私有状态目录，已取消更新。") from None
     log_path = None
+    result_path = None
     if silent and log_dir is not None:
         try:
             Path(log_dir).mkdir(parents=True, exist_ok=True)
             log_path = Path(log_dir) / "msi-install.log"
+            result_path = Path(log_dir) / "install-result.json"
         except OSError:
             log_path = None
     pid = _start_worker(msi, anchor, version, size, digest, signature, payload, directory,
-                        silent=silent, log_path=log_path)
+                        silent=silent, log_path=log_path, result_path=result_path)
+    if silent:
+        return _observe_worker(pid, directory, on_launch, full_result=True)
     return _observe_worker(pid, directory, on_launch)

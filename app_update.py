@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import base64
+import contextvars
 import hashlib
 import inspect
 import json
@@ -11,8 +13,9 @@ import tempfile
 import threading
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.parse import unquote, urlsplit
+from urllib.request import (HTTPRedirectHandler, ProxyHandler as _StandardProxyHandler,
+                            Request, _parse_proxy, build_opener)
 
 from windows_update import install_msi, verify_msi
 
@@ -28,6 +31,31 @@ RELEASE_ASSETS = ('youziauth.msi', 'SHA256SUMS.txt', 'youziauth.msi.ed25519')
 # 老客户端彻底无法自助更新，这个代价比少一段说明大得多。
 NOTES_ASSET = 'release-notes.md'
 MAX_NOTES_BYTES = 32 * 1024
+_PROXY_USER_SID = contextvars.ContextVar('youziauth_update_proxy_user_sid', default=None)
+_USER_SID = re.compile(r'S-1-(?:5-21|12-1)(?:-[0-9]{1,10}){4}')
+
+
+class ProxyHandler(_StandardProxyHandler):
+    """Route this updater through its chosen proxy without unrelated bypasses.
+
+    urllib's default handler consults NO_PROXY or the process account's registry
+    even when given an explicit proxy. The SYSTEM account's bypass settings are
+    not the bound user's routing choice. Keep urllib's CONNECT and auth behavior,
+    while making this updater's explicit routing independent of those settings.
+    """
+
+    def proxy_open(self, request, proxy, protocol):
+        original = request.type
+        proxy_type, user, password, hostport = _parse_proxy(proxy)
+        if proxy_type is None:
+            proxy_type = original
+        if user and password:
+            credentials = ('%s:%s' % (unquote(user), unquote(password))).encode()
+            request.add_header('Proxy-authorization', 'Basic ' + base64.b64encode(credentials).decode('ascii'))
+        request.set_proxy(unquote(hostport), proxy_type)
+        if original == proxy_type or original == 'https':
+            return None
+        return self.parent.open(request, timeout=request.timeout)
 
 # --- 更新内容 ---------------------------------------------------------------
 # 首选是发布者手写的中文说明（`release-notes.md` 资产，源文件在 docs/release-notes/）。
@@ -112,7 +140,7 @@ class GitHubRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def interactive_user_proxy():
+def interactive_user_proxy(user_sid=None):
     """The proxy the signed-in user actually configured, if any.
 
     A service running as SYSTEM has its own registry hive: it cannot see the interactive
@@ -123,8 +151,8 @@ def interactive_user_proxy():
     it downloads over a path nobody configured while the user's own browser flies through
     the proxy next to it.
 
-    Reads the loaded users' hives through HKEY_USERS. Returns ``None`` when there is
-    nothing usable, so the caller behaves exactly as before when no proxy is configured.
+    A configured SID reads exactly that user's hive. Without one, detect only a
+    single loaded user; several profiles are ambiguous and must not pick a winner.
     """
     if sys.platform != "win32":
         return None
@@ -132,6 +160,10 @@ def interactive_user_proxy():
         import winreg
     except ImportError:
         return None
+    if user_sid is not None:
+        if not isinstance(user_sid, str) or _USER_SID.fullmatch(user_sid) is None:
+            return None
+        return _proxy_from_hive(winreg, user_sid)
     try:
         users = winreg.OpenKey(winreg.HKEY_USERS, "")
     except OSError:
@@ -145,15 +177,13 @@ def interactive_user_proxy():
             except OSError:
                 break
             index += 1
-            # 只认交互用户的 SID：S-1-5-21-<机器>-<用户 RID>，且不是服务账户。
-            if not sid.startswith("S-1-5-21-") or sid.endswith(("-18", "-19", "-20")):
+            # Exact profile SIDs, including Entra accounts; skip *_Classes and
+            # service hives rather than treating a prefix as an interactive user.
+            if _USER_SID.fullmatch(sid) is None:
                 continue
             candidates.append(sid)
-        # 多个已登录用户时取第一个有可用代理的（单用户机器上只有一个）。
-        for sid in candidates:
-            server = _proxy_from_hive(winreg, sid)
-            if server:
-                return server
+        if len(candidates) == 1:
+            return _proxy_from_hive(winreg, candidates[0])
     except OSError:
         return None
     finally:
@@ -210,7 +240,7 @@ def _proxy_from_hive(winreg, sid):
 
 
 def configured_proxy():
-    """Proxy for our outbound requests: explicit setting, else the user's, else system.
+    """Explicit updater setting, else the bound user's proxy, else direct.
 
     ``YOUZIAUTH_UPDATE_PROXY`` wins so an operator can pin one; ``""`` (set but empty)
     forces direct, which is also the escape hatch if a detected proxy is unwanted.
@@ -218,7 +248,7 @@ def configured_proxy():
     override = os.environ.get("YOUZIAUTH_UPDATE_PROXY")
     if override is not None:
         return override.strip() or None
-    return interactive_user_proxy()
+    return interactive_user_proxy(_PROXY_USER_SID.get())
 
 
 def open_url(url, headers=None):
@@ -549,10 +579,11 @@ class UpdateController:
     installing anything itself, because that is what used to cost a UAC prompt per release.
     """
 
-    def __init__(self, current_version, cache_dir, executable=None, manual=True):
+    def __init__(self, current_version, cache_dir, executable=None, manual=True, *, proxy_user_sid=None):
         self._cache = Path(cache_dir)
         self._executable = executable
         self._manual = bool(manual)
+        self._proxy_user_sid = proxy_user_sid
         self._lock = threading.RLock()
         self._gate = threading.Lock()
         self._closed = threading.Event()
@@ -653,6 +684,7 @@ class UpdateController:
         return '正在校验并打开安装向导，请按 Windows 提示完成管理员授权。'
 
     def _run(self, work):
+        token = _PROXY_USER_SID.set(self._proxy_user_sid)
         try:
             work()
         except HTTPError as exc:
@@ -677,6 +709,7 @@ class UpdateController:
             self._set(state='error', transient=False,
                       message='更新未完成，请重新检查；校园网和寝室功能不受影响。')
         finally:
+            _PROXY_USER_SID.reset(token)
             if self._data['state'] == 'error':
                 self._package = None
             self._set(checked=dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))

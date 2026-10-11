@@ -11,10 +11,12 @@ import datetime as dt
 import logging
 import logging.handlers
 import re
+import subprocess
 import sys
 import threading
 import time
 import uuid
+from functools import partial
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -23,7 +25,7 @@ import campus_auth
 from agent_ipc import AgentCommand, NamedPipeServer, RuntimeSnapshot, read_snapshot, write_snapshot
 from auth_runtime import AgentState, AuthAttempt, AttemptKind, RetryPolicy
 from network_probe import NetworkObservation, NetworkProbe
-from windows_credentials import CredentialStore, machine_config_path, program_data_root
+from windows_credentials import CredentialError, CredentialStore, machine_config_path, program_data_root
 
 
 AGENT_PIPE_NAME = "youziauth-agent"
@@ -107,6 +109,8 @@ class Agent:
         )
         write_snapshot(self.snapshot_path, self.snapshot)
 
+        self._recover_update()
+
     @staticmethod
     def _now() -> str:
         return dt.datetime.now().astimezone().isoformat(timespec="seconds")
@@ -158,6 +162,10 @@ class Agent:
         )
 
     def run_cycle(self, force_login: bool = False) -> CycleResult:
+        if not self.config.username or not self.config.password:
+            snapshot = self._publish(AgentState.WAITING_FOR_NETWORK,
+                                     "请先在校园网页面保存账号和密码。")
+            return CycleResult(snapshot, self.config.check_interval_seconds, False)
         try:
             observation: NetworkObservation = self.probe.observe(self.config)
         except Exception as exc:  # noqa: BLE001 - probe failures are runtime state, not process failure.
@@ -276,6 +284,7 @@ class Agent:
         return self.snapshot
 
     def handle_command(self, command: AgentCommand) -> dict[str, object]:
+        self._recover_update()
         if command.command == "status":
             snapshot = self.snapshot
         elif command.command == "retry":
@@ -287,6 +296,23 @@ class Agent:
         else:
             snapshot = self.suppress_notifications_for_boot()
         return {"ok": True, "snapshot": dataclasses.asdict(snapshot)}
+
+    def _recover_update(self) -> None:
+        """Adopt the detached install worker's result, including late writes."""
+        recover = getattr(self.updater, "recover_install_result", None)
+        if not callable(recover) or not self._update_lock.acquire(blocking=False):
+            return
+        try:
+            status = recover()
+            if status is not None:
+                self._publish_update(status)
+                # monotonic deadlines do not survive a process restart. Schedule
+                # from the recovered terminal state, so its feedback stays visible.
+                self._next_update_at = time.monotonic() + self.update_interval_seconds
+        except Exception as exc:  # noqa: BLE001 - recovery must never stop authentication
+            self.logger.warning("update result recovery failed: %s", type(exc).__name__)
+        finally:
+            self._update_lock.release()
 
     def _publish_update(self, status) -> RuntimeSnapshot:
         """把自动更新状态并进运行时快照，界面经由同一条通道读到它。"""
@@ -398,6 +424,7 @@ class Agent:
         self._publish_disabled_reason()
         delay = 0
         while not stop_event.wait(delay):
+            self._recover_update()
             if self.update_due():
                 # 只在网络循环的间隙跑一次；安装会终止本进程，重启后由 next_update_at
                 # 拦住，不会变成「装一次、重启、马上又装」的循环。
@@ -425,6 +452,14 @@ def load_agent_config(path: Path) -> campus_auth.AuthConfig:
     return dataclasses.replace(config, log_file=str(log_path))
 
 
+def load_runtime_config(path: Path) -> campus_auth.AuthConfig:
+    """Keep installed updates running while the user finishes account setup."""
+    try:
+        return load_agent_config(path)
+    except (OSError, CredentialError, ValueError, configparser.Error):
+        return campus_auth.AuthConfig()
+
+
 def configure_agent_logging(log_path: Path, verbose: bool = False) -> logging.Logger:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("youziauth.agent")
@@ -450,10 +485,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--allowed-user-sid")
+    parser.add_argument("--repair-install-tasks", action="store_true")
+    parser.add_argument("--install-user-sid")
+    parser.add_argument("--first-install", action="store_true")
     return parser
 
 
-def build_updater(app_dir: Path) -> tuple:
+def build_updater(app_dir: Path, allowed_user_sid: str | None = None) -> tuple:
     """后台自动更新的实装。返回 ``(updater, reason)``：拿到更新器时 reason 为空。
 
     只在冻结的正式安装版里启用：源码运行时没有可安装的 MSI，也没有稳定的安装目录，
@@ -467,6 +505,7 @@ def build_updater(app_dir: Path) -> tuple:
         return None, "源码运行：后台自动更新只在安装版里启用"
     try:
         import auto_update
+        from app_update import UpdateController
         from startup_tasks import (install_dir_for_current_process, run_agent_task,
                                run_tray_task)
 
@@ -481,9 +520,10 @@ def build_updater(app_dir: Path) -> tuple:
             install_dir=install_dir,
             # app_dir 是 **app 数据目录**（%ProgramData%\youziauth），不是它的父目录。
             cache_dir=Path(app_dir) / "updates",
+            controller_factory=partial(UpdateController, proxy_user_sid=allowed_user_sid),
             executable=install_dir / "youziauth.exe",
             relaunch=run_tray_task,
-        agent_relaunch=run_agent_task,
+            agent_relaunch=run_agent_task,
             log_dir=Path(app_dir) / "updates",
         )
         return updater, ""
@@ -493,22 +533,53 @@ def build_updater(app_dir: Path) -> tuple:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.repair_install_tasks:
+        # MSI invokes this as SYSTEM after its payload has committed. Dispatch
+        # before config/network setup: the helper only maintains startup tasks.
+        import startup_tasks
+        try:
+            startup_tasks.repair_installed_tasks(Path(sys.executable).resolve().parent,
+                                                install_user_sid=args.install_user_sid,
+                                                first_install=args.first_install)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            return 1
+        return 0
+    load_config = load_runtime_config if getattr(sys, "frozen", False) else load_agent_config
     try:
-        config = load_agent_config(args.config)
+        config = load_config(args.config)
     except Exception as exc:  # noqa: BLE001 - agent reports bounded configuration failures.
         print(f"agent config error: {sanitized_detail(str(exc))}")
         return 2
-    logger = configure_agent_logging(Path(config.log_file), args.verbose)
-    snapshot_path = (program_data_root(args.config.parent.parent) / "runtime.json"
+    if getattr(sys, "frozen", False):
+        # This is the privileged path. User-writable config may select credentials
+        # and cadence, but it must never select a SYSTEM file-write destination.
+        from system_storage import secure_system_storage, verified_system_storage
+        try:
+            app_dir = verified_system_storage()
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            # An elevated user's startup helper runs as that administrator, not
+            # SYSTEM. The registered SYSTEM task may initialize the fixed root
+            # on first launch; the helper rejects pre-existing unsafe trees.
+            if not args.allowed_user_sid:
+                return 3
+            try:
+                app_dir = secure_system_storage(args.allowed_user_sid)
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                return 3
+        config = dataclasses.replace(config, log_file=str(app_dir / "logs" / "agent.log"))
+        snapshot_path = app_dir / "runtime.json"
+    else:
+        snapshot_path = (program_data_root(args.config.parent.parent) / "runtime.json"
                      if args.config == machine_config_path(args.config.parent.parent)
                      else args.config.parent / "runtime.json")
+    logger = configure_agent_logging(Path(config.log_file), args.verbose)
     # snapshot_path.parent 就是 app 数据目录（%ProgramData%\youziauth）；更新缓存与
     # MSI 日志都放在它下面，不能放到安装目录（Program Files）里去。
-    updater, update_reason = build_updater(snapshot_path.parent)
+    updater, update_reason = build_updater(snapshot_path.parent, args.allowed_user_sid)
     if update_reason:
         logger.warning("automatic update disabled: %s", update_reason)
     agent = Agent(
-        config_loader=lambda: load_agent_config(args.config),
+        config_loader=lambda: dataclasses.replace(load_config(args.config), log_file=config.log_file),
         probe=NetworkProbe(),
         authenticator=lambda loaded, active_logger, force_login=False: (
             campus_auth.attempt_authentication(

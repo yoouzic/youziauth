@@ -3,6 +3,7 @@
 import json
 import tempfile
 import unittest
+import inspect
 from pathlib import Path
 from unittest.mock import patch
 
@@ -69,6 +70,8 @@ class UpdaterTests(unittest.TestCase):
             self.installed.append(
                 {'package': package, 'version': version, 'digest': digest,
                  'signature': signature, 'silent': silent, 'log_dir': log_dir})
+            if result.get('code') in (0, 3010):
+                self.write_version(version)
             return result
         return installer
 
@@ -100,7 +103,7 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(self.installed[0]['version'], '1.9.0')
         self.assertEqual(self.installed[0]['log_dir'], self.cache)
         # 中间的「正在安装」也要报给界面，否则用户看不到任何进展。
-        self.assertEqual([status.state for status in self.statuses], ['installing', 'installed'])
+        self.assertEqual([status.state for status in self.statuses], ['checking', 'installing', 'installed'])
 
     def test_nothing_happens_when_the_release_is_not_newer(self):
         self.write_version('1.8.4')
@@ -108,7 +111,7 @@ class UpdaterTests(unittest.TestCase):
         status = updater.run_cycle()
         self.assertEqual(status.state, 'up_to_date')
         self.assertEqual(self.installed, [], 'an up-to-date check must not install anything')
-        self.assertEqual([item.state for item in self.statuses], ['up_to_date'])
+        self.assertEqual([item.state for item in self.statuses], ['checking', 'up_to_date'])
 
     def test_a_missing_installed_version_stops_before_touching_the_network(self):
         updater, controller = self.updater(READY)
@@ -143,6 +146,7 @@ class UpdaterTests(unittest.TestCase):
         for code, expected in ((1603, '后台安装未完成'), (1618, '后台安装未完成'),
                                (3010, '需要重启'), (1602, '被取消')):
             with self.subTest(code=code):
+                self.write_version('1.8.4')
                 self.statuses.clear()
                 self.installed.clear()
                 updater, _ = self.updater(READY, result={'code': code})
@@ -213,6 +217,58 @@ class UpdaterTests(unittest.TestCase):
         updater, _ = self.updater(READY, result={'code': 0, 'healthy': True}, relaunch=exploding)
         status = updater.run_cycle()
         self.assertEqual(status.state, 'installed')
+
+    def test_installing_is_published_before_the_installer_starts_without_report(self):
+        self.write_version('1.8.4')
+        seen = []
+        updater, _ = self.updater(READY)
+        updater._report = None
+        original = updater._installer
+
+        def installer(*args, **kwargs):
+            self.assertEqual(seen[-1].state, 'installing')
+            persisted = auto_update.read_status(self.cache / auto_update.STATUS_FILE)
+            self.assertEqual(persisted.state, 'installing')
+            return original(*args, **kwargs)
+
+        updater._installer = installer
+        updater.run_cycle(progress=seen.append)
+        self.assertIn('installing', [item.state for item in seen])
+
+    def test_agent_restart_does_not_replace_installation_failure_details(self):
+        self.write_version('1.8.4')
+        updater, _ = self.updater(READY, result={'code': 1603}, agent_relaunch=lambda: True)
+        status = updater.run_cycle()
+        self.assertEqual(status.state, 'error')
+        self.assertEqual(status.detail, 'msiexec exit 1603')
+
+    def test_the_default_install_path_calls_the_real_installer_signature(self):
+        # Exercise the actual install_msi boundary, stopping only OS/signature operations.
+        # A lambda installer would hide drift in silent/log_dir and the return contract.
+        import windows_update
+        self.write_version('1.8.4')
+        package = self.cache / 'test.msi'
+        package.write_bytes(b'offline package')
+        anchor = self.install / 'youziauth.exe'
+        updater = Updater(self.install, self.cache, executable=anchor)
+        signature = b's' * 64
+        bound = inspect.signature(windows_update.install_msi).bind(
+            package, anchor, '1.9.0', 'a' * 64, lambda: None, signature,
+            silent=True, log_dir=self.cache)
+        self.assertTrue(bound.arguments['silent'])
+        final = {'code': 0, 'healthy': True, 'relaunched': True, 'agent_restarted': True}
+        with patch.object(windows_update, '_validate_inputs',
+                          return_value=(package, anchor, '1.9.0', 'a' * 64, signature, package.stat().st_size)), \
+             patch.object(windows_update, '_read_digest', return_value='a' * 64), \
+             patch.object(windows_update.ed25519, 'verify', return_value=True), \
+             patch.object(windows_update, '_run_verifier', return_value=0), \
+             patch.object(windows_update, '_start_worker', return_value=123) as start, \
+             patch.object(windows_update, '_observe_worker', return_value=final) as observe:
+            result = updater._install(package, '1.9.0', 'a' * 64, signature, lambda: None)
+        self.assertEqual(result, final)
+        self.assertTrue(start.call_args.kwargs['silent'])
+        self.assertEqual(start.call_args.kwargs['log_path'], self.cache / auto_update.MSI_LOG)
+        self.assertTrue(observe.call_args.kwargs.get('full_result'))
 
 
 class StatusFileTests(unittest.TestCase):
@@ -348,7 +404,11 @@ class RetryTests(unittest.TestCase):
             holder["controller"] = Flaky(*args, **kwargs)
             return holder["controller"]
 
-        installer = lambda *a, **k: (install_result or {"code": 0, "healthy": True, "relaunched": True})
+        def installer(*args, **kwargs):
+            result = install_result or {"code": 0, "healthy": True, "relaunched": True}
+            if result.get('code') in (0, 3010):
+                (self.install / 'VERSION').write_text(args[2], encoding='utf-8')
+            return result
         updater = Updater(install_dir=self.install, cache_dir=self.cache,
                           executable=self.install / "youziauth.exe",
                           controller_factory=factory, installer=installer,
@@ -424,10 +484,14 @@ class AgentRecoveryTests(unittest.TestCase):
             def package(inner): return Path("p.msi"), "1.8.26", "a" * 64, "b" * 128
             def close(inner): pass
 
+        def installer(*args, **kwargs):
+            (self.install / 'VERSION').write_text(args[2], encoding='utf-8')
+            return {"code": 0, "healthy": True, "relaunched": True}
+
         return Updater(install_dir=self.install, cache_dir=self.cache,
                        executable=self.install / "youziauth.exe",
                        controller_factory=lambda *a, **k: Controller(),
-                       installer=lambda *a, **k: {"code": 0, "healthy": True, "relaunched": True},
+                       installer=installer,
                        relaunch=lambda: True,
                        agent_relaunch=agent_relaunch)
 
@@ -449,6 +513,82 @@ class AgentRecoveryTests(unittest.TestCase):
 
     def test_no_runner_configured_is_not_an_error(self):
         self.assertFalse(self.build(None)._restart_agent())
+
+
+class SlowDownloadTests(unittest.TestCase):
+    """A live slow transfer cannot be mistaken for a completed check."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.install = self.root / 'install'
+        self.install.mkdir()
+        (self.install / 'VERSION').write_text('1.8.4', encoding='utf-8')
+        self.cache = self.root / 'updates'
+        self.clock = 0.0
+        self.joins = []
+        self.installations = []
+
+    def build(self, finish_after):
+        owner = self
+
+        class Worker:
+            def join(self, timeout):
+                owner.joins.append(timeout)
+                remaining = timeout if finish_after is None else max(0, finish_after - owner.clock)
+                owner.clock += min(timeout, remaining)
+
+            def is_alive(self):
+                return finish_after is None or owner.clock < finish_after
+
+        class Controller(FakeController):
+            def __init__(self):
+                super().__init__(READY)
+                self._worker = Worker()
+                self.closed_while_alive = False
+
+            def snapshot(self):
+                return dict(READY, state='downloading', progress=50) if self._worker.is_alive() else dict(READY)
+
+            def close(self):
+                self.closed_while_alive = self._worker.is_alive()
+                super().close()
+
+        controller = Controller()
+
+        def installer(*args, **kwargs):
+            owner.installations.append(args[2])
+            (owner.install / 'VERSION').write_text(args[2], encoding='utf-8')
+            return {'code': 0, 'healthy': True}
+
+        updater = Updater(self.install, self.cache, controller_factory=lambda *args: controller,
+                          installer=installer)
+        return updater, controller
+
+    def test_a_transfer_slower_than_ten_minutes_finishes_instead_of_being_cancelled(self):
+        updater, controller = self.build(finish_after=660)
+        progress = []
+        with patch.object(auto_update.time, 'monotonic', side_effect=lambda: self.clock):
+            status = updater.run_cycle(progress=progress.append)
+        self.assertEqual(status.state, 'installed')
+        self.assertFalse(controller.closed_while_alive)
+        self.assertEqual(self.installations, ['1.9.0'])
+        self.assertGreater(len(self.joins), 1)
+        self.assertTrue(all(timeout <= 60 for timeout in self.joins))
+        self.assertIn('downloading', [item.state for item in progress])
+
+    def test_the_hour_deadline_reports_timeout_without_starting_a_second_busy_check(self):
+        updater, controller = self.build(finish_after=None)
+        with patch.object(auto_update.time, 'monotonic', side_effect=lambda: self.clock):
+            status = updater.run_cycle()
+        self.assertEqual(status.state, 'error')
+        self.assertIn('超时', status.message)
+        self.assertEqual(status.detail, 'download timeout')
+        self.assertEqual(controller.checked, 1)
+        self.assertEqual(controller.closed, 1)
+        self.assertEqual(self.installations, [])
+        self.assertEqual(sum(self.joins), 3600)
 
 
 class AgentTaskRunnerTests(unittest.TestCase):

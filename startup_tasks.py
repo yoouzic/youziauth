@@ -20,6 +20,7 @@ TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 SYSTEM_TASK_NAME = r"\youziauth\SystemAgent"
 TRAY_TASK_NAME = r"\youziauth\Tray"
 SYSTEM_SID = "S-1-5-18"
+USER_SID_PATTERN = r"S-1-(?:5-21|12-1)-(?:\d+-){3}\d+"
 
 ET.register_namespace("", TASK_NS)
 
@@ -125,7 +126,7 @@ def _run_task_command(
     *,
     check: bool,
 ) -> subprocess.CompletedProcess:
-    return runner(arguments, check=check, capture_output=True, text=True)
+    return runner(arguments, check=check, stdin=subprocess.DEVNULL, capture_output=True, text=True)
 
 
 def configure_system_startup(
@@ -180,6 +181,82 @@ def configure_system_startup(
     legacy_shortcut.unlink(missing_ok=True)
 
 
+def repair_installed_tasks(
+    install_dir: Path,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    install_user_sid: str | None = None,
+    first_install: bool = False,
+    storage_setup=None,
+    input_storage_setup=None,
+) -> bool:
+    """Register first-install tasks or restore enabled tasks from MSI's SYSTEM commit.
+
+    Recover the interactive identity from the existing tasks, never from whoami:
+    the installer can run as SYSTEM or a different administrator. No tasks means
+    startup was disabled, so an upgrade/repair must leave that choice alone. Only
+    a genuinely fresh installation enables tasks for the original MSI user.
+    """
+    user_sid = None
+    for name in (TRAY_TASK_NAME, SYSTEM_TASK_NAME):
+        result = _run_task_command(
+            runner, ["schtasks.exe", "/Query", "/TN", name, "/XML"], check=False)
+        if result.returncode != 0:
+            continue
+        try:
+            root = ET.fromstring(result.stdout)
+            if name == TRAY_TASK_NAME:
+                user_sid = root.findtext(".//" + _tag("Principal") + "/" + _tag("UserId"))
+            else:
+                arguments = root.findtext(".//" + _tag("Exec") + "/" + _tag("Arguments"), "")
+                match = re.fullmatch(r"--allowed-user-sid (" + USER_SID_PATTERN + ")", arguments)
+                user_sid = match.group(1) if match else None
+        except ET.ParseError:
+            raise ValueError("existing startup task XML is invalid") from None
+        if not isinstance(user_sid, str) or re.fullmatch(USER_SID_PATTERN, user_sid) is None:
+            raise ValueError("existing startup task has no valid interactive user SID")
+        break
+    # No remaining task means there is no original identity to recover. Never
+    # rebind an opted-out user's input ACL to another administrator performing
+    # the upgrade. First-install identity is the only supported fallback.
+    if user_sid is None and not first_install:
+        return False
+    if user_sid is None and install_user_sid in (None, "", SYSTEM_SID, "S-1-5-19", "S-1-5-20"):
+        if first_install:
+            raise ValueError("first installation requires the original interactive user SID")
+        return False
+    storage_sid = user_sid or install_user_sid
+    if storage_sid is not None:
+        if re.fullmatch(USER_SID_PATTERN, storage_sid) is None:
+            raise ValueError("installer has no valid interactive user SID")
+        if storage_setup is None:
+            from system_storage import secure_system_storage
+            storage_setup = secure_system_storage
+        storage_setup(storage_sid)
+        if input_storage_setup is None:
+            from input_storage import secure_input_storage
+            input_storage_setup = secure_input_storage
+        input_storage_setup(storage_sid)
+    if user_sid is None and first_install:
+        user_sid = storage_sid
+    if user_sid is None:
+        return False
+    with tempfile.TemporaryDirectory(prefix="youziauth-install-tasks-") as temporary:
+        for name, filename, definition in (
+            (SYSTEM_TASK_NAME, "system-agent.xml", build_system_task_xml(install_dir, user_sid)),
+            (TRAY_TASK_NAME, "tray.xml", build_tray_task_xml(install_dir, user_sid)),
+        ):
+            path = Path(temporary) / filename
+            _write_xml(path, definition)
+            _run_task_command(runner, ["schtasks.exe", "/Create", "/TN", name,
+                                      "/XML", str(path), "/F"], check=True)
+    # Keep registered tasks if a start fails, so boot can still recover them.
+    _run_task_command(runner, ["schtasks.exe", "/Run", "/TN", SYSTEM_TASK_NAME], check=True)
+    # There may be no signed-in user; never draw the tray on the SYSTEM desktop.
+    _run_task_command(runner, ["schtasks.exe", "/Run", "/TN", TRAY_TASK_NAME], check=False)
+    return True
+
+
 def install_dir_for_current_process(executable: Path | None = None) -> Path | None:
     """The directory this process was installed into, or ``None`` when it is not installed.
 
@@ -212,7 +289,7 @@ def run_agent_task(
                 "/Run", "/TN", SYSTEM_TASK_NAME,
             ],
             shell=False, check=False,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -232,6 +309,7 @@ def run_tray_task(
         result = runner(
             ["schtasks.exe", "/Run", "/TN", TRAY_TASK_NAME],
             check=False,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
         )
@@ -244,6 +322,7 @@ def current_user_sid() -> str:
     result = subprocess.run(
         ["whoami.exe", "/user", "/fo", "csv", "/nh"],
         check=True,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
     )
@@ -264,6 +343,7 @@ def is_system_startup_enabled(
     result = runner(
         ["schtasks.exe", "/Query", "/TN", TRAY_TASK_NAME],
         check=False,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
     )
