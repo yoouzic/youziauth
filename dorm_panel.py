@@ -365,8 +365,7 @@ class DormPanel:
         self.idm_status = tk.StringVar()
         ttk.Label(self.idm_box, textvariable=self.idm_status, wraplength=620,
                   justify='left').grid(row=0, column=0, columnspan=4, sticky='w')
-        ttk.Label(self.idm_box, text='说明：凭据用 Windows DPAPI 加密后仅存本机，'
-                                     '仅供自动登录使用；可在本机被完全控制时被解密。',
+        ttk.Label(self.idm_box, text='说明：凭据加密后仅保存在本机，仅供自动登录使用。',
                   wraplength=620, justify='left').grid(row=1, column=0, columnspan=4, sticky='w', pady=(4, 8))
         ttk.Label(self.idm_box, text='学号').grid(row=2, column=0, sticky='w')
         self.idm_user = tk.StringVar()

@@ -669,14 +669,14 @@ class UpdateController:
 
     def check(self):
         if not self._manual:
-            raise RuntimeError('更新由后台代理负责，请在「校园网」页开启后台检测。')
+            raise RuntimeError('更新由后台服务负责，请在「校园网」页开启后台检测。')
         with self._lock:
             self._start(self._check, 'checking', '正在检查 GitHub 最新正式版…')
         return '正在后台检查；发现新版本后会自动下载，不影响正常使用。'
 
     def install(self, confirmed, version):
         if not self._manual:
-            raise RuntimeError('更新由后台代理静默完成，这里无需手动安装。')
+            raise RuntimeError('更新会自动完成，这里无需手动安装。')
         with self._lock:
             if confirmed is not True or self._data['state'] != 'ready' or version != self._data['latest_version'] or not self._package:
                 raise RuntimeError('请等待下载校验完成，并重新确认要安装的版本。')

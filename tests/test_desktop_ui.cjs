@@ -184,6 +184,8 @@ function harness(source='windows',extras={}){
     logView:()=>vm.runInContext('logView',context),
     // 用户滚动：位置和滚动事件要一起发生，否则 1.5 秒心跳那边看到的还是旧位置。
     scrolled(top){const log=el('log-output');log.scrollTop=top;log.fire('scroll');},
+    // 运行记录的两个标签页：logType 是 app.js 里的状态，测试直接切它。
+    showLog(type){vm.runInContext('logType='+JSON.stringify(type),context);},
     navigate(page){context.location.hash='#'+page;vm.runInContext('navigate()',context);}};
 }
 const settle=()=>new Promise(resolve=>setImmediate(resolve));
@@ -457,6 +459,19 @@ test('the removed page hints stay out of the markup',()=>{
   assert.doesNotMatch(html,/section-mark"><i class="bi bi-arrow-clockwise"/);
   // 「（已保存样本）」不再出现在下拉选项里，来源名称本身就是完整文案。
   assert.doesNotMatch(html,/模拟定位（已保存样本）/);
+});
+
+test('the updates page keeps implementation notes out of the user copy',()=>{
+  const html=fs.readFileSync(path.join(__dirname,'../desktop_ui/index.html'),'utf8');
+  // 用户标注：内置公钥验签、提权代理、界面管不到安装 —— 这是写给审查者的实现说明，不是给用户的话。
+  assert.doesNotMatch(html,/Ed25519/);
+  assert.doesNotMatch(html,/提权/);
+  assert.doesNotMatch(html,/静默安装/);
+  assert.doesNotMatch(html,/界面只负责显示进度/);
+  assert.doesNotMatch(html,/验签/);
+  const source=fs.readFileSync(path.join(__dirname,'../desktop_ui/app.js'),'utf8');
+  // 确认框里说的话要给用户看：说「打卡信息」，不说请求体的「任务字段」。
+  assert.doesNotMatch(source,/任务字段/);
 });
 
 for(const saved of ['windows','simulation']){
@@ -788,7 +803,7 @@ test('download progress exposes percentage and transferred size with an accessib
 });
 
 test('a silent install reports progress and then success without a confirmation step',async()=>{
-  const h=await updateHarness({...readyUpdate,state:'installing',message:'正在后台静默安装 v1.5.0…'});
+  const h=await updateHarness({...readyUpdate,state:'installing',message:'正在后台安装 v1.5.0…'});
   assert.equal(h.el('update-status').textContent,'正在后台安装');
   assert.equal(h.el('update-progress').hidden,false);
   assert.equal(h.el('check-updates').disabled,true);
@@ -1867,4 +1882,80 @@ test('the records page still renders text and hides the prompt when there is not
   assert.equal(h.el('log-output').hidden,false);
   assert.equal(h.el('log-output').textContent,LOG_ERROR('02'),'日志照旧按纯文本渲染');
   assert.equal(h.el('empty-records').hidden,true);
+});
+
+/* 寝室打卡记录的显示整理 -----------------------------------------------------------------------
+   history.log 一行一次检查，原样铺在页面上就是「每天三行、行行相似」。这里只整理显示：按天分组、
+   去掉内部状态名、丢掉当天成功之后那句例行复查、连续相同的记录合并计数、连续几天情形一样就并成
+   一段。原始文件不动，解析不出来的行也原样保留。 */
+const DORM_HISTORY=[
+  '2026-10-07T21:18:59+08:00 [signed] 服务器已确认今日任务完成',
+  '2026-10-07T23:13:53+08:00 [signed] 今日打卡已完成，当天不再重复检查',
+  '2026-10-08T21:01:33+08:00 [login_required] 登录已失效，请重新登录',
+  '2026-10-08T21:01:43+08:00 [signed] 服务器已确认今日任务完成',
+  '2026-10-08T23:13:24+08:00 [signed] 今日打卡已完成，当天不再重复检查',
+  '2026-10-09T21:01:31+08:00 [login_required] 登录已失效，请重新登录',
+  '2026-10-09T21:02:03+08:00 [signed] 服务器已确认今日任务完成',
+  '2026-10-09T23:14:57+08:00 [signed] 今日打卡已完成，当天不再重复检查',
+  '2026-10-10T21:01:35+08:00 [login_required] 登录已失效，请重新登录',
+  '2026-10-10T21:01:40+08:00 [signed] 服务器已确认今日任务完成',
+  '2026-10-10T23:11:46+08:00 [signed] 今日打卡已完成，当天不再重复检查'].join('\n');
+
+async function dormRecords(dorm){
+  const h=harness('windows',{logs:{dorm}});
+  h.showLog('dorm');
+  h.navigate('records');
+  await h.refresh();
+  return h;
+}
+
+test('dorm records read as one conclusion per day instead of three similar lines',async()=>{
+  const h=await dormRecords(DORM_HISTORY);
+  assert.equal(h.el('log-output').textContent,[
+    '10月7日 周三',
+    '  21:18  打卡完成',
+    '10月8日 周四',
+    '  21:01  登录已失效，请重新登录',
+    '  21:01  打卡完成',
+    '10月9日 周五',
+    '  21:01  登录已失效，请重新登录',
+    '  21:02  打卡完成',
+    '10月10日 周六',
+    '  21:01  登录已失效，请重新登录',
+    '  21:01  打卡完成'].join('\n'),'按天分组、去掉内部状态名、丢掉当天那句例行复查');
+  // 每天各写各的：10月9日 打卡晚了一分钟，并成「连续 N 天」就看不出来了。
+  assert.doesNotMatch(h.el('log-output').textContent,/连续 \d+ 天/);
+  assert.match(h.el('log-output').textContent,/10月9日 周五\n {2}21:01 {2}登录已失效，请重新登录\n {2}21:02 {2}打卡完成/);
+});
+
+test('a day whose only record is the routine re-check still shows up',async()=>{
+  const h=await dormRecords('2026-10-05T23:13:53+08:00 [signed] 今日打卡已完成，当天不再重复检查');
+  assert.equal(h.el('log-output').textContent,'10月5日 周一\n  23:13  今日已完成',
+    '当天没有成功记录时，那句例行复查就是当天唯一的信息，不能顺手丢掉');
+});
+
+test('identical records in one day each keep their own time',async()=>{
+  const h=await dormRecords(['2026-10-05T21:04:00+08:00 [network_error] 与学校接口的 TLS 握手被切断，请稍后重试',
+                             '2026-10-05T21:05:00+08:00 [network_error] 与学校接口的 TLS 握手被切断，请稍后重试'].join('\n'));
+  assert.equal(h.el('log-output').textContent,
+    '10月5日 周一\n  21:04  与学校接口的 TLS 握手被切断，请稍后重试\n  21:05  与学校接口的 TLS 握手被切断，请稍后重试',
+    '重复的记录不合并计数：几点发生过几次都是记录的一部分');
+});
+
+test('a failure day keeps its own wording and diagnostics',async()=>{
+  const h=await dormRecords('2026-10-05T21:04:00+08:00 [network_error] 学校接口响应超时（20 秒未回应），请稍后重试 · 响应超时 20.0s／直连');
+  assert.equal(h.el('log-output').textContent,
+    '10月5日 周一\n  21:04  学校接口响应超时（20 秒未回应），请稍后重试 · 响应超时 20.0s／直连',
+    '整理的是排版，不是内容：失败原因和诊断一个都不能少');
+});
+
+test('lines the records page cannot parse are shown verbatim',async()=>{
+  const h=await dormRecords('2026-10-05T21:04:00+08:00 [signed] 服务器已确认今日任务完成\n历史记录头（旧格式）');
+  assert.equal(h.el('log-output').textContent,'10月5日 周一\n  21:04  打卡完成\n历史记录头（旧格式）');
+});
+
+test('a record with no wording at all is not dressed up as a user message',async()=>{
+  const h=await dormRecords('2026-10-05T21:04:00+08:00 [signed]');
+  assert.equal(h.el('log-output').textContent,'2026-10-05T21:04:00+08:00 [signed]',
+    '读不出说明就原样显示，不能把内部状态名 signed 当成文案给用户');
 });

@@ -19,7 +19,66 @@ const MAP_TILE_STALL = 8000;   // ms with nothing drawn before the next provider
 // 边界要写死：\s+\w+ 这种「量词接量词」在只有一个空格时会让 \s+ 把空格吃光，永远匹配不上。
 const LOG_STATUS_LINE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} +\w+ current auth status:/;
 const logView = {showNewest:false, stick:true, unread:0, upto:0};
-function logText(){return (state && state.logs && state.logs[logType]) || '';}
+
+/* 寝室打卡记录的显示整理 ----------------------------------------------------------------------
+   history.log 是排障用的原始记录：一行一次检查，写成「时间 [内部状态] 文案 · 诊断」。原样贴在
+   页面上，一周就是十几行「每天三行、行行相似」，最该看到的结论反而被淹掉。所以这里只整理**显示**：
+   每天各占一段（日期只写一次）、去掉内部状态名、丢掉当天成功之后那句例行的「不再重复检查」，
+   每条记录留着自己的时刻。**不做跨天合并** —— 并成「连续 N 天」看着简洁，但哪天不一样就看不出来
+   了，而「哪天不一样」正是这份记录要回答的事。解析不出来的行原样保留，history.log 本身、以及
+   校园网那份流水日志都不受影响。 */
+const DORM_LINE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\s+\[([^\]]*)\]\s*(.*)$/;
+// 当天已经打过卡，这一次只是例行复查：它只重复上一条已经说过的事。
+const DORM_ROUTINE = '今日打卡已完成，当天不再重复检查';
+// 后端文案里最啰嗦的一句，换成用户看得懂的两个字。
+const DORM_SHORT = {'服务器已确认今日任务完成':'打卡完成', [DORM_ROUTINE]:'今日已完成'};
+const WEEKDAYS = ['周日','周一','周二','周三','周四','周五','周六'];
+function dormRecord(line){
+  const m = DORM_LINE.exec(line.trim());
+  if(!m) return null;
+  const body = m[7] || '', cut = body.lastIndexOf(' · ');
+  // 连文案都没有的行读不出「发生了什么」，按读不动处理：原样显示，别把内部状态名当说明给出
+  // （正常写入的 history.log 不会只有状态没有文案）。
+  if(!body) return null;
+  return {
+    day:`${m[1]}-${m[2]}-${m[3]}`,
+    title:`${Number(m[2])}月${Number(m[3])}日 ${WEEKDAYS[new Date(Number(m[1]), Number(m[2])-1, Number(m[3])).getDay()]}`,
+    time:`${m[4]}:${m[5]}`, state:m[6],
+    message:cut === -1 ? body : body.slice(0, cut),
+    detail:cut === -1 ? '' : body.slice(cut + 3),
+  };
+}
+function dormRecordText(record){
+  const label = DORM_SHORT[record.message] || record.message || record.state || '检查';
+  return record.detail ? label + ' · ' + record.detail : label;
+}
+function compactDormLog(text){
+  const blocks = [];
+  for(const line of String(text || '').split('\n')){
+    if(!line.trim()) continue;
+    const record = dormRecord(line);
+    if(!record){blocks.push({raw:line}); continue;}   // 看不懂的行原样留着，不猜
+    const last = blocks[blocks.length - 1];
+    if(last && last.entries && last.day === record.day) last.entries.push(record);
+    else blocks.push({day:record.day, title:record.title, entries:[record]});
+  }
+  const lines = [];
+  for(const block of blocks){
+    if(!block.entries){lines.push(block.raw); continue;}
+    // 这一天真的打上卡了，才轮得到那句例行复查被丢掉。
+    const done = block.entries.some(record => record.state === 'signed' && record.message !== DORM_ROUTINE);
+    lines.push(block.title);
+    for(const record of block.entries){
+      if(done && record.message === DORM_ROUTINE) continue;
+      lines.push('  ' + record.time + '  ' + dormRecordText(record));
+    }
+  }
+  return lines.join('\n');
+}
+function logText(){
+  const raw = (state && state.logs && state.logs[logType]) || '';
+  return logType === 'dorm' ? compactDormLog(raw) : raw;
+}
 // 例行 status 行每分钟一条，不该被算成「新记录」。
 function isStatusLine(line){return LOG_STATUS_LINE.test(line);}
 // 用户眼里「一条记录」的数量：非空、且不是例行 status 的行。
@@ -201,10 +260,10 @@ function render() {
   $('dorm-summary').textContent=d.message;
   const tone=d.state==='signed'?'success':['uncertain','error','network_error','location_required','login_required'].includes(d.state)?'warning':'';
   badge('dorm-badge',dormLabel,tone);badge('task-badge',dormLabel,tone);
-  $('monitor-summary').textContent=n.startup?'系统代理运行中':n.monitoring?'正在后台检测':'未开启';
+  $('monitor-summary').textContent=n.startup?'系统后台服务运行中':n.monitoring?'正在后台检测':'未开启';
   $('auto-summary').textContent=d.settings.enabled ? d.settings.start+'–'+d.settings.end : '未开启';
-  badge('monitor-badge',n.startup?'系统代理管理':n.monitoring?'运行中':'未开启',n.monitoring?'success':'');
-  $('agent-hint').textContent=n.startup?'由系统代理持续运行；停用请取消开机自启动并保存。':'开启前请先保存设置。';
+  badge('monitor-badge',n.startup?'系统后台服务':n.monitoring?'运行中':'未开启',n.monitoring?'success':'');
+  $('agent-hint').textContent=n.startup?'由系统后台服务持续运行；停用请取消开机自启动并保存。':'开启前请先保存设置。';
   $('overview-attention').textContent=n.state!=='online'?'从一次连接检测开始':d.state==='signed'?'今天的安排，已妥当':d.state==='ready'?'别忘了今晚的寝室打卡':'看看今天的寝室安排';
   $('task-title').textContent=d.task?d.task.title:'先看看今天的安排';
   $('task-message').textContent=d.busy?'正在处理，请稍候；学校登录可能需要在浏览器中完成。':d.message;
@@ -445,8 +504,8 @@ $('submit-dorm').onclick=()=>{
   const text=recheck
     ? '仅向学校查询已有提交结果，不会重新提交打卡，也不会读取或发送新的位置坐标。'
     : (source==='simulation'
-      ? '将使用已保存的模拟位置（样本附近的随机偏移，非实时，并非当前位置），向学校发送登录凭据、任务字段和该位置。'
-      : '将使用 Windows 实时定位，向学校发送登录凭据、任务字段和位置。')+'仍须通过学校验证，学校仍可拒绝。提交后会回查学校结果。';
+      ? '将使用已保存的模拟位置（非实时），向学校发送登录凭据、打卡信息和这个位置。'
+      : '将使用 Windows 实时定位，向学校发送登录凭据、打卡信息和当前位置。')+'学校仍会核验，可能拒绝；提交后会自动核对结果。';
   confirmAction(recheck?'回查提交结果？':'提交今日打卡？',text,()=>{
     if(!requireSavedLocationSource())return;
     if(source!==savedLocationSource()||recheck!==(state.dorm.state==='uncertain')){notify('定位来源或任务状态已变化，请重新确认。',true);return;}

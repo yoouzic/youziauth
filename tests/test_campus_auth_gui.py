@@ -303,13 +303,14 @@ class StartupOptionTests(unittest.TestCase):
         elevate.assert_called_once_with(["--configure-system-startup=enable"])
         enabled.assert_called_once_with()
 
-    def test_a_failed_helper_exit_code_is_reported_instead_of_assumed_success(self):
+    def test_a_failed_helper_is_reported_instead_of_assumed_success(self):
         with mock.patch.object(
             campus_auth_gui.startup_tasks, "launch_elevated", return_value=1
         ):
             with self.assertRaises(RuntimeError) as raised:
                 campus_auth_gui.set_startup_enabled(True)
-        self.assertIn("1", str(raised.exception))
+        self.assertIn("开机自启动配置失败", str(raised.exception))
+        self.assertNotIn("退出码", str(raised.exception))
 
     def test_a_declined_uac_prompt_reaches_the_caller(self):
         with mock.patch.object(

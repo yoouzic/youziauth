@@ -542,7 +542,8 @@ class DesktopBridge(LocationProbe):
         if action in ('network_check', 'network_start'):
             if self._agent:
                 self._agent_command('retry' if action == 'network_check' else 'reload-config')
-                return '已请求系统认证代理执行'
+                return ('已通知后台服务重新检测' if action == 'network_check'
+                        else '已通知后台服务开始后台检测')
             if self._monitoring or not self._network_gate.acquire(blocking=False):
                 raise RuntimeError('校园网检测正在运行，请等待完成或先停止后台检测。')
             try:
@@ -561,7 +562,7 @@ class DesktopBridge(LocationProbe):
             return '已开始后台检测' if self._monitoring else '正在检测，请稍候'
         if action == 'network_stop':
             if self._agent:
-                raise RuntimeError('系统代理由开机自启动管理；如需关闭，请取消开机自启动并保存。')
+                raise RuntimeError('后台服务由开机自启动管理；如需关闭，请取消开机自启动并保存。')
             self._stop.set()
             return '正在停止，当前网络请求结束后生效'
         if action in ('dorm_login', 'dorm_query', 'dorm_submit', 'dorm_logout'):
@@ -798,8 +799,8 @@ class DesktopBridge(LocationProbe):
         try:
             self._agent_command('check-update')
         except OSError:
-            raise RuntimeError('无法联系后台代理，请稍后重试或检查后台检测是否在运行。') from None
-        return '已请求后台代理检查更新；发现新版本会静默安装，无需再确认。'
+            raise RuntimeError('无法联系后台服务，请稍后重试或检查后台检测是否在运行。') from None
+        return '已开始检查更新；发现新版本会自动安装，无需再确认。'
 
     def _network_work(self, config, monitor):
         attempt = 0

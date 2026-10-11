@@ -368,7 +368,7 @@ class Updater:
 
             self._publish(dataclasses.replace(
                 status, state="installing", progress=100,
-                checked=_timestamp(), message=f"正在后台静默安装 v{version}…"), progress)
+                checked=_timestamp(), message=f"正在后台安装 v{version}…"), progress)
             launched = {"seen": False}
 
             def on_launch():

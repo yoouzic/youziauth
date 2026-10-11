@@ -462,7 +462,7 @@ def set_startup_enabled(enabled: bool, shortcut_path: Optional[Path] = None) -> 
             ["--configure-system-startup=" + ("enable" if enabled else "disable")]
         )
         if code != 0:
-            raise RuntimeError("开机自启动配置失败（提权助手退出码 %d），请重试。" % code)
+            raise RuntimeError("开机自启动配置失败，请重试。")
         if startup_tasks.is_system_startup_enabled() != enabled:
             raise RuntimeError(
                 "开机自启动状态未生效：管理员授权可能被取消，请在 UAC 提示中选择“是”后重试。"
@@ -724,7 +724,7 @@ class CampusAuthGui:
         try:
             code = startup_tasks.launch_elevated(["--configure-system-startup=enable"])
             if code != 0:
-                raise RuntimeError("提权助手退出码 %d" % code)
+                raise RuntimeError("管理员授权未完成，请重试")
         except Exception as exc:  # noqa: BLE001 - report UAC/setup failures in the UI.
             self._set_status(
                 f"修复系统代理失败：{exc}", windows_tray.TrayStatus.ERROR
@@ -1098,7 +1098,7 @@ class CampusAuthGui:
 
     def stop_monitor(self) -> None:
         if self.agent_mode:
-            self._set_status("系统级后台认证由计划任务持续运行")
+            self._set_status("后台服务由开机自启动管理；如需停用，请取消开机自启动并保存。")
             return
         self.stop_event.set()
         self.start_button.configure(state="normal")
