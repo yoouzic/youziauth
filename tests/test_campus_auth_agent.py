@@ -255,8 +255,14 @@ class AgentLoopTests(unittest.TestCase):
             while agent.snapshot.update.get('state') != 'installed' and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertEqual(agent.snapshot.update.get('state'), 'installed')
-            # 状态经同一条运行时快照通道发布，界面照原样读。
+            # 状态经同一条运行时快照通道发布，界面照原样读。落盘排在内存更新**之后**
+            # （_publish_update 先发布、再 best-effort 写文件），所以这里同样要等到期限，
+            # 不能只读一次 —— 读在 os.replace 之前就会看到上一份快照（CI 上偶发过一次，
+            # 主分支构因此变红，而同样的提交在发布流水线里是绿的）。
             written = agent_ipc.read_snapshot(self.snapshot_path)
+            while written.update.get('state') != 'installed' and time.monotonic() < deadline:
+                time.sleep(0.02)
+                written = agent_ipc.read_snapshot(self.snapshot_path)
             self.assertEqual(written.update.get('state'), 'installed')
         finally:
             finish.set()
