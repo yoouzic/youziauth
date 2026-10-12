@@ -290,6 +290,35 @@ class AgentLoopTests(unittest.TestCase):
         finally:
             release.set()
 
+    def test_an_update_line_does_not_trail_an_empty_detail_field(self):
+        # 2026-10-12 现场：detail 为空时行尾留着光秃秃的「detail=」，用户读起来像日志被截断了。
+        class QuietUpdater:
+            def run_cycle(inner, progress=None):
+                return auto_update.UpdateStatus(state='up_to_date', current_version='1.8.31',
+                                                latest_version='1.8.31', message='当前已是最新正式版。')
+
+        agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]), updater=QuietUpdater())
+        with agent._update_lock:
+            with self.assertLogs(agent.logger, level='INFO') as captured:
+                agent._run_update_check('periodic')
+        line = [entry for entry in captured.output if 'automatic update' in entry][-1]
+        self.assertIn('state=up_to_date current=1.8.31 latest=1.8.31', line)
+        self.assertNotIn('detail=', line, line)
+
+    def test_a_failed_update_still_names_its_detail(self):
+        class FailingUpdater:
+            def run_cycle(inner, progress=None):
+                return auto_update.UpdateStatus(state='error', current_version='1.8.31',
+                                                latest_version='1.8.32', message='更新未完成',
+                                                detail='签名校验失败')
+
+        agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]), updater=FailingUpdater())
+        with agent._update_lock:
+            with self.assertLogs(agent.logger, level='INFO') as captured:
+                agent._run_update_check('periodic')
+        line = [entry for entry in captured.output if 'automatic update' in entry][-1]
+        self.assertIn('detail=签名校验失败', line)
+
     def test_the_update_command_is_accepted_and_carries_no_arguments(self):
         # 指令里不能有参数：提权端自己决定下载和安装什么。
         command = agent_ipc.AgentCommand.parse({'command': 'check-update'})

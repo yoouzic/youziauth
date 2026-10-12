@@ -1959,3 +1959,11 @@ test('a record with no wording at all is not dressed up as a user message',async
   assert.equal(h.el('log-output').textContent,'2026-10-05T21:04:00+08:00 [signed]',
     '读不出说明就原样显示，不能把内部状态名 signed 当成文案给用户');
 });
+
+test('records written before the streak fix still read correctly',async()=>{
+  // 1.8.28–1.8.31 写坏过计数段；文件照旧不改，只是显示时把重复的「连续第」收掉。
+  const h=await dormRecords('2026-10-12T21:08:00+08:00 [network_error] 学校接口响应超时（20 秒未回应），请稍后重试 '
+    + '· 响应超时 20.7s／直连／本轮已重试 2 次／连续第 连续第 2 次');
+  assert.equal(h.el('log-output').textContent,
+    '10月12日 周一\n  21:08  学校接口响应超时（20 秒未回应），请稍后重试 · 响应超时 20.7s／直连／本轮已重试 2 次／连续第 2 次');
+});

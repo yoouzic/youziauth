@@ -600,7 +600,9 @@ class Engine:
             self._transient_key = message
         self.transient_streak += 1
         note = f'连续第 {self.transient_streak} 次'
-        detail = f'{detail}{STREAK_MARK}{note}' if detail else note
+        # STREAK_MARK 自己就带着「连续第」三个字，它只用来**匹配**已有记录（_failure_core 靠它
+        # 定位计数）；拼 detail 时必须用裸分隔符，否则写出来是「连续第 连续第 N 次」。
+        detail = f'{detail}／{note}' if detail else note
         if self.transient_streak >= TRANSIENT_ESCALATE_AT and TRANSIENT_ESCALATE_HINT not in message:
             message = f'{message}（{TRANSIENT_ESCALATE_HINT}）'
         return message, detail

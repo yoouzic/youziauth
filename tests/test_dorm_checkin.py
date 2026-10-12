@@ -515,6 +515,10 @@ class RepeatedFailureTests(unittest.TestCase):
         self.assertEqual(len(lines), 1, f'应折叠成一行，实际 {len(lines)} 行')
         self.assertIn('连续第 4 次', lines[0])
         self.assertIn('TLS 握手被切断 5.3s／直连', lines[0])
+        # 计数段整体是「／连续第 N 次」：少写一次「连续第」才是对的（STREAK_MARK 自带那三个字，
+        # 只用来匹配，不能拿来拼接）。
+        self.assertIn('／连续第 4 次', lines[0])
+        self.assertNotIn('连续第 连续第', lines[0])
 
     def test_the_escalated_text_is_its_own_line_and_then_also_collapses(self):
         self.failing_runs(7)
@@ -538,6 +542,7 @@ class RepeatedFailureTests(unittest.TestCase):
         self.assertIn('已连续多次失败', results[4].message)
         self.assertIn('「规则」模式', results[4].message)
         self.assertIn('连续第 5 次', results[4].detail)
+        self.assertTrue(results[4].detail.endswith('／连续第 5 次'), results[4].detail)
         # 第 6 次仍然是升级后的文案（通知去重键才不会再变来变去）
         self.assertIn('「规则」模式', self.failing_runs(1)[0].message)
 

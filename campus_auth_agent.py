@@ -348,9 +348,12 @@ class Agent:
         except Exception as exc:  # noqa: BLE001 - a failed update must not stop the agent
             self.logger.warning("automatic update failed: %s", type(exc).__name__)
             return self.snapshot
+        # detail 为空时不写这个字段：行尾挂一个光秃秃的「detail=」看上去就像日志被截断了
+        # （2026-10-12 现场），而它本来就不带任何信息。有内容才写。
         self.logger.info(
-            "automatic update (%s): state=%s current=%s latest=%s detail=%s",
-            reason, status.state, status.current_version, status.latest_version, status.detail,
+            "automatic update (%s): state=%s current=%s latest=%s%s",
+            reason, status.state, status.current_version, status.latest_version,
+            f" detail={status.detail}" if status.detail else "",
         )
         return self._publish_update(status)
 

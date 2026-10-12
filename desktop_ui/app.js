@@ -50,7 +50,10 @@ function dormRecord(line){
 }
 function dormRecordText(record){
   const label = DORM_SHORT[record.message] || record.message || record.state || '检查';
-  return record.detail ? label + ' · ' + record.detail : label;
+  const text = record.detail ? label + ' · ' + record.detail : label;
+  // 1.8.28–1.8.31 的旧记录把计数段写成了「连续第 连续第 N 次」（生产端已修）。历史文件不动，
+  // 显示时收掉重复的前缀，免得同一页里新旧两种写法并排。
+  return text.replace(/连续第\s+连续第\s+/g, '连续第 ');
 }
 function compactDormLog(text){
   const blocks = [];
