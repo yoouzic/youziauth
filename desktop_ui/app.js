@@ -20,19 +20,36 @@ const MAP_TILE_STALL = 8000;   // ms with nothing drawn before the next provider
 const LOG_STATUS_LINE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} +\w+ current auth status:/;
 const logView = {showNewest:false, stick:true, unread:0, upto:0};
 
-/* 寝室打卡记录的显示整理 ----------------------------------------------------------------------
-   history.log 是排障用的原始记录：一行一次检查，写成「时间 [内部状态] 文案 · 诊断」。原样贴在
-   页面上，一周就是十几行「每天三行、行行相似」，最该看到的结论反而被淹掉。所以这里只整理**显示**：
-   每天各占一段（日期只写一次）、去掉内部状态名、丢掉当天成功之后那句例行的「不再重复检查」，
-   每条记录留着自己的时刻。**不做跨天合并** —— 并成「连续 N 天」看着简洁，但哪天不一样就看不出来
-   了，而「哪天不一样」正是这份记录要回答的事。解析不出来的行原样保留，history.log 本身、以及
-   校园网那份流水日志都不受影响。 */
+/* 运行记录的显示整理 --------------------------------------------------------------------------
+   两份日志都是排障用的原始记录，原样铺在页面上就是一屏「每隔半小时一句、句句相同」。所以这里只
+   整理**显示**：按天分段（日期只写一次）、把机器话换成用户看得懂的短句、连续相同的记录合成一条。
+   **不做跨天合并** —— 并成「连续 N 天」看着简洁，但哪天不一样就看不出来了，而「哪天不一样」
+   正是这份记录要回答的事。解析不出来的行原样保留；history.log 与 agent.log 本身都不动。 */
+const WEEKDAYS = ['周日','周一','周二','周三','周四','周五','周六'];
+function dayTitle(year, month, day){
+  return `${Number(month)}月${Number(day)}日 `
+    + WEEKDAYS[new Date(Number(year), Number(month) - 1, Number(day)).getDay()];
+}
+// 同一天的行归成一段，看不懂的行原样插在流里，不猜也不丢。
+function groupByDay(text, parse){
+  const blocks = [];
+  for(const line of String(text || '').split('\n')){
+    if(!line.trim()) continue;
+    const record = parse(line);
+    if(!record){blocks.push({raw:line}); continue;}
+    const last = blocks[blocks.length - 1];
+    if(last && last.entries && last.day === record.day) last.entries.push(record);
+    else blocks.push({day:record.day, title:record.title, entries:[record]});
+  }
+  return blocks;
+}
+
+/* 寝室打卡：history.log 一行一次检查，写成「时间 [内部状态] 文案 · 诊断」。 */
 const DORM_LINE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\s+\[([^\]]*)\]\s*(.*)$/;
 // 当天已经打过卡，这一次只是例行复查：它只重复上一条已经说过的事。
 const DORM_ROUTINE = '今日打卡已完成，当天不再重复检查';
 // 后端文案里最啰嗦的一句，换成用户看得懂的两个字。
 const DORM_SHORT = {'服务器已确认今日任务完成':'打卡完成', [DORM_ROUTINE]:'今日已完成'};
-const WEEKDAYS = ['周日','周一','周二','周三','周四','周五','周六'];
 function dormRecord(line){
   const m = DORM_LINE.exec(line.trim());
   if(!m) return null;
@@ -41,8 +58,7 @@ function dormRecord(line){
   // （正常写入的 history.log 不会只有状态没有文案）。
   if(!body) return null;
   return {
-    day:`${m[1]}-${m[2]}-${m[3]}`,
-    title:`${Number(m[2])}月${Number(m[3])}日 ${WEEKDAYS[new Date(Number(m[1]), Number(m[2])-1, Number(m[3])).getDay()]}`,
+    day:`${m[1]}-${m[2]}-${m[3]}`, title:dayTitle(m[1], m[2], m[3]),
     time:`${m[4]}:${m[5]}`, state:m[6],
     message:cut === -1 ? body : body.slice(0, cut),
     detail:cut === -1 ? '' : body.slice(cut + 3),
@@ -56,17 +72,8 @@ function dormRecordText(record){
   return text.replace(/连续第\s+连续第\s+/g, '连续第 ');
 }
 function compactDormLog(text){
-  const blocks = [];
-  for(const line of String(text || '').split('\n')){
-    if(!line.trim()) continue;
-    const record = dormRecord(line);
-    if(!record){blocks.push({raw:line}); continue;}   // 看不懂的行原样留着，不猜
-    const last = blocks[blocks.length - 1];
-    if(last && last.entries && last.day === record.day) last.entries.push(record);
-    else blocks.push({day:record.day, title:record.title, entries:[record]});
-  }
   const lines = [];
-  for(const block of blocks){
+  for(const block of groupByDay(text, dormRecord)){
     if(!block.entries){lines.push(block.raw); continue;}
     // 这一天真的打上卡了，才轮得到那句例行复查被丢掉。
     const done = block.entries.some(record => record.state === 'signed' && record.message !== DORM_ROUTINE);
@@ -78,12 +85,90 @@ function compactDormLog(text){
   }
   return lines.join('\n');
 }
+
+/* 校园网：agent.log 是英文机器话（「时间 级别 消息」）。心跳和例行检测占了绝大多数篇幅，句句
+   一模一样，所以除了按天分段，还把已知消息换成短句、把连续相同的一条合成「（×N，至 HH:MM）」。
+   不认识的句子原样保留，只去掉时间戳和级别里的信息量最低的部分。 */
+const NET_LINE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):\d{2}\s+([A-Z]+)\s+(.*)$/;
+// 非 INFO 的级别要在显示里留下痕迹，否则一句普通的「失败」和一次崩溃看起来一样。
+const NET_LEVEL = {WARNING:'警告', ERROR:'错误', CRITICAL:'严重'};
+// 自动更新的状态词，与更新页、auto_update.STATES 同一套。
+const NET_UPDATE_STATE = {idle:'等待检查', checking:'正在检查', downloading:'正在后台下载',
+  verifying:'正在校验', ready:'准备安装', up_to_date:'已是最新', installing:'正在安装',
+  installed:'已更新完成', error:'更新未完成', launching:'正在安装', launched:'已更新完成'};
+// 例行行：心跳与「已认证」的例行检测。它们每分钟/每半小时来一条，不该把人从旧记录里叫回来。
+const LOG_ROUTINE_LINE = /^\d{2}:\d{2}\s+(?:后台检查正常|例行检测：已认证)(?:（×\d+，至 \d{2}:\d{2}）)?$/;
+function netLabel(message){
+  let m;
+  // 心跳：句尾的「)」容忍缺失，日志被写了一半时也认得出。
+  if(/^uplink is up; background check running \(every \d+s\)?$/.test(message)) return '后台检查正常';
+  if((m = /^current auth status: (\S+)$/.exec(message))){
+    if(m[1] === 'authenticated') return '例行检测：已认证';
+    if(m[1] === 'unauthenticated') return '检测到未认证，准备重新认证';
+    return '认证状态：' + m[1];
+  }
+  if(/^forcing a fresh login attempt$/.test(message)) return '开始重新认证';
+  if(/^login succeeded: /.test(message)) return '认证成功';
+  if((m = /^login failed: (.*)$/.exec(message))) return '认证失败：' + m[1];
+  if((m = /^login attempt failed before server response: (.*)$/.exec(message))) return '认证请求未送达：' + m[1];
+  if(/^portal reports an authenticated session but the uplink is down; leaving the session alone$/.test(message))
+    return '学校会话仍有效，但外网不通，暂不处理';
+  if((m = /^automatic update \((\w+)\): state=(\w+) current=(\S*) latest=(\S*)(?:\s+(.*))?$/.exec(message))){
+    const version = (m[4] || m[3] || '').replace(/^v/, '');
+    // 尾部通常是 detail=…；以后加了别的字段也照抄，不能因为多一个字段就退回整行原文。
+    const tail = (m[5] || '').replace(/^detail=/, '');
+    return (m[1] === 'requested' ? '手动检查更新：' : '后台更新：')
+      + (NET_UPDATE_STATE[m[2]] || m[2]) + (version ? '（v' + version + '）' : '')
+      + (tail ? ' · ' + tail : '');
+  }
+  if((m = /^automatic update failed: (.*)$/.exec(message))) return '自动更新未完成（' + m[1] + '）';
+  if((m = /^automatic update disabled: (.*)$/.exec(message))) return '自动更新未启用：' + m[1];
+  if((m = /^update result recovery failed: (.*)$/.exec(message))) return '更新结果处理失败（' + m[1] + '）';
+  if((m = /^periodic update check failed: (.*)$/.exec(message))) return '定时检查更新失败（' + m[1] + '）';
+  if((m = /^network probe failed: (.*)$/.exec(message))) return '网络检测失败：' + m[1];
+  if((m = /^agent command channel failed: (.*)$/.exec(message))) return '界面通道异常：' + m[1];
+  return '';
+}
+function netRecord(line){
+  const m = NET_LINE.exec(line.trim());
+  if(!m) return null;
+  return {
+    day:`${m[1]}-${m[2]}-${m[3]}`, title:dayTitle(m[1], m[2], m[3]),
+    time:`${m[4]}:${m[5]}`, level:m[6], message:m[7] || '',
+  };
+}
+function netRecordText(record){
+  // 认不出来就原样给人看：这条日志本身就是排障材料，翻译不了也别丢。
+  const text = netLabel(record.message) || record.message || record.level;
+  return NET_LEVEL[record.level] ? NET_LEVEL[record.level] + ' ' + text : text;
+}
+function compactNetworkLog(text){
+  const lines = [];
+  for(const block of groupByDay(text, netRecord)){
+    if(!block.entries){lines.push(block.raw); continue;}
+    const runs = [];
+    for(const record of block.entries){
+      const line = netRecordText(record), last = runs[runs.length - 1];
+      // 「前后相同」的那些只留一条：次数和最后一次的时刻写进括号，别的都省略。
+      if(last && last.text === line){last.count++; last.until = record.time; continue;}
+      runs.push({time:record.time, until:record.time, text:line, count:1});
+    }
+    lines.push(block.title);
+    for(const run of runs){
+      lines.push('  ' + run.time + '  ' + run.text
+        + (run.count > 1 ? `（×${run.count}，至 ${run.until}）` : ''));
+    }
+  }
+  return lines.join('\n');
+}
+
 function logText(){
   const raw = (state && state.logs && state.logs[logType]) || '';
-  return logType === 'dorm' ? compactDormLog(raw) : raw;
+  // 两份日志都是给人看的：寝室打卡那份是后端写好的中文，校园网那份要在这里换成短句。
+  return logType === 'dorm' ? compactDormLog(raw) : compactNetworkLog(raw);
 }
-// 例行 status 行每分钟一条，不该被算成「新记录」。
-function isStatusLine(line){return LOG_STATUS_LINE.test(line);}
+// 例行 status 行每分钟一条，不该被算成「新记录」。压缩后的心跳/例行检测行同样不算。
+function isStatusLine(line){return LOG_STATUS_LINE.test(line) || LOG_ROUTINE_LINE.test(line);}
 // 用户眼里「一条记录」的数量：非空、且不是例行 status 的行。
 function logTold(text){return text.split('\n').filter(line=>line.trim()&&!isStatusLine(line)).length;}
 // 元素没有渲染出来（还没显示 / 测试桩）时按「在底部」处理：只有真正能滚动时才谈打断。

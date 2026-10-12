@@ -1797,7 +1797,8 @@ test('a snapshot without the per-account status fields still renders the bar',as
 /* 运行记录的滚动落点 --------------------------------------------------------------------------
    日志是升序的（最旧在上），人点开它多半想看「刚才那一下为什么失败」，也就是最后几行。 */
 const LOG_STATUS=min=>`2026-10-10 11:${min}:01 INFO current auth status: authenticated`;
-const LOG_ERROR=min=>`2026-10-10 11:${min}:05 ERROR login failed: 设备未注册,请在ePortal上添加认证设备`;
+const LOG_ERROR=(min,detail='设备未注册,请在ePortal上添加认证设备')=>
+  `2026-10-10 11:${min}:05 ERROR login failed: ${detail}`;
 function recordsHarness(network=[LOG_STATUS('00'),LOG_ERROR('02')].join('\n')){
   return harness('windows',{logs:{network}});
 }
@@ -1822,7 +1823,7 @@ test('reading older records is never interrupted, not even by the 1.5s snapshot'
   h.navigate('records');await h.refresh();
   await h.refresh();
   h.scrolled(0);
-  h.data.logs.network+='\n'+LOG_ERROR('10');
+  h.data.logs.network+='\n'+LOG_ERROR('10','账号或密码错误');
   await h.refresh();
   assert.equal(h.el('log-output').scrollTop,0,'正在翻旧记录时不能被拽回底部');
   assert.equal(h.el('log-jump').hidden,false,'有新记录时要出现提示');
@@ -1837,9 +1838,9 @@ test('routine status lines never ring the unread counter',async()=>{
   h.navigate('records');await h.refresh();
   await h.refresh();
   h.scrolled(0);
-  h.data.logs.network+='\n'+LOG_ERROR('11')+'\n'+LOG_STATUS('12')+'\n'+LOG_ERROR('13');
+  h.data.logs.network+='\n'+LOG_ERROR('11')+'\n'+LOG_STATUS('12')+'\n'+LOG_ERROR('13','账号或密码错误');
   await h.refresh();
-  assert.equal(h.el('log-jump-count').textContent,'2','每分钟一条的 status 行不算新记录');
+  assert.equal(h.el('log-jump-count').textContent,'2','例行的 status 行不算新记录，两条不同的失败才算');
   assert.equal(h.el('log-output').scrollTop,0);
 });
 
@@ -1848,7 +1849,7 @@ test('scrolling back to the bottom clears the prompt and resumes following',asyn
   h.navigate('records');await h.refresh();
   await h.refresh();
   h.scrolled(0);
-  h.data.logs.network+='\n'+LOG_ERROR('10');
+  h.data.logs.network+='\n'+LOG_ERROR('10','账号或密码错误');
   await h.refresh();
   assert.equal(h.el('log-jump').hidden,false);
   h.scrolled(h.el('log-output').scrollHeight);
@@ -1863,7 +1864,7 @@ test('the unread prompt jumps to the newest line when clicked',async()=>{
   h.navigate('records');await h.refresh();
   await h.refresh();
   h.scrolled(0);
-  h.data.logs.network+='\n'+LOG_ERROR('10');
+  h.data.logs.network+='\n'+LOG_ERROR('10','账号或密码错误');
   await h.refresh();
   h.el('log-jump').onclick();
   assert.equal(h.el('log-output').scrollTop,h.el('log-output').scrollHeight,'点提示要回到底部');
@@ -1880,8 +1881,93 @@ test('the records page still renders text and hides the prompt when there is not
   h.data.logs.network=LOG_ERROR('02');
   await h.refresh();
   assert.equal(h.el('log-output').hidden,false);
-  assert.equal(h.el('log-output').textContent,LOG_ERROR('02'),'日志照旧按纯文本渲染');
+  assert.equal(h.el('log-output').textContent,
+    '10月10日 周六\n  11:02  错误 认证失败：设备未注册,请在ePortal上添加认证设备','日志照旧按纯文本渲染');
   assert.equal(h.el('empty-records').hidden,true);
+});
+
+/* 校园网记录的显示整理 -------------------------------------------------------------------------
+   agent.log 是英文机器话，心跳占了绝大多数篇幅。按天分段、已知消息换成短句、连续相同的一条
+   合成「（×N，至 HH:MM）」；不认识的消息原样保留，两个日志文件本身都不动。 */
+const NET_HISTORY=[
+  '2026-10-12 10:47:09 INFO automatic update (requested): state=up_to_date current=1.8.31 latest=1.8.31',
+  '2026-10-12 10:54:42 INFO uplink is up; background check running (every 60s)',
+  '2026-10-12 11:02:06 INFO uplink is up; background check running (every 60s)',
+  '2026-10-12 11:32:19 INFO uplink is up; background check running (every 60s)',
+  '2026-10-12 11:36:48 INFO automatic update (requested): state=up_to_date current=1.8.32 latest=1.8.32',
+  '2026-10-12 12:02:41 INFO uplink is up; background check running (every 60s)',
+  '2026-10-12 12:21:07 INFO current auth status: unauthenticated',
+  '2026-10-12 12:21:07 INFO login succeeded: success',
+  '2026-10-12 12:22:08 INFO uplink is up; background check running (every 60s)',
+  '2026-10-12 12:52:17 INFO uplink is up; background check running (every 60s)',
+  '2026-10-12 13:03:27 INFO current auth status: unauthenticated',
+  '2026-10-12 13:03:27 INFO login succeeded: success',
+  '2026-10-12 13:04:27 INFO uplink is up; background check running (every 60s)',
+  '2026-10-12 13:34:39 INFO uplink is up; background check running (every 60s)',
+  '2026-10-12 14:01:59 INFO current auth status: authenticated',
+  '2026-10-12 14:01:59 INFO portal reports an authenticated session but the uplink is down; leaving the session alone',
+  '2026-10-12 14:02:59 INFO uplink is up; background check running (every 60s)',
+  '2026-10-12 14:33:09 INFO uplink is up; background check running (every 60s)'].join('\n');
+
+async function networkRecords(network){
+  const h=harness('windows',{logs:{network}});
+  h.navigate('records');
+  await h.refresh();
+  return h;
+}
+
+test('network records say what changed, in one line per run',async()=>{
+  const h=await networkRecords(NET_HISTORY);
+  assert.equal(h.el('log-output').textContent,[
+    '10月12日 周一',
+    '  10:47  手动检查更新：已是最新（v1.8.31）',
+    '  10:54  后台检查正常（×3，至 11:32）',
+    '  11:36  手动检查更新：已是最新（v1.8.32）',
+    '  12:02  后台检查正常',
+    '  12:21  检测到未认证，准备重新认证',
+    '  12:21  认证成功',
+    '  12:22  后台检查正常（×2，至 12:52）',
+    '  13:03  检测到未认证，准备重新认证',
+    '  13:03  认证成功',
+    '  13:04  后台检查正常（×2，至 13:34）',
+    '  14:01  例行检测：已认证',
+    '  14:01  学校会话仍有效，但外网不通，暂不处理',
+    '  14:02  后台检查正常（×2，至 14:33）'].join('\n'));
+});
+
+test('an unknown or unreadable network line is shown as it is',async()=>{
+  const h=await networkRecords([
+    '2026-10-12 09:00:00 WARNING network probe failed: 连接被重置',
+    '2026-10-12 09:01:00 INFO some brand new sentence',
+    '2026-10-12 09:02:00 这行根本不是日志格式'].join('\n'));
+  assert.equal(h.el('log-output').textContent,[
+    '10月12日 周一',
+    '  09:00  警告 网络检测失败：连接被重置',
+    '  09:01  some brand new sentence',
+    '2026-10-12 09:02:00 这行根本不是日志格式'].join('\n'),
+    '认得出就换短句，认不出就原样给；级别不能丢');
+});
+
+test('an update line keeps its reason and any field we do not know yet',async()=>{
+  const h=await networkRecords([
+    '2026-10-12 09:00:00 INFO automatic update (periodic): state=error current=1.8.32 latest=1.8.33 detail=签名校验失败',
+    '2026-10-12 09:01:00 INFO automatic update (periodic): state=downloading current=1.8.32 latest=1.8.33 progress=40'].join('\n'));
+  assert.equal(h.el('log-output').textContent,[
+    '10月12日 周一',
+    '  09:00  后台更新：更新未完成（v1.8.33） · 签名校验失败',
+    '  09:01  后台更新：正在后台下载（v1.8.33） · progress=40'].join('\n'),
+    '多一个不认识的字段也要照抄，不能退回整行原文');
+});
+
+test('routine heartbeats never ring the unread counter in the compact view',async()=>{
+  const h=await networkRecords(NET_HISTORY);
+  h.scrolled(0);
+  h.data.logs.network+='\n2026-10-12 15:03:19 INFO uplink is up; background check running (every 60s)';
+  await h.refresh();
+  assert.equal(h.el('log-jump').hidden,true,'心跳自己来了不该把人从旧记录里叫回来');
+  h.data.logs.network+='\n2026-10-12 15:20:00 INFO current auth status: unauthenticated';
+  await h.refresh();
+  assert.equal(h.el('log-jump-count').textContent,'1','真出了事才提示');
 });
 
 /* 寝室打卡记录的显示整理 -----------------------------------------------------------------------
