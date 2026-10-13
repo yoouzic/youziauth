@@ -263,18 +263,12 @@ class AgentLoopTests(unittest.TestCase):
             # 回来的时候更新还没结束 —— 这就是「不阻塞指令通道」。
             self.assertNotEqual(snapshot.update.get('state'), 'installed')
             finish.set()
-            deadline = time.monotonic() + UPDATE_SETTLE_TIMEOUT
-            while agent.snapshot.update.get('state') != 'installed' and time.monotonic() < deadline:
-                time.sleep(0.02)
+            # 内存状态先发布，文件随后原子替换。先等 worker 完成，再读磁盘；
+            # Windows 下并发轮询文件会持有读句柄，可能阻止 os.replace。
+            self.assertTrue(agent.wait_for_update(UPDATE_SETTLE_TIMEOUT),
+                            'the update worker must finish publishing its result')
             self.assertEqual(agent.snapshot.update.get('state'), 'installed')
-            # 状态经同一条运行时快照通道发布，界面照原样读。落盘排在内存更新**之后**
-            # （_publish_update 先发布、再 best-effort 写文件），所以这里同样要等到期限，
-            # 不能只读一次 —— 读在 os.replace 之前就会看到上一份快照（CI 上偶发过一次，
-            # 主分支构因此变红，而同样的提交在发布流水线里是绿的）。
             written = agent_ipc.read_snapshot(self.snapshot_path)
-            while written.update.get('state') != 'installed' and time.monotonic() < deadline:
-                time.sleep(0.02)
-                written = agent_ipc.read_snapshot(self.snapshot_path)
             self.assertEqual(written.update.get('state'), 'installed')
         finally:
             finish.set()
