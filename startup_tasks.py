@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import csv
 import ctypes
 import os
@@ -21,6 +22,11 @@ SYSTEM_TASK_NAME = r"\youziauth\SystemAgent"
 TRAY_TASK_NAME = r"\youziauth\Tray"
 SYSTEM_SID = "S-1-5-18"
 USER_SID_PATTERN = r"S-1-(?:5-21|12-1)-(?:\d+-){3}\d+"
+# Bounded retries cover task-command failures; they do not repair a missing
+# executable dependency or prove that a requested task has started successfully.
+TASK_REGISTRATION_ATTEMPTS = 3
+TASK_REGISTRATION_RETRY_DELAY_SECONDS = 1.5
+ENSURE_AGENT_TIMEOUT_SECONDS = 15.0
 
 ET.register_namespace("", TASK_NS)
 
@@ -125,8 +131,29 @@ def _run_task_command(
     arguments: list[str],
     *,
     check: bool,
+    attempts: int = 1,
+    retry_delay_seconds: float = TASK_REGISTRATION_RETRY_DELAY_SECONDS,
 ) -> subprocess.CompletedProcess:
-    return runner(arguments, check=check, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    """Run one schtasks command, retrying a transient refusal.
+
+    Failures are retried a bounded number of times, then reported to the caller.
+    This is only task-command recovery: the 2026-10-13 installer helper failed
+    before running this code because old-product removal had deleted its Python
+    DLL. Task-command retries cannot repair that payload failure.
+    """
+    last: subprocess.CompletedProcess | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        last = runner(arguments, check=False, stdin=subprocess.DEVNULL,
+                      capture_output=True, text=True)
+        if last.returncode == 0:
+            return last
+        if attempt < attempts:
+            time.sleep(retry_delay_seconds)
+    if check and last is not None:
+        raise subprocess.CalledProcessError(
+            last.returncode, arguments, output=last.stdout, stderr=last.stderr
+        )
+    return last
 
 
 def configure_system_startup(
@@ -248,13 +275,89 @@ def repair_installed_tasks(
         ):
             path = Path(temporary) / filename
             _write_xml(path, definition)
-            _run_task_command(runner, ["schtasks.exe", "/Create", "/TN", name,
-                                      "/XML", str(path), "/F"], check=True)
+            _run_task_command(
+                runner,
+                ["schtasks.exe", "/Create", "/TN", name, "/XML", str(path), "/F"],
+                check=True,
+                attempts=TASK_REGISTRATION_ATTEMPTS,
+            )
     # Keep registered tasks if a start fails, so boot can still recover them.
-    _run_task_command(runner, ["schtasks.exe", "/Run", "/TN", SYSTEM_TASK_NAME], check=True)
+    _run_task_command(
+        runner,
+        ["schtasks.exe", "/Run", "/TN", SYSTEM_TASK_NAME],
+        check=True,
+        attempts=TASK_REGISTRATION_ATTEMPTS,
+    )
     # There may be no signed-in user; never draw the tray on the SYSTEM desktop.
     _run_task_command(runner, ["schtasks.exe", "/Run", "/TN", TRAY_TASK_NAME], check=False)
     return True
+
+
+def _agent_healthy(
+    *, runner: Callable[..., subprocess.CompletedProcess], timeout_seconds: float,
+    pipe_name: str = "youziauth-agent",
+) -> bool:
+    """Require a bounded, valid status reply rather than a process name.
+
+    The pipe reader is asynchronous and the subprocess deadline also bounds
+    PowerShell startup and disposal. A synchronous agent_ipc.send_command read
+    would have no deadline after connection and can hang an MSI commit helper.
+    """
+    from windows_update import _AGENT_HEALTHCHECK, _system_tool
+
+    if timeout_seconds <= 0:
+        return False
+    powershell = _system_tool("WindowsPowerShell/v1.0/powershell.exe")
+    milliseconds = max(1, int((timeout_seconds - 0.25) * 1000))
+    script = ("$ErrorActionPreference = 'Stop'\n" + _AGENT_HEALTHCHECK +
+              f"\nif (Test-AgentHealthy -pipeName $env:YOUZIAUTH_AGENT_HEALTH_PIPE -timeoutMs {milliseconds}) {{ exit 0 }}; exit 1\n")
+    environment = os.environ.copy()
+    environment["PSModulePath"] = str(powershell.parent / "Modules")
+    environment["YOUZIAUTH_AGENT_HEALTH_PIPE"] = pipe_name
+    try:
+        result = runner(
+            [str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand",
+             base64.b64encode(script.encode("utf-16le")).decode("ascii")],
+            env=environment, shell=False, check=False, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=timeout_seconds,
+            creationflags=0x08000000,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def ensure_agent_running(
+    runner: Callable[..., subprocess.CompletedProcess] | None = None,
+    *, timeout_seconds: float = ENSURE_AGENT_TIMEOUT_SECONDS,
+) -> bool:
+    """Recover an existing SYSTEM task and require an actual bounded IPC reply.
+
+    Never create a missing task or infer health from this helper's own process
+    name. An accepted task request alone is not a successful recovery.
+    """
+    runner = runner or subprocess.run
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        if _agent_healthy(runner=runner, timeout_seconds=min(1.5, deadline - time.monotonic())):
+            return True
+        from windows_update import _system_tool
+
+        scheduler = str(_system_tool("schtasks.exe"))
+        for operation, budget in (("/Query", 2.0), ("/Run", 3.0)):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            result = runner(
+                [scheduler, operation, "/TN", SYSTEM_TASK_NAME],
+                check=False, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                timeout=min(budget, remaining), creationflags=0x08000000,
+            )
+            if result.returncode != 0:
+                return False
+        return _agent_healthy(runner=runner, timeout_seconds=deadline - time.monotonic())
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def install_dir_for_current_process(executable: Path | None = None) -> Path | None:

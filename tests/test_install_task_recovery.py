@@ -1,5 +1,8 @@
+import os
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -134,6 +137,259 @@ class InstallTaskRecoveryTests(unittest.TestCase):
         load.assert_not_called()
 
 
+class TaskCommandRetryTests(unittest.TestCase):
+    """Task-command failures are retried and then reported as requested.
+
+    The 2026-10-13 missing-DLL failure happened before this code could run.
+    These tests cover scheduler command recovery rather than that MSI failure.
+    """
+
+    def test_a_transient_refusal_is_retried_until_it_succeeds(self):
+        results = [1, 1, 0]
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, results.pop(0), '', 'boom')
+
+        with patch.object(tasks.time, 'sleep') as sleep:
+            result = tasks._run_task_command(
+                runner, ['schtasks.exe', '/Run', '/TN', tasks.SYSTEM_TASK_NAME],
+                check=True, attempts=3, retry_delay_seconds=0,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_a_persistent_refusal_still_raises_when_the_caller_asked_for_that(self):
+        def runner(args, **kwargs):
+            return subprocess.CompletedProcess(args, 1, '', 'denied')
+
+        with patch.object(tasks.time, 'sleep'):
+            with self.assertRaises(subprocess.CalledProcessError):
+                tasks._run_task_command(runner, ['schtasks.exe', '/Run'], check=True, attempts=3)
+
+    def test_a_best_effort_command_reports_failure_instead_of_raising(self):
+        def runner(args, **kwargs):
+            return subprocess.CompletedProcess(args, 1, '', 'denied')
+
+        with patch.object(tasks.time, 'sleep'):
+            result = tasks._run_task_command(runner, ['schtasks.exe', '/Delete'], check=False, attempts=2)
+
+        self.assertEqual(result.returncode, 1)
+
+    def test_repairing_tasks_retries_the_agent_start(self):
+        attempts = {'run': 0, 'create': 0}
+
+        def runner(args, **kwargs):
+            name = args[args.index('/TN') + 1] if '/TN' in args else ''
+            if args[1] == '/Query':
+                return subprocess.CompletedProcess(
+                    args, 0, tasks.build_tray_task_xml(Path('C:/old'), SID), '')
+            if args[1] == '/Create':
+                attempts['create'] += 1
+                return subprocess.CompletedProcess(args, 0, '', '')
+            attempts['run'] += 1
+            # The first start of the SYSTEM task is refused, the second succeeds.
+            refused = attempts['run'] == 1 and name == tasks.SYSTEM_TASK_NAME
+            return subprocess.CompletedProcess(args, 1 if refused else 0, '', 'busy')
+
+        with patch.object(tasks.time, 'sleep'):
+            restored = tasks.repair_installed_tasks(
+                Path('C:/installed'), runner=runner,
+                storage_setup=lambda sid: None, input_storage_setup=lambda sid: None)
+
+        self.assertTrue(restored)
+        self.assertEqual(attempts['create'], 2, 'both tasks are still created exactly once')
+        self.assertGreaterEqual(attempts['run'], 3, 'the refused start must have been retried')
+
+    def test_an_upgrade_leaves_an_agent_running_even_if_the_repair_failed(self):
+        # The installer already killed both processes. Repair can fail (it did on
+        # 2026-10-13); the last commit action must still try to bring the agent back.
+        started = []
+
+        def runner(args, **kwargs):
+            if args[0].endswith('tasklist.exe'):
+                return subprocess.CompletedProcess(args, 0, 'INFO: No tasks are running', '')
+            if args[0].endswith('schtasks.exe'):
+                started.append(args[args.index('/TN') + 1])
+                return subprocess.CompletedProcess(args, 0, '', '')
+            return subprocess.CompletedProcess(args, 1, '', '')
+
+        with patch.object(tasks, '_agent_healthy', side_effect=[False, True]):
+            self.assertTrue(tasks.ensure_agent_running(runner=runner))
+        self.assertEqual(started, [tasks.SYSTEM_TASK_NAME, tasks.SYSTEM_TASK_NAME])
+
+    def test_ensure_agent_does_not_disturb_a_running_agent(self):
+        started = []
+
+        def runner(args, **kwargs):
+            if args[0].endswith('tasklist.exe'):
+                return subprocess.CompletedProcess(
+                    args, 0, 'youziauth-agent.exe         89400 Services', '')
+            started.append(args)
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        with patch.object(tasks, '_agent_healthy', return_value=True):
+            self.assertTrue(tasks.ensure_agent_running(runner=runner))
+        self.assertEqual(started, [], 'a healthy agent must not be restarted')
+
+    def test_ensure_agent_reports_failure_instead_of_raising(self):
+        def runner(args, **kwargs):
+            if args[0].endswith('tasklist.exe'):
+                return subprocess.CompletedProcess(args, 0, 'INFO: No tasks are running', '')
+            return subprocess.CompletedProcess(args, 1, '', 'denied')
+
+        with patch.object(tasks, '_agent_healthy', return_value=False):
+            self.assertFalse(tasks.ensure_agent_running(runner=runner))
+
+    def test_the_agent_helper_dispatches_ensure_agent_without_config_or_network(self):
+        with patch.object(tasks, 'ensure_agent_running', return_value=True) as ensure, \
+             patch.object(campus_auth_agent, 'load_agent_config') as load:
+            self.assertEqual(campus_auth_agent.main(['--ensure-agent']), 0)
+        ensure.assert_called_once()
+        load.assert_not_called()
+
+    def test_the_ensure_agent_action_never_fails_the_installation(self):
+        root = ET.parse(Path(__file__).resolve().parents[1] / 'packaging/youziauth.wxs').getroot()
+        ns = {'w': 'http://wixtoolset.org/schemas/v4/wxs'}
+        action = root.find('.//w:CustomAction[@Id="EnsureAgentRunning"]', ns)
+        self.assertIsNotNone(action)
+        self.assertEqual(action.get('Execute'), 'commit')
+        self.assertEqual(action.get('Impersonate'), 'no')
+        self.assertEqual(action.get('Return'), 'ignore')
+        self.assertIn('--ensure-agent', action.get('ExeCommand'))
+        schedule = root.find(
+            './/w:InstallExecuteSequence/w:Custom[@Action="EnsureAgentRunning"]', ns)
+        self.assertEqual(schedule.get('After'), 'RepairInstalledTasks')
+
+
+class EnsureAgentHealthTests(unittest.TestCase):
+    def test_the_helper_process_name_is_not_proof_of_a_running_agent(self):
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append(args)
+            if args[0].endswith('tasklist.exe'):
+                return subprocess.CompletedProcess(
+                    args, 0, 'youziauth-agent.exe         89400 Services', '')
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        with patch.object(tasks, '_agent_healthy', return_value=False, create=True):
+            self.assertFalse(tasks.ensure_agent_running(runner=runner))
+        self.assertFalse(any(args[0].endswith('tasklist.exe') for args in calls))
+        self.assertTrue(any('/Run' in args for args in calls))
+
+    def test_an_accepted_task_request_without_an_ipc_reply_is_not_success(self):
+        def runner(args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        with patch.object(tasks, '_agent_healthy', return_value=False, create=True) as health:
+            self.assertFalse(tasks.ensure_agent_running(runner=runner))
+        self.assertEqual(health.call_count, 2)
+
+    def test_an_already_healthy_agent_does_not_run_or_query_tasks(self):
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        with patch.object(tasks, '_agent_healthy', return_value=True, create=True):
+            self.assertTrue(tasks.ensure_agent_running(runner=runner))
+        self.assertEqual(calls, [])
+
+    def test_a_started_agent_must_return_a_valid_status_before_success(self):
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append(args)
+            self.assertGreater(kwargs['timeout'], 0)
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        with patch.object(tasks, '_agent_healthy', side_effect=[False, True], create=True):
+            self.assertTrue(tasks.ensure_agent_running(runner=runner))
+        self.assertEqual([args[1] for args in calls], ['/Query', '/Run'])
+        self.assertTrue(all(args[args.index('/TN') + 1] == tasks.SYSTEM_TASK_NAME for args in calls))
+
+    def test_an_opted_out_machine_does_not_recreate_or_start_a_missing_task(self):
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 1, '', 'Task does not exist')
+
+        with patch.object(tasks, '_agent_healthy', return_value=False, create=True):
+            self.assertFalse(tasks.ensure_agent_running(runner=runner))
+        self.assertEqual([args[1] for args in calls], ['/Query'])
+
+    def test_a_hung_scheduler_command_is_reported_as_failure(self):
+        def runner(args, **kwargs):
+            raise subprocess.TimeoutExpired(args, kwargs['timeout'])
+
+        with patch.object(tasks, '_agent_healthy', return_value=False, create=True):
+            self.assertFalse(tasks.ensure_agent_running(runner=runner))
+
+
+@unittest.skipUnless(os.name == 'nt', 'requires Windows message pipes')
+class BoundedAgentProbeTests(unittest.TestCase):
+    def start_pipe(self, handler):
+        import agent_ipc
+
+        name = 'youziauth-test-installer-health-' + os.urandom(8).hex()
+        server = agent_ipc.NamedPipeServer(name, handler)
+
+        def serve():
+            try:
+                server.serve_once()
+            except OSError:
+                pass  # An expired probe disconnects before the deliberately late reply.
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        return name, thread
+
+    def test_the_probe_accepts_a_real_valid_status_reply(self):
+        name, thread = self.start_pipe(lambda command: {
+            'ok': True, 'snapshot': {'boot_id': 'test-boot', 'state': 'waiting_for_network'}})
+        try:
+            self.assertTrue(tasks._agent_healthy(
+                runner=subprocess.run, timeout_seconds=3, pipe_name=name))
+        finally:
+            thread.join(4)
+        self.assertFalse(thread.is_alive())
+
+    def test_a_connected_pipe_that_never_replies_cannot_hang_the_helper(self):
+        connected = threading.Event()
+        release = threading.Event()
+
+        def stalled(command):
+            connected.set()
+            release.wait(10)
+            return {'ok': True, 'snapshot': {'boot_id': 'late', 'state': 'waiting_for_network'}}
+
+        name, thread = self.start_pipe(stalled)
+        started = time.monotonic()
+        try:
+            self.assertFalse(tasks._agent_healthy(
+                runner=subprocess.run, timeout_seconds=5, pipe_name=name))
+            self.assertTrue(connected.is_set(), 'exercise a stalled read, not just a missing pipe')
+            self.assertLess(time.monotonic() - started, 6)
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+
+    def test_a_hung_health_process_is_bounded_and_reports_failure(self):
+        def runner(args, **kwargs):
+            self.assertEqual(kwargs['timeout'], 0.4)
+            self.assertEqual(kwargs['stdin'], subprocess.DEVNULL)
+            raise subprocess.TimeoutExpired(args, kwargs['timeout'])
+
+        self.assertFalse(tasks._agent_healthy(runner=runner, timeout_seconds=0.4))
+
+
 class MsiTaskLifecycleTests(unittest.TestCase):
     def test_chinese_installer_still_detects_previous_english_language_packages(self):
         root = ET.parse(Path(__file__).resolve().parents[1] / 'packaging/youziauth.wxs').getroot()
@@ -150,7 +406,9 @@ class MsiTaskLifecycleTests(unittest.TestCase):
         self.assertEqual(action.get('Impersonate'), 'no')
         schedule = root.find('.//w:InstallExecuteSequence/w:Custom[@Action="StopYouziauthProcessesElevated"]', ns)
         self.assertEqual(schedule.get('Before'), 'InstallFiles')
-        self.assertEqual(root.find('.//w:MajorUpgrade', ns).get('Schedule'), 'afterInstallExecute')
+        # A transition from the broken 1.8.34 component identity must remove the
+        # old payload before laying down the new one, within the MSI transaction.
+        self.assertEqual(root.find('.//w:MajorUpgrade', ns).get('Schedule'), 'afterInstallInitialize')
 
     def test_task_repair_is_privileged_and_only_runs_for_committed_installations(self):
         root = ET.parse(Path(__file__).resolve().parents[1] / 'packaging/youziauth.wxs').getroot()
@@ -159,7 +417,11 @@ class MsiTaskLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(action)
         self.assertEqual(action.get('Execute'), 'commit')
         self.assertEqual(action.get('Impersonate'), 'no')
-        self.assertEqual(action.get('Return'), 'check')
+        # Recovery remains best effort, so its ignored failure must be checked
+        # independently by the update worker. During the 2026-10-13 incident,
+        # the missing Python DLL caused this action to fail before helper dispatch;
+        # ignoring that error allowed 1.8.35 to report success with a broken payload.
+        self.assertEqual(action.get('Return'), 'ignore')
         self.assertIn('--repair-install-tasks', action.get('ExeCommand'))
         schedule = root.find('.//w:InstallExecuteSequence/w:Custom[@Action="RepairInstalledTasks"]', ns)
         self.assertEqual(schedule.get('Before'), 'InstallFinalize')

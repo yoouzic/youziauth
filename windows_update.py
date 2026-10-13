@@ -153,6 +153,46 @@ try {
 """
 _ENCODED_COMMAND = base64.b64encode(_POWERSHELL.encode("utf-16le")).decode("ascii")
 
+_AGENT_HEALTHCHECK = r"""
+function Test-AgentHealthy([string]$pipeName = 'youziauth-agent', [int]$timeoutMs = 15000) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $pipe = $null
+        $pending = $null
+        try {
+            $pipe = New-Object IO.Pipes.NamedPipeClientStream('.', $pipeName,
+                [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
+            $remaining = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            $pipe.Connect([Math]::Min(500, $remaining))
+            $pipe.ReadMode = [IO.Pipes.PipeTransmissionMode]::Message
+            $message = [Text.Encoding]::UTF8.GetBytes('{"command":"status"}')
+            $pipe.Write($message, 0, $message.Length)
+            $buffer = New-Object byte[] 16384
+            $pending = $pipe.BeginRead($buffer, 0, $buffer.Length, $null, $null)
+            $remaining = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            if (-not $pending.AsyncWaitHandle.WaitOne([Math]::Min(1500, $remaining))) {
+                throw 'status-timeout'
+            }
+            $count = $pipe.EndRead($pending)
+            if ($count -le 0 -or -not $pipe.IsMessageComplete) { throw 'status-incomplete' }
+            $response = [Text.Encoding]::UTF8.GetString($buffer, 0, $count) | ConvertFrom-Json
+            if ($response.ok -is [bool] -and $response.ok -and
+                $response.snapshot.boot_id -is [string] -and $response.snapshot.boot_id -and
+                @('online_external', 'online_campus', 'waiting_for_network', 'auth_failed', 'error') -ccontains
+                    $response.snapshot.state) { return $true }
+        } catch {
+            # A scheduled-task launch is only a request; wait for a real IPC reply.
+        } finally {
+            if ($null -ne $pipe) { $pipe.Dispose() }
+            if ($null -ne $pending) { $pending.AsyncWaitHandle.Close() }
+        }
+        $remaining = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+        if ($remaining -gt 0) { Start-Sleep -Milliseconds ([Math]::Min(100, $remaining)) }
+    }
+    return $false
+}
+"""
+
 _WORKER_RECOVERY = r"""
 function Write-InstallResult($result) {
     $target = [string]$env:YOUZIAUTH_UPDATE_RESULT
@@ -200,43 +240,7 @@ function Start-UpdateTask($name) {
         } finally { $task.Dispose() }
     } catch { return $false }
 }
-function Test-AgentHealthy([string]$pipeName = 'youziauth-agent', [int]$timeoutMs = 15000) {
-    $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
-    while ([DateTime]::UtcNow -lt $deadline) {
-        $pipe = $null
-        $pending = $null
-        try {
-            $pipe = New-Object IO.Pipes.NamedPipeClientStream('.', $pipeName,
-                [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
-            $remaining = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-            $pipe.Connect([Math]::Min(500, $remaining))
-            $pipe.ReadMode = [IO.Pipes.PipeTransmissionMode]::Message
-            $message = [Text.Encoding]::UTF8.GetBytes('{"command":"status"}')
-            $pipe.Write($message, 0, $message.Length)
-            $buffer = New-Object byte[] 16384
-            $pending = $pipe.BeginRead($buffer, 0, $buffer.Length, $null, $null)
-            $remaining = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-            if (-not $pending.AsyncWaitHandle.WaitOne([Math]::Min(1500, $remaining))) {
-                throw 'status-timeout'
-            }
-            $count = $pipe.EndRead($pending)
-            if ($count -le 0 -or -not $pipe.IsMessageComplete) { throw 'status-incomplete' }
-            $response = [Text.Encoding]::UTF8.GetString($buffer, 0, $count) | ConvertFrom-Json
-            if ($response.ok -is [bool] -and $response.ok -and
-                $response.snapshot.boot_id -is [string] -and $response.snapshot.boot_id -and
-                @('online_external', 'online_campus', 'waiting_for_network', 'auth_failed', 'error') -ccontains
-                    $response.snapshot.state) { return $true }
-        } catch {
-            # A scheduled-task launch is only a request; wait for a real IPC reply.
-        } finally {
-            if ($null -ne $pipe) { $pipe.Dispose() }
-            if ($null -ne $pending) { $pending.AsyncWaitHandle.Close() }
-        }
-        $remaining = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
-        if ($remaining -gt 0) { Start-Sleep -Milliseconds ([Math]::Min(100, $remaining)) }
-    }
-    return $false
-}
+""" + _AGENT_HEALTHCHECK + r"""
 function Complete-Install($result) {
     # This worker outlives the application stopped by MSI. Save the outcome before
     # starting the new agent, then replace it with the observed recovery outcome.

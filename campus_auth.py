@@ -235,6 +235,11 @@ def parse_online_user_info(
     return AuthStatus.UNKNOWN
 
 
+# The portal's success page retries an incomplete (result=wait) online-user
+# query. An incomplete query leaves the session UNKNOWN rather than absent.
+LOGIN_SETTLE_WAIT_SECONDS = 1.5
+
+
 def online_user_result_code(response_text: str) -> str:
     """Return the portal's raw ``result`` field, or "" when it is not JSON."""
     try:
@@ -595,6 +600,90 @@ class CampusAuthClient:
         response = self.request(login_url, data=payload, referer=referer)
         return parse_login_result(response.text)
 
+    def verify_login(self, result: LoginResult) -> AuthStatus:
+        """Ask the portal whether the session the login just claimed really exists.
+
+        The login response names the session it created (its ``userIndex`` field is a
+        bare value, not a URL), so this asks about that exact session rather than
+        whatever the caller's IP happens to be.
+        """
+        named_index = str((result.data or {}).get("userIndex") or "").strip()
+        if named_index and named_index.lower() != "null":
+            status = self.check_online_user_info_by_index(named_index)
+            if status is not AuthStatus.UNKNOWN:
+                return status
+            time.sleep(LOGIN_SETTLE_WAIT_SECONDS)
+            settled = self.check_online_user_info_by_index(named_index)
+            return settled if settled is not AuthStatus.UNKNOWN else status
+
+        # Non-JSON/older login responses may omit the session name. Fetch the
+        # post-login redirect before querying it, just as check_status() does;
+        # a nameless query cannot conclusively verify many healthy sessions.
+        return self.check_online_user_info(self.fetch_portal_home())
+
+    def check_online_user_info_by_index(self, user_index: str) -> AuthStatus:
+        """getOnlineUserInfo for one named session; UNKNOWN when the portal is unsure."""
+        url = self.portal_url("/eportal/InterFace.do?method=getOnlineUserInfo")
+        url = f"{url}&userIndex={urllib.parse.quote(user_index)}"
+        for retry_available in (True, False):
+            try:
+                response = self.request(url)
+            except OSError as exc:
+                self.logger.debug("getOnlineUserInfo failed: %s", exc)
+                return AuthStatus.UNKNOWN
+            if online_user_result_code(response.text) == "wait" and retry_available:
+                continue
+            return parse_online_user_info(response.text, user_index_supplied=True)
+        return AuthStatus.UNKNOWN
+
+
+# A portal message that means "not now", not "never". Distinguishing these matters:
+# on 2026-10-13 06:42 the portal answered 认证设备响应超时,请稍后再试! and the agent
+# treated that as a permanent rejection, stopped authenticating for 67 minutes and
+# logged nothing at all while doing so. The phrases below are the portal's own
+# wording for a temporary condition.
+TRANSIENT_PORTAL_PHRASES = (
+    "请稍后再试",
+    "认证设备响应超时",
+    "不允许抢占",
+    "系统繁忙",
+    "try again",
+    "timeout",
+    "timed out",
+)
+
+
+PERMANENT_PORTAL_PHRASES = (
+    "密码错误",
+    "密码不正确",
+    "用户不存在",
+    "用户名不存在",
+    "账号不存在",
+    "账号已禁用",
+    "用户已被禁用",
+    "设备未注册",
+    "invalid credentials",
+    "incorrect password",
+    "password incorrect",
+    "account disabled",
+)
+
+
+def is_permanent_refusal(message: str) -> bool:
+    """Explicit credential/account-policy refusals require a user/config change."""
+    lowered = (message or "").strip().lower()
+    return any(phrase in lowered for phrase in PERMANENT_PORTAL_PHRASES)
+
+
+def is_transient_refusal(message: str) -> bool:
+    """Whether a portal refusal describes a temporary condition worth retrying."""
+    lowered = (message or "").strip().lower()
+    if not lowered:
+        return True
+    return not is_permanent_refusal(message) and any(
+        phrase.lower() in lowered for phrase in TRANSIENT_PORTAL_PHRASES
+    )
+
 
 def attempt_authentication(
     client: CampusAuthClient, logger: logging.Logger, force_login: bool = False
@@ -615,16 +704,47 @@ def attempt_authentication(
             # releasing its own stale record, which it does on its own.
             logger.info("forcing a fresh login attempt")
         result = client.login()
+        # A client without a verifier must remain unverified rather than fail open.
+        verify = getattr(client, "verify_login", None)
+        verification = verify(result) if (result.ok and callable(verify)) else None
     except Exception as exc:  # noqa: BLE001 - CLI tool should log and keep running.
-        logger.error("login attempt failed before server response: %s", exc)
+        logger.error("authentication attempt failed: %s", exc)
         return AuthAttempt(AttemptKind.TRANSIENT_ERROR, str(exc))
 
-    if result.ok:
+    if not result.ok:
+        if is_transient_refusal(result.message):
+            logger.warning("login refused for now: %s", result.message)
+            return AuthAttempt(AttemptKind.TRANSIENT_ERROR, result.message)
+        logger.error("login failed: %s", result.message)
+        return AuthAttempt(AttemptKind.REJECTED, result.message)
+
+    if verification is AuthStatus.AUTHENTICATED:
         logger.info("login succeeded: %s", result.message)
         return AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, result.message)
 
-    logger.error("login failed: %s", result.message)
-    return AuthAttempt(AttemptKind.REJECTED, result.message)
+    # The portal said yes and the portal still has no session for this machine.
+    # Reporting that as success is what produced 110 identical "login succeeded"
+    # lines in one night without the status check ever once agreeing.
+    detail = result.message or "success"
+    if verification is AuthStatus.UNAUTHENTICATED:
+        logger.warning(
+            "login accepted (%s) but the portal reports no session for it; "
+            "the session did not take effect",
+            detail,
+        )
+    else:
+        logger.warning(
+            "login accepted (%s) but the session could not be verified",
+            detail,
+        )
+        return AuthAttempt(
+            AttemptKind.LOGIN_UNVERIFIED,
+            f"门户已受理（{detail}），但无法确认会话状态",
+        )
+    return AuthAttempt(
+        AttemptKind.LOGIN_UNVERIFIED,
+        f"门户已受理（{detail}），但会话未生效",
+    )
 
 
 def run_once(client: CampusAuthClient, logger: logging.Logger) -> bool:

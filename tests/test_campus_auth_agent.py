@@ -13,8 +13,11 @@ import agent_ipc
 # 测试失败的原因就成了机器快慢，而不是被测行为。
 UPDATE_RELEASE_TIMEOUT = 30
 UPDATE_SETTLE_TIMEOUT = 30
+from unittest.mock import patch
+
 import auto_update
 import campus_auth
+import campus_auth_agent
 import network_probe
 from agent_ipc import RuntimeSnapshot, read_snapshot, write_snapshot
 from auth_runtime import AuthAttempt, AttemptKind
@@ -195,6 +198,15 @@ class AgentArgumentTests(unittest.TestCase):
         arguments = build_arg_parser().parse_args(["--allowed-user-sid", sid])
 
         self.assertEqual(arguments.allowed_user_sid, sid)
+
+
+class AgentStartupHelperTests(unittest.TestCase):
+    def test_an_unhealthy_ensure_agent_result_has_a_failing_exit_status(self):
+        with patch("startup_tasks.ensure_agent_running", return_value=False), \
+             patch.object(campus_auth_agent, "load_agent_config") as load:
+            self.assertEqual(campus_auth_agent.main(["--ensure-agent"]), 1)
+
+        load.assert_not_called()
 
 
 class AgentLoopTests(unittest.TestCase):
@@ -591,6 +603,290 @@ class AgentLoopTests(unittest.TestCase):
 
         self.assertFalse(agent.snapshot.notifications_suppressed)
         self.assertEqual(read_snapshot(self.snapshot_path).boot_id, "new-boot")
+
+
+class IneffectiveLoginTests(AgentLoopTests):
+    """What the agent does when the portal keeps accepting logins that never stick.
+
+    2026-10-13, 23:55 -> 08:08: 110 accepted logins and 110 "login succeeded" lines,
+    the portal never once reporting a live session, and no alert at all. The status
+    check and the login answer are two different questions; before this change only
+    the second one was asked.
+    """
+
+    def test_a_login_that_never_takes_effect_is_not_reported_as_success(self):
+        authenticator = FakeAuthenticator(
+            [AuthAttempt(AttemptKind.LOGIN_UNVERIFIED, "门户已受理（success），但会话未生效")]
+        )
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+
+        result = agent.run_cycle()
+
+        # "login succeeded" is exactly the line that made eight hours of this look
+        # like a working agent.
+        self.assertNotEqual(result.snapshot.state, "online_campus")
+        self.assertEqual(result.snapshot.state, "waiting_for_network")
+        self.assertIn("未生效", result.snapshot.detail)
+        self.assertFalse(result.notification_required, "a single retry is not an alert")
+
+    def test_repeated_ineffective_logins_back_off_and_raise_one_incident(self):
+        authenticator = FakeAuthenticator(
+            [AuthAttempt(AttemptKind.LOGIN_UNVERIFIED, "门户已受理，但会话未生效")] * 8
+        )
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+
+        results = [agent.run_cycle() for _ in range(8)]
+
+        # Retrying once a minute for hours is what kept resetting the session the
+        # portal had just filed; the cadence has to decay after the first retry.
+        self.assertEqual(
+            [item.next_delay for item in results[:6]], [60, 120, 300, 300, 300, 300]
+        )
+        # It becomes a real, notifiable failure instead of endless silent success.
+        self.assertEqual(results[4].snapshot.state, "auth_failed")
+        self.assertTrue(results[4].notification_required)
+        # ...once. The same incident must not toast again on every cycle.
+        self.assertFalse(any(item.notification_required for item in results[5:]))
+        self.assertEqual(results[4].snapshot.incident_id, results[7].snapshot.incident_id)
+
+    def test_unverified_login_snapshots_reach_the_real_notification_tracker_once(self):
+        from windows_notifications import NotificationTracker
+
+        authenticator = FakeAuthenticator([
+            AuthAttempt(AttemptKind.LOGIN_UNVERIFIED, "门户已受理，但无法确认会话状态")
+        ])
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+        tracker = NotificationTracker()
+
+        snapshots = [agent.run_cycle().snapshot for _ in range(8)]
+        toasts = [tracker.evaluate(snapshot) for snapshot in snapshots]
+
+        self.assertTrue(all(toast is None for toast in toasts[:4]))
+        self.assertIn("无法确认", toasts[4])
+        self.assertTrue(all(toast is None for toast in toasts[5:]))
+
+    def test_a_briefly_unreachable_portal_does_not_repeat_the_same_failure_toast(self):
+        from windows_notifications import NotificationTracker
+
+        authenticator = FakeAuthenticator([
+            AuthAttempt(AttemptKind.LOGIN_UNVERIFIED, "门户已受理，但无法确认会话状态")
+        ])
+        agent = self.make_agent(FakeProbe(
+            [NetworkObservation(False, True)] * 5 + [
+                NetworkObservation(False, False), NetworkObservation(False, True),
+            ]
+        ), authenticator)
+        tracker = NotificationTracker()
+
+        snapshots = [agent.run_cycle().snapshot for _ in range(7)]
+        toasts = [tracker.evaluate(snapshot) for snapshot in snapshots]
+
+        self.assertEqual([index for index, toast in enumerate(toasts) if toast], [4])
+        self.assertEqual(snapshots[5].state, "waiting_for_network")
+        self.assertEqual(snapshots[4].incident_id, snapshots[6].incident_id)
+
+    def test_a_verified_login_allows_a_later_unverified_incident_to_notify(self):
+        from windows_notifications import NotificationTracker
+
+        unverified = AuthAttempt(AttemptKind.LOGIN_UNVERIFIED, "门户已受理，但无法确认会话状态")
+        authenticator = FakeAuthenticator(
+            [unverified] * 5 + [AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, "会话已确认")] + [unverified] * 5
+        )
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+        tracker = NotificationTracker()
+
+        snapshots = [agent.run_cycle().snapshot for _ in range(11)]
+        toasts = [tracker.evaluate(snapshot) for snapshot in snapshots]
+
+        self.assertEqual([index for index, toast in enumerate(toasts) if toast], [4, 10])
+        self.assertNotEqual(snapshots[4].incident_id, snapshots[10].incident_id)
+
+    def test_the_ineffective_login_cadence_is_bounded(self):
+        self.assertEqual(campus_auth_agent.unverified_login_delay(1), 60)
+        self.assertEqual(campus_auth_agent.unverified_login_delay(2), 120)
+        self.assertEqual(campus_auth_agent.unverified_login_delay(3), 300)
+        # It must not run away: every later attempt keeps the longest delay.
+        for attempts in (4, 5, 50, 10_000):
+            self.assertEqual(campus_auth_agent.unverified_login_delay(attempts), 300)
+
+    def test_a_verified_login_clears_the_ineffective_login_counter(self):
+        authenticator = FakeAuthenticator(
+            [
+                AuthAttempt(AttemptKind.LOGIN_UNVERIFIED, "未生效"),
+                AuthAttempt(AttemptKind.LOGIN_UNVERIFIED, "未生效"),
+                AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, "success"),
+                AuthAttempt(AttemptKind.LOGIN_UNVERIFIED, "未生效"),
+            ]
+        )
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+
+        results = [agent.run_cycle() for _ in range(4)]
+
+        self.assertEqual(results[2].snapshot.state, "online_campus")
+        # The counter restarted, so the fourth attempt is a first attempt again.
+        self.assertEqual(results[3].next_delay, 60)
+        self.assertEqual(results[3].snapshot.state, "waiting_for_network")
+
+    def test_a_user_retry_resets_the_escalation(self):
+        authenticator = FakeAuthenticator(
+            [AuthAttempt(AttemptKind.LOGIN_UNVERIFIED, "未生效")] * 6,
+            forced_attempts=[AuthAttempt(AttemptKind.LOGIN_UNVERIFIED, "未生效")],
+        )
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+        for _ in range(5):
+            agent.run_cycle()
+        self.assertEqual(agent.unverified_logins, 5)
+
+        agent.retry_now()
+
+        self.assertEqual(agent.unverified_logins, 1)
+
+    def test_reaching_the_uplink_clears_the_ineffective_login_counter(self):
+        authenticator = FakeAuthenticator(
+            [AuthAttempt(AttemptKind.LOGIN_UNVERIFIED, "未生效")] * 3
+        )
+        agent = self.make_agent(
+            FakeProbe(
+                [
+                    NetworkObservation(False, True),
+                    NetworkObservation(False, True),
+                    NetworkObservation(True, False),
+                ]
+            ),
+            authenticator,
+        )
+        for _ in range(3):
+            agent.run_cycle()
+
+        self.assertEqual(agent.unverified_logins, 0)
+
+
+class LoginBlockTests(AgentLoopTests):
+    """A refusal slows retries down; it must not stop them without a way back.
+
+    2026-10-13 06:42: the portal answered 认证设备响应超时,请稍后再试!, and the agent
+    stopped authenticating for 67 minutes while logging nothing whatsoever.
+    """
+
+    def test_a_blocked_agent_says_so_instead_of_logging_nothing(self):
+        authenticator = FakeAuthenticator([AuthAttempt(AttemptKind.REJECTED, "账号或密码错误")])
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+        agent.run_cycle()
+
+        with self.assertLogs(agent.logger, level="INFO") as captured:
+            agent.run_cycle()
+            agent.run_cycle()
+
+        # Entry plus the heartbeat, not one line per silent cycle.
+        self.assertEqual(
+            sum("login is blocked" in line for line in captured.output), 1
+        )
+        self.assertEqual(authenticator.calls, 1)
+
+    def test_a_password_refusal_stays_blocked_after_the_retry_deadline(self):
+        authenticator = FakeAuthenticator([
+            AuthAttempt(AttemptKind.REJECTED, "账号或密码错误"),
+        ])
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+        agent.run_cycle()
+
+        with patch.object(campus_auth_agent, "LOGIN_BLOCK_RETRY_SECONDS", 0):
+            result = agent.run_cycle()
+            agent.run_cycle()
+
+        self.assertEqual(authenticator.calls, 1, "invalid credentials require a user/config change")
+        self.assertEqual(result.snapshot.state, "auth_failed")
+
+    def test_a_working_uplink_does_not_clear_a_bad_credentials_block(self):
+        authenticator = FakeAuthenticator([
+            AuthAttempt(AttemptKind.REJECTED, "账号或密码错误"),
+        ])
+        agent = self.make_agent(FakeProbe([
+            NetworkObservation(False, True),
+            NetworkObservation(True, False),
+            NetworkObservation(False, True),
+        ]), authenticator)
+
+        results = [agent.run_cycle() for _ in range(3)]
+
+        self.assertEqual([r.snapshot.state for r in results],
+                         ["auth_failed", "online_external", "auth_failed"])
+        self.assertEqual(authenticator.calls, 1, "connectivity is not a credentials change")
+        self.assertEqual(results[-1].snapshot.detail, "账号或密码错误")
+
+    def test_an_unreachable_portal_does_not_replace_the_stored_refusal_reason(self):
+        authenticator = FakeAuthenticator([
+            AuthAttempt(AttemptKind.REJECTED, "账号或密码错误"),
+        ])
+        agent = self.make_agent(FakeProbe([
+            NetworkObservation(False, True),
+            NetworkObservation(False, False),
+            NetworkObservation(False, True),
+        ]), authenticator)
+
+        results = [agent.run_cycle() for _ in range(3)]
+
+        self.assertEqual(authenticator.calls, 1)
+        self.assertEqual(results[-1].snapshot.detail, "账号或密码错误")
+
+    def test_a_working_uplink_does_clear_an_unclassified_temporary_block(self):
+        authenticator = FakeAuthenticator([
+            AuthAttempt(AttemptKind.REJECTED, "authentication service refused"),
+        ])
+        agent = self.make_agent(FakeProbe([
+            NetworkObservation(False, True),
+            NetworkObservation(True, False),
+            NetworkObservation(False, True),
+        ]), authenticator)
+
+        for _ in range(3):
+            agent.run_cycle()
+
+        self.assertEqual(authenticator.calls, 2)
+
+    def test_unknown_session_queries_do_not_blame_the_gateway(self):
+        authenticator = FakeAuthenticator([
+            AuthAttempt(AttemptKind.LOGIN_UNVERIFIED, "门户已受理，但无法确认会话状态"),
+        ])
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+        results = [agent.run_cycle() for _ in range(5)]
+
+        for result in results:
+            self.assertIn("无法确认", result.snapshot.detail)
+            self.assertNotIn("未放行", result.snapshot.detail)
+            self.assertNotIn("未生效", result.snapshot.detail)
+        self.assertEqual(results[-1].snapshot.state, "auth_failed")
+
+    def test_a_block_expires_so_a_transient_refusal_cannot_stall_the_agent(self):
+        authenticator = FakeAuthenticator(
+            [
+                AuthAttempt(AttemptKind.REJECTED, "认证设备响应超时,请稍后再试!"),
+                AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, "success"),
+            ]
+        )
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+        agent.run_cycle()
+        self.assertEqual(authenticator.calls, 1)
+
+        with patch.object(campus_auth_agent, "LOGIN_BLOCK_RETRY_SECONDS", 0):
+            result = agent.run_cycle()
+
+        self.assertEqual(authenticator.calls, 2, "the block must not be permanent")
+        self.assertEqual(result.snapshot.state, "online_campus")
+
+    def test_an_unreachable_portal_says_so_instead_of_logging_nothing(self):
+        agent = self.make_agent(
+            FakeProbe([NetworkObservation(False, False)]),
+            FakeAuthenticator([AuthAttempt(AttemptKind.REJECTED, "no")]),
+        )
+
+        with self.assertLogs(agent.logger, level="INFO") as captured:
+            agent.run_cycle()
+            agent.run_cycle()
+
+        self.assertEqual(
+            sum("portal is not reachable" in line for line in captured.output), 1
+        )
 
 
 class BuildUpdaterTests(unittest.TestCase):

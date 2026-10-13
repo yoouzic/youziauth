@@ -34,6 +34,13 @@ class RuntimeStateTests(unittest.TestCase):
             AgentState.WAITING_FOR_NETWORK,
         )
 
+    def test_an_unverified_login_is_not_online_campus(self):
+        # Accepted login requests alone do not confirm a working session.
+        self.assertEqual(
+            classify_state(False, True, AttemptKind.LOGIN_UNVERIFIED),
+            AgentState.WAITING_FOR_NETWORK,
+        )
+
     def test_startup_delays_then_use_regular_interval(self):
         policy = RetryPolicy(regular_interval_seconds=60)
 

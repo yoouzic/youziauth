@@ -422,6 +422,10 @@ class OnlineUserInfoTests(unittest.TestCase):
                 order.append("login")
                 return campus_auth.LoginResult(ok=True, message="success")
 
+            def verify_login(self, result):
+                order.append("verify")
+                return campus_auth.AuthStatus.AUTHENTICATED
+
         attempt = campus_auth.attempt_authentication(
             FakeClient(), logging.getLogger("test"), force_login=True
         )
@@ -429,7 +433,7 @@ class OnlineUserInfoTests(unittest.TestCase):
         # Measured on the live portal: logging out tears down connectivity while
         # the ePortal keeps its record, so a forced attempt must never do it.
         self.assertEqual(attempt.kind.value, "login_succeeded")
-        self.assertEqual(order, ["login"])
+        self.assertEqual(order, ["login", "verify"])
 
     def test_portal_requests_bypass_the_system_proxy(self):
         self.assertIsNotNone(campus_auth, import_error)
@@ -741,11 +745,267 @@ class StructuredAttemptTests(unittest.TestCase):
             def login(self):
                 return campus_auth.LoginResult(ok=True, message="success")
 
+            def verify_login(self, result):
+                return campus_auth.AuthStatus.AUTHENTICATED
+
         attempt = campus_auth.attempt_authentication(
             FakeClient(), logging.getLogger("test"), force_login=True
         )
 
         self.assertEqual(attempt.kind.value, "login_succeeded")
+
+
+class PostLoginVerificationTests(unittest.TestCase):
+    """A login the portal accepted is not yet a session.
+
+    2026-10-13: 110 accepted logins between 23:55 and 08:08, each reported as
+    "login succeeded", while the status check never once saw a live session. The
+    only evidence consulted was the ePortal's own result=success.
+    """
+
+    def test_a_login_the_portal_does_not_confirm_is_not_reported_as_success(self):
+        self.assertIsNotNone(campus_auth, import_error)
+
+        class FakeClient:
+            def check_status(self):
+                return campus_auth.AuthStatus.UNAUTHENTICATED
+
+            def login(self):
+                return campus_auth.LoginResult(
+                    ok=True,
+                    message="success",
+                    data={"userIndex": "abc123"},
+                )
+
+            def verify_login(self, result):
+                return campus_auth.AuthStatus.UNAUTHENTICATED
+
+        attempt = campus_auth.attempt_authentication(FakeClient(), logging.getLogger("test"))
+
+        self.assertEqual(attempt.kind.value, "login_unverified")
+        # The user-facing detail must not claim a success that did not happen.
+        self.assertIn("未生效", attempt.message)
+
+    def test_an_unreachable_portal_verdict_is_unverified_not_a_failure_claim(self):
+        self.assertIsNotNone(campus_auth, import_error)
+
+        class FakeClient:
+            def check_status(self):
+                return campus_auth.AuthStatus.UNAUTHENTICATED
+
+            def login(self):
+                return campus_auth.LoginResult(ok=True, message="success")
+
+            def verify_login(self, result):
+                return campus_auth.AuthStatus.UNKNOWN
+
+        attempt = campus_auth.attempt_authentication(FakeClient(), logging.getLogger("test"))
+
+        self.assertEqual(attempt.kind.value, "login_unverified")
+        self.assertIn("无法确认", attempt.message)
+        self.assertNotIn("未生效", attempt.message)
+
+    def test_a_credentials_refusal_is_not_retried_even_with_try_later_wording(self):
+        class FakeClient:
+            def check_status(self):
+                return campus_auth.AuthStatus.UNAUTHENTICATED
+
+            def login(self):
+                return campus_auth.LoginResult(
+                    ok=False, message="账号或密码错误，请稍后再试"
+                )
+
+        attempt = campus_auth.attempt_authentication(FakeClient(), logging.getLogger("test"))
+
+        self.assertEqual(attempt.kind, campus_auth.AttemptKind.REJECTED)
+
+    def test_a_login_without_an_index_uses_the_post_login_redirect_session(self):
+        calls = []
+
+        class FakeClient(campus_auth.CampusAuthClient):
+            def __init__(self):
+                super().__init__(campus_auth.AuthConfig(username="student", password="pw"))
+
+            def request(self, url, data=None, allow_redirects=True, referer=None):
+                calls.append(url)
+                if "getOnlineUserInfo" not in url:
+                    return campus_auth.HttpResponse(
+                        200, {}, "<html></html>",
+                        self.portal_url("/eportal/success.jsp?userIndex=post-login-session"),
+                    )
+                body = '{"result":"success"}' if "userIndex=post-login-session" in url else '{"result":"fail"}'
+                return campus_auth.HttpResponse(200, {}, body, url)
+
+        client = FakeClient()
+        status = client.verify_login(campus_auth.LoginResult(ok=True, message="success"))
+
+        self.assertEqual(status, campus_auth.AuthStatus.AUTHENTICATED)
+        self.assertEqual(calls[0], client.config.portal_url)
+        self.assertIn("userIndex=post-login-session", calls[-1])
+
+    def test_a_capability_free_client_is_treated_as_unverified(self):
+        # A client that cannot verify cannot claim success either: failing open is
+        # the bug this change exists to remove.
+        self.assertIsNotNone(campus_auth, import_error)
+
+        class FakeClient:
+            def check_status(self):
+                return campus_auth.AuthStatus.UNAUTHENTICATED
+
+            def login(self):
+                return campus_auth.LoginResult(ok=True, message="success")
+
+        attempt = campus_auth.attempt_authentication(FakeClient(), logging.getLogger("test"))
+
+        self.assertEqual(attempt.kind.value, "login_unverified")
+
+    def test_a_transient_refusal_is_not_treated_as_a_permanent_rejection(self):
+        self.assertIsNotNone(campus_auth, import_error)
+
+        class FakeClient:
+            def check_status(self):
+                return campus_auth.AuthStatus.UNAUTHENTICATED
+
+            def login(self):
+                return campus_auth.LoginResult(
+                    ok=False, message="认证设备响应超时,请稍后再试!"
+                )
+
+        attempt = campus_auth.attempt_authentication(FakeClient(), logging.getLogger("test"))
+
+        # 2026-10-13 06:42: the portal said "try again later" and the agent stopped
+        # authenticating for 67 minutes.
+        self.assertEqual(attempt.kind.value, "transient_error")
+
+    def test_a_credentials_refusal_stays_a_rejection(self):
+        self.assertIsNotNone(campus_auth, import_error)
+
+        class FakeClient:
+            def check_status(self):
+                return campus_auth.AuthStatus.UNAUTHENTICATED
+
+            def login(self):
+                return campus_auth.LoginResult(ok=False, message="账号或密码错误")
+
+        attempt = campus_auth.attempt_authentication(FakeClient(), logging.getLogger("test"))
+
+        self.assertEqual(attempt.kind.value, "rejected")
+
+    def test_verify_login_asks_about_the_session_the_login_named(self):
+        self.assertIsNotNone(campus_auth, import_error)
+        asked = []
+
+        class FakeClient(campus_auth.CampusAuthClient):
+            def __init__(self):
+                super().__init__(campus_auth.AuthConfig(username="student", password="pw"))
+
+            def request(self, url, data=None, allow_redirects=True, referer=None):
+                asked.append(url)
+                return campus_auth.HttpResponse(
+                    200, {}, '{"result":"success","message":"获取用户信息成功"}', url
+                )
+
+        status = FakeClient().verify_login(
+            campus_auth.LoginResult(ok=True, message="success", data={"userIndex": "abc123"})
+        )
+
+        self.assertEqual(status, campus_auth.AuthStatus.AUTHENTICATED)
+        self.assertEqual(len(asked), 1)
+        self.assertIn("userIndex=abc123", asked[0])
+
+    def test_verify_login_gives_a_settling_portal_one_more_chance(self):
+        self.assertIsNotNone(campus_auth, import_error)
+        from unittest import mock
+
+        class FakeClient(campus_auth.CampusAuthClient):
+            def __init__(self):
+                super().__init__(campus_auth.AuthConfig(username="student", password="pw"))
+                self.bodies = [
+                    '{"result":"wait","message":"用户信息不完整，请稍后重试"}',
+                    '{"result":"wait","message":"用户信息不完整，请稍后重试"}',
+                    '{"result":"success","message":"获取用户信息成功"}',
+                ]
+
+            def request(self, url, data=None, allow_redirects=True, referer=None):
+                return campus_auth.HttpResponse(200, {}, self.bodies.pop(0), url)
+
+        with mock.patch.object(campus_auth.time, "sleep"):
+            status = FakeClient().verify_login(
+                campus_auth.LoginResult(
+                    ok=True, message="success", data={"userIndex": "abc123"}
+                )
+            )
+
+        self.assertEqual(status, campus_auth.AuthStatus.AUTHENTICATED)
+
+    def test_verification_is_never_attempted_after_a_refusal(self):
+        self.assertIsNotNone(campus_auth, import_error)
+
+        class FakeClient:
+            def check_status(self):
+                return campus_auth.AuthStatus.UNAUTHENTICATED
+
+            def login(self):
+                return campus_auth.LoginResult(ok=False, message="账号或密码错误")
+
+            def verify_login(self, result):
+                raise AssertionError("a refused login has no session to verify")
+
+        attempt = campus_auth.attempt_authentication(FakeClient(), logging.getLogger("test"))
+
+        self.assertEqual(attempt.kind.value, "rejected")
+
+    def test_a_success_body_without_a_session_name_falls_back_to_the_status_check(self):
+        # parse_login_result accepts a non-JSON body containing "success", and that
+        # shape carries no userIndex. Verification must still ask the portal, not
+        # take the word "success" for an answer.
+        self.assertIsNotNone(campus_auth, import_error)
+        asked = []
+
+        class FakeClient(campus_auth.CampusAuthClient):
+            def __init__(self):
+                # password_encrypt pinned so the login path does not need a pageInfo
+                # round trip; this test is about what happens after the POST.
+                super().__init__(
+                    campus_auth.AuthConfig(
+                        username="student", password="pw", password_encrypt=False
+                    )
+                )
+
+            def request(self, url, data=None, allow_redirects=True, referer=None):
+                asked.append(url)
+                if "getOnlineUserInfo" in url:
+                    return campus_auth.HttpResponse(
+                        200, {}, '{"result":"fail","message":"not online"}',
+                        self.portal_url("/eportal/index.jsp?wlanuserip=1.2.3.4&wlanacname=ac01"),
+                    )
+                if "method=login" in url:
+                    return campus_auth.HttpResponse(200, {}, "login success", url)
+                return campus_auth.HttpResponse(
+                    200,
+                    {},
+                    "<html></html>",
+                    self.portal_url("/eportal/index.jsp?wlanuserip=1.2.3.4&wlanacname=ac01"),
+                )
+
+        attempt = campus_auth.attempt_authentication(FakeClient(), logging.getLogger("test"))
+
+        self.assertEqual(attempt.kind.value, "login_unverified")
+        self.assertTrue(any("getOnlineUserInfo" in url for url in asked))
+
+    def test_the_transient_classifier_matches_the_portals_own_wording(self):
+        self.assertIsNotNone(campus_auth, import_error)
+
+        # Both of these were actually answered by the live portal during the
+        # 2026-10-13 outage and must not stop authentication.
+        self.assertTrue(campus_auth.is_transient_refusal("认证设备响应超时,请稍后再试!"))
+        self.assertTrue(campus_auth.is_transient_refusal("用户上线不超过10s，不允许抢占!"))
+        self.assertTrue(campus_auth.is_transient_refusal(""))
+        # A wrong password is not worth retrying every few minutes.
+        self.assertFalse(campus_auth.is_transient_refusal("账号或密码错误"))
+        self.assertFalse(
+            campus_auth.is_transient_refusal("设备未注册,请在ePortal上添加认证设备")
+        )
 
 
 if __name__ == "__main__":

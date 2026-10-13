@@ -19,6 +19,10 @@ class AgentState(enum.Enum):
 class AttemptKind(enum.Enum):
     ALREADY_ONLINE = "already_online"
     LOGIN_SUCCEEDED = "login_succeeded"
+    # The login endpoint accepted the request, but no live session was confirmed.
+    # This includes an unavailable status query, so it does not prove that the
+    # gateway refused authorization.
+    LOGIN_UNVERIFIED = "login_unverified"
     REJECTED = "rejected"
     TRANSIENT_ERROR = "transient_error"
 

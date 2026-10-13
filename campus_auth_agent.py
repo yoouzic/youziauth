@@ -34,6 +34,17 @@ TRANSIENT_RETRY_DELAYS = (5, 15, 30)
 # to that state and then this often. Without it a quiet log is indistinguishable
 # from a stopped agent.
 ONLINE_HEARTBEAT_SECONDS = 1800
+# An accepted login with no confirmed session backs off to avoid repeatedly
+# submitting credentials while the portal is settling or its queries are failing.
+LOGIN_UNVERIFIED_DELAYS = (60, 120, 300)
+# Five unverified attempts raise an incident after at least 13 minutes
+# (60 + 120 + 300 + 300 seconds, plus request time).
+LOGIN_UNVERIFIED_ESCALATE_AFTER = 5
+# Unclassified refusals have a bounded block. Explicit invalid credentials or
+# account policy errors remain blocked until the user retries or changes config.
+LOGIN_BLOCK_RETRY_SECONDS = 300
+# How often the two states that used to log nothing at all say something.
+STALLED_HEARTBEAT_SECONDS = 300
 
 
 @dataclasses.dataclass(frozen=True)
@@ -41,6 +52,18 @@ class CycleResult:
     snapshot: RuntimeSnapshot
     next_delay: int
     notification_required: bool
+
+
+def unverified_login_delay(attempts: int) -> int:
+    """How long to wait before the next login attempt after ``attempts`` of them.
+
+    The first retry stays at the normal cadence so a single blip recovers at once;
+    after that the pace decays to one attempt every few minutes. ``attempts`` is
+    1-based.
+    """
+    if attempts < 1:
+        return LOGIN_UNVERIFIED_DELAYS[0]
+    return LOGIN_UNVERIFIED_DELAYS[min(attempts, len(LOGIN_UNVERIFIED_DELAYS)) - 1]
 
 
 def current_boot_id() -> str:
@@ -86,6 +109,12 @@ class Agent:
         self.network_attempt_index = 0
         self.transient_failures = 0
         self.automatic_login_blocked = False
+        self.login_block_requires_action = False
+        self.login_block_detail = ""
+        self.login_blocked_since = 0.0
+        self.unverified_logins = 0
+        self.unverified_incident_id = ""
+        self._stalled_logged_at = None
         # 后台自动更新：这是 SYSTEM 常驻进程存在的意义之一 —— 它已经提权，所以
         # 检查、下载、验签、静默安装都不需要再弹一次 UAC。
         self.updater = updater
@@ -136,9 +165,24 @@ class Agent:
         write_snapshot(self.snapshot_path, self.snapshot)
         return self.snapshot
 
-    def _failure_snapshot(self, detail: str) -> RuntimeSnapshot:
-        incident_id = self.snapshot.incident_id or uuid.uuid4().hex
+    def _failure_snapshot(self, detail: str, *, incident_id: Optional[str] = None) -> RuntimeSnapshot:
+        incident_id = incident_id or self.snapshot.incident_id or uuid.uuid4().hex
         return self._publish(AgentState.AUTH_FAILED, detail, incident_id=incident_id)
+
+    def _log_stalled(self, message: str, *args) -> None:
+        """Say something about a state that used to be completely silent.
+
+        The blocked branch and the no-portal branch both published a snapshot and
+        returned without touching the log, so 67 minutes of "the agent gave up"
+        looked exactly like "the agent is dead". Report on entry and then no more
+        often than the heartbeat.
+        """
+        now = time.monotonic()
+        if self._stalled_logged_at is not None:
+            if now - self._stalled_logged_at < STALLED_HEARTBEAT_SECONDS:
+                return
+        self._stalled_logged_at = now
+        self.logger.info(message, *args)
 
     def _log_online_heartbeat(self, previous_state: str) -> None:
         """Say something occasionally while the uplink is fine.
@@ -178,7 +222,15 @@ class Agent:
         if observation.internet_ok:
             self.network_attempt_index = 0
             self.transient_failures = 0
-            self.automatic_login_blocked = False
+            # Working connectivity does not fix rejected saved credentials.
+            # Keep that block until retry/config reload, while reporting the
+            # current usable uplink normally. Temporary blocks can recover here.
+            if not self.login_block_requires_action:
+                self.automatic_login_blocked = False
+                self.login_block_detail = ""
+            self.unverified_logins = 0
+            self.unverified_incident_id = ""
+            self._stalled_logged_at = None
             # The uplink works. If the browsing path does not, the campus session
             # is not the problem -- the proxy/VPN carrying ordinary traffic is --
             # and saying "互联网连接正常" there is what made this app look like it
@@ -196,20 +248,53 @@ class Agent:
             snapshot = self._publish(AgentState.WAITING_FOR_NETWORK, "等待网络或校园网门户")
             delay = self.retry_policy.delay(self.network_attempt_index)
             self.network_attempt_index += 1
+            self._log_stalled(
+                "portal is not reachable; waiting for the campus network "
+                "(next check in %ss)", delay,
+            )
             return CycleResult(snapshot, delay, False)
 
         self.network_attempt_index = 0
         if self.automatic_login_blocked and not force_login:
-            snapshot = self._failure_snapshot(self.snapshot.detail)
-            return CycleResult(
-                snapshot,
-                self.config.check_interval_seconds,
-                not snapshot.notifications_suppressed,
+            if self.login_block_requires_action:
+                snapshot = self._failure_snapshot(self.login_block_detail or self.snapshot.detail)
+                self._log_stalled(
+                    "login is blocked after a credential/account refusal (%s); "
+                    "waiting for updated configuration or a user retry",
+                    self.snapshot.detail,
+                )
+                return CycleResult(snapshot, self.config.check_interval_seconds,
+                                   not snapshot.notifications_suppressed)
+            waited = time.monotonic() - self.login_blocked_since
+            if waited < LOGIN_BLOCK_RETRY_SECONDS:
+                snapshot = self._failure_snapshot(self.login_block_detail or self.snapshot.detail)
+                self._log_stalled(
+                    "login is blocked after a refusal (%s); retrying automatically "
+                    "in %ss",
+                    self.snapshot.detail, int(LOGIN_BLOCK_RETRY_SECONDS - waited),
+                )
+                return CycleResult(
+                    snapshot,
+                    self.config.check_interval_seconds,
+                    not snapshot.notifications_suppressed,
+                )
+            # A refusal is not necessarily permanent. Letting the block stand until
+            # someone clicks 重新认证 is what turned the portal's 认证设备响应超时
+            # ("device timed out, try again later") into a 67-minute silent outage.
+            self.logger.info(
+                "login block expired after %ss; trying again", LOGIN_BLOCK_RETRY_SECONDS
             )
+            self.automatic_login_blocked = False
+            self.login_block_requires_action = False
+            # A new block is a new stall and must be reported on entry, not held
+            # back by the previous one's heartbeat.
+            self._stalled_logged_at = None
 
         attempt = self.authenticator(self.config, self.logger, force_login=force_login)
 
         if attempt.kind is AttemptKind.ALREADY_ONLINE and not observation.internet_ok:
+            self.unverified_logins = 0
+            self.unverified_incident_id = ""
             # The portal says this machine is authenticated, yet the uplink probe
             # failed. On a campus network the portal record is usually telling the
             # truth -- what breaks the Internet here is the proxy/VPN the machine
@@ -232,18 +317,60 @@ class Agent:
         if attempt.kind in (AttemptKind.ALREADY_ONLINE, AttemptKind.LOGIN_SUCCEEDED):
             self.transient_failures = 0
             self.automatic_login_blocked = False
+            self.unverified_logins = 0
+            self.unverified_incident_id = ""
             snapshot = self._publish(AgentState.ONLINE_CAMPUS, attempt.message or "校园网已认证")
             return CycleResult(snapshot, self.config.check_interval_seconds, False)
 
         if attempt.kind is AttemptKind.REJECTED:
             self.transient_failures = 0
             self.automatic_login_blocked = True
+            self.login_block_requires_action = campus_auth.is_permanent_refusal(attempt.message)
+            self.login_blocked_since = time.monotonic()
+            self._stalled_logged_at = None
             snapshot = self._failure_snapshot(attempt.message or "校园网认证被拒绝")
+            self.login_block_detail = snapshot.detail
+            if self.login_block_requires_action:
+                self.logger.error(
+                    "login refused: %s; automatic login waits for a user/config change",
+                    attempt.message or "unknown",
+                )
+            else:
+                self.logger.error(
+                    "login refused: %s; automatic retries slow to every %ss",
+                    attempt.message or "unknown", LOGIN_BLOCK_RETRY_SECONDS,
+                )
             return CycleResult(
                 snapshot,
                 self.config.check_interval_seconds,
                 not snapshot.notifications_suppressed,
             )
+
+        if attempt.kind is AttemptKind.LOGIN_UNVERIFIED:
+            # Preserve whether the session was explicitly absent or simply could
+            # not be queried; both need retry, but only the former is a verdict.
+            self.transient_failures = 0
+            self.unverified_logins += 1
+            delay = unverified_login_delay(self.unverified_logins)
+            if self.unverified_logins >= LOGIN_UNVERIFIED_ESCALATE_AFTER:
+                snapshot = self._failure_snapshot(
+                    attempt.message or "认证请求已被受理，但会话尚未确认",
+                    incident_id=self.unverified_incident_id,
+                )
+                # WAITING_FOR_NETWORK snapshots intentionally have no incident
+                # ID, so keep this unresolved episode across portal outages.
+                self.unverified_incident_id = snapshot.incident_id
+                return CycleResult(
+                    snapshot,
+                    delay,
+                    self.unverified_logins == LOGIN_UNVERIFIED_ESCALATE_AFTER
+                    and not snapshot.notifications_suppressed,
+                )
+            snapshot = self._publish(
+                AgentState.WAITING_FOR_NETWORK,
+                f"{attempt.message or '认证请求已被受理，但会话尚未确认'}（重试中）",
+            )
+            return CycleResult(snapshot, delay, False)
 
         self.transient_failures += 1
         if self.transient_failures >= len(TRANSIENT_RETRY_DELAYS):
@@ -262,7 +389,14 @@ class Agent:
 
     def retry_now(self) -> RuntimeSnapshot:
         self.automatic_login_blocked = False
+        self.login_block_requires_action = False
+        self.login_block_detail = ""
         self.transient_failures = 0
+        # The user asking for a retry is also the signal that "the portal keeps
+        # accepting logins that never take effect" may have cleared, so the
+        # circuit breaker starts over rather than staying escalated.
+        self.unverified_logins = 0
+        self.unverified_incident_id = ""
         return self.run_cycle(force_login=True).snapshot
 
     def reload_config(self) -> RuntimeSnapshot:
@@ -271,7 +405,11 @@ class Agent:
         # Clear the rejection block, but do not force: reloading settings is not
         # a reason to skip the cached session status.
         self.automatic_login_blocked = False
+        self.login_block_requires_action = False
+        self.login_block_detail = ""
         self.transient_failures = 0
+        self.unverified_logins = 0
+        self.unverified_incident_id = ""
         return self.run_cycle().snapshot
 
     def suppress_notifications_for_boot(self) -> RuntimeSnapshot:
@@ -489,6 +627,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--allowed-user-sid")
     parser.add_argument("--repair-install-tasks", action="store_true")
+    parser.add_argument("--ensure-agent", action="store_true")
     parser.add_argument("--install-user-sid")
     parser.add_argument("--first-install", action="store_true")
     return parser
@@ -536,6 +675,15 @@ def build_updater(app_dir: Path, allowed_user_sid: str | None = None) -> tuple:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.ensure_agent:
+        # Report observed recovery to the caller. MSI's Return="ignore" keeps
+        # this commit action best effort; exit 0 alone must not mask an unhealthy
+        # agent. A registered boot trigger can attempt startup later, but cannot
+        # repair missing runtime files.
+        import startup_tasks
+        running = startup_tasks.ensure_agent_running()
+        print("agent running" if running else "agent not responding; inspect installed payload and task")
+        return 0 if running else 1
     if args.repair_install_tasks:
         # MSI invokes this as SYSTEM after its payload has committed. Dispatch
         # before config/network setup: the helper only maintains startup tasks.

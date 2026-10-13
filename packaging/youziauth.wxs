@@ -8,9 +8,13 @@
     Codepage="936"
     Scope="perMachine">
 
-    <!-- Payload components keep their per-path GUIDs across releases. Execute
-         the elevated stop/file-copy script before removing the older product. -->
-    <MajorUpgrade Schedule="afterInstallExecute" IgnoreLanguage="yes" DowngradeErrorMessage="A newer version of youziauth is already installed." />
+    <!-- Remove the old payload inside the transaction before installing new files.
+         The 1.8.34 runtime had a different component GUID for the same Windows
+         path. Late removal skipped the equal-version copy, then deleted the new
+         product's runtime. Early transactional removal also rolls the old product
+         back if installation fails. Restart Manager handles old files in use;
+         the privileged stop below remains a second pass before copying new files. -->
+    <MajorUpgrade Schedule="afterInstallInitialize" IgnoreLanguage="yes" DowngradeErrorMessage="A newer version of youziauth is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <UIRef Id="YouziauthInstallerUI" />
     <Icon Id="YuzuAppIcon" SourceFile="assets\yuzu_app.ico" />
@@ -39,6 +43,7 @@
       <Custom Action="StopYouziauthProcessesElevated" Before="InstallFiles" Condition="NOT REMOVE" />
       <Custom Action="ConfigureFirstInstallTasks" Before="InstallFinalize" Condition="NOT REMOVE AND NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
       <Custom Action="RepairInstalledTasks" Before="InstallFinalize" Condition="NOT REMOVE AND (Installed OR WIX_UPGRADE_DETECTED)" />
+      <Custom Action="EnsureAgentRunning" After="RepairInstalledTasks" Condition="NOT REMOVE AND (Installed OR WIX_UPGRADE_DETECTED)" />
       <Custom Action="StopYouziauthProcesses" Before="InstallValidate" Condition="NOT REMOVE" />
     </InstallExecuteSequence>
 
@@ -61,13 +66,33 @@
       Execute="commit"
       Impersonate="no"
       Return="check" />
+    <!-- Task recovery is best effort after payload commit. Ignoring its exit
+         code avoids turning a scheduler failure into a rollback, but does not
+         prove the installed payload or agent is healthy. In the 2026-10-13
+         incident, a component identity change caused old-product removal to
+         delete python314.dll; the helper could not start. Retries and an ignored
+         exit code cannot repair that missing runtime. -->
     <CustomAction
       Id="RepairInstalledTasks"
       Directory="INSTALLFOLDER"
       ExeCommand="&quot;[INSTALLFOLDER]youziauth-agent.exe&quot; --repair-install-tasks --install-user-sid &quot;[UserSID]&quot;"
       Execute="commit"
       Impersonate="no"
-      Return="check" />
+      Return="ignore" />
+
+    <!-- Last commit action of an upgrade: request recovery of the agent.
+         The installer killed both processes before the file copy, so leaving
+         without one means no campus-network authentication until the next boot.
+         Return="ignore" leaves this action best effort. The update worker must
+         independently check the resulting version and agent response; a
+         successful MSI exit code alone does not prove application recovery. -->
+    <CustomAction
+      Id="EnsureAgentRunning"
+      Directory="INSTALLFOLDER"
+      ExeCommand="&quot;[INSTALLFOLDER]youziauth-agent.exe&quot; --ensure-agent"
+      Execute="commit"
+      Impersonate="no"
+      Return="ignore" />
 
     <StandardDirectory Id="ProgramFilesFolder">
       <Directory Id="INSTALLFOLDER" Name="youziauth" />
