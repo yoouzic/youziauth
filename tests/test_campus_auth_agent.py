@@ -190,6 +190,73 @@ class NetworkProbeTests(unittest.TestCase):
             [],
         )
 
+    def test_the_uplink_is_also_asked_through_mainland_204_responders(self):
+        # On a TUN setup "no proxy handler" does not mean "skips the proxy
+        # rules", so the NCSI hosts alone cannot answer whether the uplink works.
+        ncsi = {url for url, _ in network_probe.CONNECTIVITY_PROBES}
+        self.assertTrue(network_probe.DIRECT_204_PROBES)
+        for url in network_probe.DIRECT_204_PROBES:
+            self.assertTrue(url.startswith("http://"), url)
+            self.assertNotIn(url, ncsi)
+            self.assertNotIn(url, network_probe.PROXY_PATH_PROBES)
+
+    def test_a_dead_proxy_node_cannot_hide_a_working_uplink(self):
+        # 2026-10-22 18:26: Clash's node was down, so both NCSI hosts failed,
+        # and the agent reported the campus uplink as down for 13 minutes while
+        # the session and China-direct traffic were healthy. The mainland 204
+        # responders still go DIRECT and must keep that from happening.
+        class No204Response:
+            status = 204
+            headers = {}
+
+            def read(self, size):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        ncsi_urls = {url for url, _ in network_probe.CONNECTIVITY_PROBES}
+        direct_urls = set(network_probe.DIRECT_204_PROBES)
+
+        def fake_open(request, timeout):
+            if request.full_url in ncsi_urls:
+                raise OSError("proxy node closed the connection")
+            if request.full_url in direct_urls:
+                return No204Response()
+            raise AssertionError(f"unexpected probe target {request.full_url}")
+
+        original = network_probe.DIRECT_OPENER.open
+        network_probe.DIRECT_OPENER.open = fake_open
+        try:
+            self.assertTrue(network_probe.check_external_internet(2))
+        finally:
+            network_probe.DIRECT_OPENER.open = original
+
+    def test_a_captive_portal_page_still_fails_every_uplink_probe(self):
+        # The extra endpoints must not turn a sign-in interception into "online".
+        class CaptiveResponse:
+            status = 200
+            headers = {}
+
+            def read(self, size):
+                return b"<html>Please sign in</html>"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        original = network_probe.DIRECT_OPENER.open
+        network_probe.DIRECT_OPENER.open = lambda request, timeout: CaptiveResponse()
+        try:
+            self.assertFalse(network_probe.check_external_internet(2))
+        finally:
+            network_probe.DIRECT_OPENER.open = original
+
 
 class AgentArgumentTests(unittest.TestCase):
     def test_allowed_user_sid_is_accepted_for_pipe_acl(self):
@@ -526,6 +593,26 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("Clash", results[0].snapshot.detail)
         # Never logs out, never forces a login: every call is a plain status check.
         self.assertEqual(authenticator.force_flags, [False] * 5)
+
+    def test_a_verified_session_still_says_what_the_session_is(self):
+        # 2026-10-22: the user clicked 重新认证 because the tray said 外网不通, and
+        # the answer was an English toast telling them to release a healthy
+        # session. A forced attempt now verifies the session, and that sentence
+        # must reach the status line instead of being flattened into the generic
+        # "check Clash" line.
+        held_detail = "门户仍持有有效会话，无需重新登录（会话 IP 10.65.104.219）"
+        authenticator = FakeAuthenticator(
+            [AuthAttempt(AttemptKind.ALREADY_ONLINE, held_detail)],
+            forced_attempts=[AuthAttempt(AttemptKind.ALREADY_ONLINE, held_detail)],
+        )
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+
+        snapshot = agent.retry_now()
+
+        self.assertEqual(snapshot.state, "waiting_for_network")
+        self.assertIn("门户仍持有有效会话", snapshot.detail)
+        self.assertIn("10.65.104.219", snapshot.detail)
+        self.assertIn("Clash", snapshot.detail)
 
     def test_unverified_session_recovers_when_the_portal_releases_it(self):
         # Measured on the live portal: the stale record clears by itself and the

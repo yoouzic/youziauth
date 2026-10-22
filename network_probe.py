@@ -34,6 +34,20 @@ CONNECTIVITY_URL, CONNECTIVITY_BODY = CONNECTIVITY_PROBES[0]
 # cannot fake it without also being able to reach the host.
 PROXY_PATH_PROBES: tuple[str, ...] = ("http://www.gstatic.com/generate_204",)
 
+# The uplink asked again through mainland endpoints that a rule set sends
+# DIRECT. This is not redundant on this machine: Clash runs in TUN mode, so its
+# packets are captured at layer 3 and even an opener with no proxy handler
+# travels through the proxy rules. The Microsoft NCSI hosts have no DIRECT rule
+# in the installed profile and land in the final MATCH group, so a dead proxy
+# node answered for the uplink -- on 2026-10-22 18:26 that produced 13 minutes
+# of "外网不通（请检查 Clash/代理）" while China-direct traffic and the campus
+# session were both completely healthy. These endpoints answer the same
+# question about the uplink without asking the proxy first.
+DIRECT_204_PROBES: tuple[str, ...] = (
+    "http://connect.rom.miui.com/generate_204",
+    "http://wifi.vivo.com.cn/generate_204",
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class NetworkObservation:
@@ -56,6 +70,11 @@ class NetworkObservation:
 # one would mask a broken uplink. Whether a VPN can reach the outside world is a
 # separate question from whether this machine has an Internet uplink, and it is
 # asked separately below.
+#
+# Note the limit of that idea when a VPN runs in TUN mode: there the packets are
+# intercepted by the tunnel at layer 3, so "no proxy handler" no longer means the
+# request skips the proxy rules. DIRECT_204_PROBES exists to ask the uplink
+# through destinations those rules keep DIRECT; it cannot promise more than that.
 DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -85,10 +104,19 @@ def probe_internet_once(url: str, expected_body: str, timeout: int) -> bool:
 
 
 def check_external_internet(timeout: int) -> bool:
-    return any(
+    """Whether this machine has a working uplink, asked more than one way.
+
+    A single family of endpoints is not enough here: the NCSI hosts are routed
+    by the proxy rules on a TUN setup, so their failure can describe a dead
+    proxy node rather than a dead uplink. One answer from either family is
+    enough -- the question is reachability, not which host was reachable.
+    """
+    if any(
         probe_internet_once(url, expected_body, timeout)
         for url, expected_body in CONNECTIVITY_PROBES
-    )
+    ):
+        return True
+    return any(probe_once(url, timeout) for url in DIRECT_204_PROBES)
 
 
 def check_proxy_path(timeout: int) -> bool:

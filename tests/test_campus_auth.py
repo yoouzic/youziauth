@@ -382,12 +382,15 @@ class OnlineUserInfoTests(unittest.TestCase):
 
         client = FakeClient(campus_auth.AuthConfig(username="student", password="pw"))
 
-        with self.assertRaises(RuntimeError) as caught:
+        with self.assertRaises(campus_auth.PortalSessionHeld) as caught:
             client.get_query_string()
 
         # Posting "userIndex=..." as queryString is what made the portal answer
-        # "设备未注册,请在ePortal上添加认证设备".
-        self.assertIn("userIndex", str(caught.exception))
+        # "设备未注册,请在ePortal上添加认证设备"; the session key is carried out
+        # instead so the caller can ask the portal about that exact session.
+        self.assertIsInstance(caught.exception, RuntimeError)
+        self.assertEqual(caught.exception.user_index, "6432343835")
+        self.assertEqual(caught.exception.parameter, "userIndex")
         self.assertIn("still holds a session", str(caught.exception))
 
     def test_login_still_accepts_a_real_eportal_query_string(self):
@@ -708,6 +711,8 @@ class StructuredAttemptTests(unittest.TestCase):
         attempt = campus_auth.attempt_authentication(FakeClient(), logging.getLogger("test"))
 
         self.assertEqual(attempt.kind.value, "already_online")
+        # This sentence reaches the tray and the notification body.
+        self.assertEqual(attempt.message, "校园网已认证")
 
     def test_server_rejection_returns_rejected_without_raw_response(self):
         class FakeClient:
@@ -735,7 +740,10 @@ class StructuredAttemptTests(unittest.TestCase):
         attempt = campus_auth.attempt_authentication(FakeClient(), logging.getLogger("test"))
 
         self.assertEqual(attempt.kind.value, "transient_error")
-        self.assertEqual(attempt.message, "network unavailable")
+        # The detail is what a notification shows, so it must not be a bare
+        # English exception; the diagnostic stays, in a labelled sentence.
+        self.assertIn("network unavailable", attempt.message)
+        self.assertTrue(attempt.message.startswith("认证尝试失败"))
 
     def test_force_login_skips_the_already_authenticated_short_circuit(self):
         class FakeClient:
@@ -753,6 +761,124 @@ class StructuredAttemptTests(unittest.TestCase):
         )
 
         self.assertEqual(attempt.kind.value, "login_succeeded")
+
+    def test_a_verified_login_reports_a_chinese_detail_instead_of_success(self):
+        # The portal answers result=success with message "success"; that is not
+        # something to put in the status line or a notification.
+        class FakeClient:
+            def check_status(self):
+                return campus_auth.AuthStatus.UNAUTHENTICATED
+
+            def login(self):
+                return campus_auth.LoginResult(ok=True, message="success")
+
+            def verify_login(self, result):
+                return campus_auth.AuthStatus.AUTHENTICATED
+
+        attempt = campus_auth.attempt_authentication(FakeClient(), logging.getLogger("test"))
+
+        self.assertEqual(attempt.kind.value, "login_succeeded")
+        self.assertEqual(attempt.message, "认证成功")
+
+
+class PortalHeldSessionTests(unittest.TestCase):
+    """A forced login cannot work while the portal holds a session.
+
+    2026-10-22 18:27: three clicks on 重新认证 produced "the portal still holds a
+    session ... the session has to be released" in an English notification while
+    the session was verified healthy. A portal that already holds a session is
+    not a failed login, and this client has no release to offer.
+    """
+
+    class HeldClient:
+        def __init__(self, verification, user_index="hexkey_10.65.104.219_yoouzic"):
+            self.verification = verification
+            self.user_index = user_index
+            self.asked = []
+
+        def check_status(self):
+            return campus_auth.AuthStatus.UNAUTHENTICATED
+
+        def login(self):
+            raise campus_auth.PortalSessionHeld(self.user_index)
+
+        def check_online_user_info_by_index(self, user_index):
+            self.asked.append(user_index)
+            return self.verification
+
+    def test_a_verified_held_session_is_reported_as_already_online(self):
+        client = self.HeldClient(campus_auth.AuthStatus.AUTHENTICATED)
+
+        attempt = campus_auth.attempt_authentication(
+            client, logging.getLogger("test"), force_login=True
+        )
+
+        self.assertEqual(attempt.kind.value, "already_online")
+        self.assertIn("无需重新登录", attempt.message)
+        self.assertIn("10.65.104.219", attempt.message)
+        self.assertEqual(client.asked, ["hexkey_10.65.104.219_yoouzic"])
+
+    def test_a_refused_held_session_names_the_release_path(self):
+        client = self.HeldClient(campus_auth.AuthStatus.UNAUTHENTICATED)
+
+        attempt = campus_auth.attempt_authentication(
+            client, logging.getLogger("test"), force_login=True
+        )
+
+        self.assertEqual(attempt.kind.value, "transient_error")
+        self.assertIn("自助服务厅", attempt.message)
+        # Never logs out on its own: that tears down BRAS for nothing.
+        self.assertNotIn("logout", attempt.message.lower())
+
+    def test_an_unconfirmed_held_session_is_retried_not_escalated(self):
+        client = self.HeldClient(campus_auth.AuthStatus.UNKNOWN)
+
+        attempt = campus_auth.attempt_authentication(
+            client, logging.getLogger("test"), force_login=True
+        )
+
+        self.assertEqual(attempt.kind.value, "transient_error")
+        self.assertIn("无法确认", attempt.message)
+
+    def test_a_held_redirect_without_a_session_key_asks_nothing(self):
+        client = self.HeldClient(campus_auth.AuthStatus.AUTHENTICATED, user_index="")
+
+        attempt = campus_auth.attempt_authentication(
+            client, logging.getLogger("test"), force_login=True
+        )
+
+        self.assertEqual(attempt.kind.value, "transient_error")
+        self.assertEqual(client.asked, [])
+
+    def test_the_handler_also_covers_a_plain_cycle_not_only_a_forced_retry(self):
+        client = self.HeldClient(campus_auth.AuthStatus.AUTHENTICATED)
+
+        attempt = campus_auth.attempt_authentication(client, logging.getLogger("test"))
+
+        self.assertEqual(attempt.kind.value, "already_online")
+
+    def test_user_index_ip_is_read_back_from_the_session_key(self):
+        self.assertEqual(
+            campus_auth.user_index_ip("6432_10.65.104.219_yoouzic"), "10.65.104.219"
+        )
+        self.assertEqual(campus_auth.user_index_ip("6432_10.0.0.5"), "10.0.0.5")
+        self.assertEqual(campus_auth.user_index_ip("no-address-here"), "")
+        self.assertEqual(campus_auth.user_index_ip(""), "")
+
+    def test_the_hex_session_key_is_decoded_before_the_ip_is_read(self):
+        # What success.jsp actually carries on the live portal: the readable
+        # "…_10.65.104.219_yoouzic" hex-encoded.
+        hex_key = (
+            "64323438356532646337343838356233353333323330323566656136613838345f"
+            "31302e36352e3130342e3231395f796f6f757a6963"
+        )
+        self.assertEqual(
+            campus_auth.decode_user_index(hex_key),
+            "d2485e2dc74885b353323025fea6a884_10.65.104.219_yoouzic",
+        )
+        self.assertEqual(campus_auth.user_index_ip(hex_key), "10.65.104.219")
+        # A key that is not hex stays as it is instead of being mangled.
+        self.assertEqual(campus_auth.decode_user_index("abc123"), "abc123")
 
 
 class PostLoginVerificationTests(unittest.TestCase):

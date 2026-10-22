@@ -296,22 +296,31 @@ class Agent:
             self.unverified_logins = 0
             self.unverified_incident_id = ""
             # The portal says this machine is authenticated, yet the uplink probe
-            # failed. On a campus network the portal record is usually telling the
-            # truth -- what breaks the Internet here is the proxy/VPN the machine
-            # routes through, not the campus session. Measured on the live setup:
-            # switching Clash off its proxy path restored the Internet without any
-            # re-authentication, and logging the session out instead cost a
-            # 10 minute outage while the portal kept its record anyway. So never
-            # touch the session here: report what is true and let the probe clear
-            # the state once the uplink is back.
+            # failed. The portal record is usually telling the truth -- measured
+            # on the live setup, the cause of "portal says online but nothing
+            # loads" is the proxy/VPN the machine routes through, not the campus
+            # session. So never touch the session here: report what is true and
+            # let the probe clear the state once the uplink is back.
+            #
+            # The one thing this can be is a stale ePortal record that no longer
+            # authorises traffic. Since 2026-10-22 the authenticator tells those
+            # apart for a forced attempt (verified session vs refused session),
+            # so its sentence wins when it is more specific; the release path for
+            # a genuinely stale record is the portal's own self-service, never a
+            # client-side logout.
+            session_detail = (attempt.message or "").strip()
+            if not session_detail or session_detail == campus_auth.ALREADY_AUTHENTICATED_DETAIL:
+                detail = (
+                    "校园网会话仍在，但外网不通（检查 Clash/代理；代理正常仍不通"
+                    "请在门户自助服务厅退出登录设备）"
+                )
+            else:
+                detail = f"{session_detail}，但外网不通（检查 Clash/代理）"
             self.logger.info(
                 "portal reports an authenticated session but the uplink is down; "
                 "leaving the session alone"
             )
-            snapshot = self._publish(
-                AgentState.WAITING_FOR_NETWORK,
-                "校园网已认证，但外网不通（请检查 Clash/代理）",
-            )
+            snapshot = self._publish(AgentState.WAITING_FOR_NETWORK, detail)
             return CycleResult(snapshot, self.config.check_interval_seconds, False)
 
         if attempt.kind in (AttemptKind.ALREADY_ONLINE, AttemptKind.LOGIN_SUCCEEDED):

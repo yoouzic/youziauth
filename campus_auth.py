@@ -168,6 +168,11 @@ LOGIN_QUERY_KEYS = (
 
 USER_INDEX_PATTERN = re.compile(r"[?&]userIndex=([^&'\"]+)", re.IGNORECASE)
 
+# What a session confirmed without a working uplink is reported as. The agent
+# owns the uplink half of that sentence and replaces this placeholder when it
+# has something more specific to say, so both halves live in one place.
+ALREADY_AUTHENTICATED_DETAIL = "校园网已认证"
+
 
 def looks_like_login_query_string(query: str) -> bool:
     lowered = urllib.parse.unquote_plus(query or "").lower()
@@ -262,6 +267,56 @@ def extract_user_index(*urls: str) -> str:
         if match:
             return urllib.parse.unquote_plus(match.group(1))
     return ""
+
+
+USER_INDEX_IP_PATTERN = re.compile(r"_(\d{1,3}(?:\.\d{1,3}){3})(?:_|$)")
+HEX_USER_INDEX_PATTERN = re.compile(r"[0-9a-fA-F]+")
+
+
+def decode_user_index(user_index: str) -> str:
+    """Decode the hex-encoded session key the portal hands out, when it is hex.
+
+    ``success.jsp`` carries the key hex-encoded (that is the form
+    ``getOnlineUserInfo`` expects back), so the readable part — session id,
+    client IP, user name — has to be recovered before it can be read.
+    """
+    candidate = (user_index or "").strip()
+    if (
+        not candidate
+        or len(candidate) % 2
+        or not HEX_USER_INDEX_PATTERN.fullmatch(candidate)
+    ):
+        return candidate
+    try:
+        return bytes.fromhex(candidate).decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        return candidate
+
+
+def user_index_ip(user_index: str) -> str:
+    """The client IP the portal baked into its session key, or ""."""
+    match = USER_INDEX_IP_PATTERN.search(decode_user_index(user_index))
+    return match.group(1) if match else ""
+
+
+class PortalSessionHeld(RuntimeError):
+    """The portal holds a session, so it never offers a login queryString.
+
+    Posting the redirect's ``userIndex`` as ``queryString=`` is what made the
+    portal look up a device it cannot resolve and answer
+    "设备未注册,请在ePortal上添加认证设备". The session key is carried out
+    instead, so the caller can ask the portal whether the session it names is
+    still real instead of guessing. A RuntimeError subclass because callers
+    that only know the old surface must keep catching something.
+    """
+
+    def __init__(self, user_index: str = "", parameter: str = "userIndex") -> None:
+        self.user_index = user_index
+        self.parameter = parameter
+        super().__init__(
+            "the portal still holds a session and offered no login queryString "
+            f"(it redirected with {parameter}=...)"
+        )
 
 
 def extract_rsa_public_key(page_info: Mapping[str, object]) -> tuple[str, str]:
@@ -551,12 +606,12 @@ class CampusAuthClient:
             # userIndex is NOT a login queryString. Posting it as queryString=
             # made the portal look up a device it cannot resolve and answer
             # "设备未注册,请在ePortal上添加认证设备", so refuse instead of guessing.
+            # Carry the session key out rather than describing the session: the
+            # caller can ask the portal about that exact session and report what
+            # it says, instead of telling the user to "release" something this
+            # client has no way to release.
             parameter = redirected_query.split("=", 1)[0]
-            raise RuntimeError(
-                "the portal still holds a session and offered no login queryString "
-                f"(it redirected with {parameter}=...); the session has to be "
-                "released before this machine can authenticate again"
-            )
+            raise PortalSessionHeld(extract_user_index(response.url), parameter)
 
         raise RuntimeError(
             "could not find ePortal queryString; make sure this machine is on the campus network"
@@ -685,6 +740,52 @@ def is_transient_refusal(message: str) -> bool:
     )
 
 
+def held_session_attempt(
+    client: CampusAuthClient, logger: logging.Logger, held: PortalSessionHeld
+) -> AuthAttempt:
+    """Answer a forced login the portal refuses with "you are already online".
+
+    While the ePortal record exists the portal root can only redirect to
+    success.jsp?userIndex=..., so a forced login can never obtain a login
+    queryString. On 2026-10-22 18:27 three clicks on 重新认证 turned that into
+    "the session has to be released" in an English toast, even though the
+    session was verified healthy and the missing Internet had nothing to do
+    with the campus session. Ask the portal about the exact session it named
+    and report that, instead of guessing or instructing a release this client
+    cannot perform (and must not perform: logout tears down the BRAS
+    authorization while the ePortal keeps its record).
+    """
+    status = AuthStatus.UNKNOWN
+    verify = getattr(client, "check_online_user_info_by_index", None)
+    if held.user_index and callable(verify):
+        status = verify(held.user_index)
+
+    if status is AuthStatus.AUTHENTICATED:
+        where = user_index_ip(held.user_index)
+        detail = "门户仍持有有效会话，无需重新登录"
+        if where:
+            detail += f"（会话 IP {where}）"
+        logger.info("portal holds a verified session; not reporting a failed login")
+        return AuthAttempt(AttemptKind.ALREADY_ONLINE, detail)
+
+    if status is AuthStatus.UNAUTHENTICATED:
+        logger.warning(
+            "portal kept a session record that no longer authorises this machine; "
+            "only the portal self-service can release it"
+        )
+        return AuthAttempt(
+            AttemptKind.TRANSIENT_ERROR,
+            "门户保留了会话记录，但该会话已不再授权本机；请在门户自助服务厅"
+            "「查看和退出我的登录设备」释放后重试",
+        )
+
+    logger.warning("portal holds a session but could not say whether it is live")
+    return AuthAttempt(
+        AttemptKind.TRANSIENT_ERROR,
+        "门户仍持有会话，暂时无法确认是否有效（稍后自动重试）",
+    )
+
+
 def attempt_authentication(
     client: CampusAuthClient, logger: logging.Logger, force_login: bool = False
 ) -> AuthAttempt:
@@ -693,7 +794,9 @@ def attempt_authentication(
             status = client.check_status()
             logger.info("current auth status: %s", status.value)
             if status is AuthStatus.AUTHENTICATED:
-                return AuthAttempt(AttemptKind.ALREADY_ONLINE, "already authenticated")
+                return AuthAttempt(
+                    AttemptKind.ALREADY_ONLINE, ALREADY_AUTHENTICATED_DETAIL
+                )
         else:
             # Only skips the cached-status shortcut. Deliberately does NOT log the
             # session out first: measured against the live portal, logout tears
@@ -703,13 +806,18 @@ def attempt_authentication(
             # outage in exchange for nothing. Recovery comes from the portal
             # releasing its own stale record, which it does on its own.
             logger.info("forcing a fresh login attempt")
-        result = client.login()
+        try:
+            result = client.login()
+        except PortalSessionHeld as held:
+            # "Retry" is clicked because something looks broken; a portal that
+            # already holds a session is not that something, so answer it.
+            return held_session_attempt(client, logger, held)
         # A client without a verifier must remain unverified rather than fail open.
         verify = getattr(client, "verify_login", None)
         verification = verify(result) if (result.ok and callable(verify)) else None
     except Exception as exc:  # noqa: BLE001 - CLI tool should log and keep running.
         logger.error("authentication attempt failed: %s", exc)
-        return AuthAttempt(AttemptKind.TRANSIENT_ERROR, str(exc))
+        return AuthAttempt(AttemptKind.TRANSIENT_ERROR, f"认证尝试失败：{exc}")
 
     if not result.ok:
         if is_transient_refusal(result.message):
@@ -720,7 +828,12 @@ def attempt_authentication(
 
     if verification is AuthStatus.AUTHENTICATED:
         logger.info("login succeeded: %s", result.message)
-        return AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, result.message)
+        # The portal's generic "success" is not something to put in front of a
+        # user; a portal-aware message is.
+        detail = (result.message or "").strip()
+        if not detail or detail.lower() == "success":
+            detail = "认证成功"
+        return AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, detail)
 
     # The portal said yes and the portal still has no session for this machine.
     # Reporting that as success is what produced 110 identical "login succeeded"
