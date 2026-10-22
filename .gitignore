@@ -17,6 +17,11 @@ build/
 dist/
 *.msi
 
+# Signed release assets (MSI signature, sums, provenance, notes) as written by
+# tools/sign_release.py and release.yml. The published copies live on the
+# GitHub Release; these are build output and must not enter the repository.
+release/
+
 # Release signing keys and scratch work; a private signing key must never be
 # committed. Keep the offline release key outside the checkout entirely.
 .release-key/
