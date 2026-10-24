@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import agent_ipc
 import dorm_points
 import proxy_rules
 from desktop_bridge import DesktopBridge, PreviewBridge
@@ -1108,6 +1109,110 @@ class AccountSwitchTests(unittest.TestCase):
         result = preview.dispatch('account_delete', {'id': 'demo1', 'confirmed': True})
         self.assertFalse(result['ok'])
         self.assertIn('至少保留一个账号', result['message'])
+
+
+class AgentSnapshotTickTests(unittest.TestCase):
+    """_tick 读 SYSTEM 代理的 runtime.json：快照过期绝不能继续显示「连接正常」。
+
+    2026-10-24：代理在 14:08 冻住（最后状态 online），界面却一直显示连接正常；用户点击
+    后旧 agent_ipc 永久阻塞，于是「点击认证卡死且没有任何日志」。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.controller = MagicMock()
+        self.controller.latest = Result('idle', '尚未查询今日任务')
+        self.controller.busy = False
+        self.controller.store.settings.return_value = Settings()
+        self.controller.store.root = self.root / 'dorm'
+        self.controller.store.history.return_value = ''
+        self.controller.schedule_text.return_value = '自动打卡：关闭'
+        self.controller.drain.return_value = []
+        self.patches = [
+            patch('desktop_bridge.gui.ensure_user_config', side_effect=lambda p: p),
+            patch('desktop_bridge.gui.load_gui_settings', return_value=GuiSettings('student', '', 60)),
+            patch('desktop_bridge.gui.is_startup_enabled', return_value=False),
+        ]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.bridge = DesktopBridge(self.root / 'config.ini', dorm=self.controller)
+        self.addCleanup(self.bridge._close)
+        self.bridge._agent = True
+        self.runtime = self.root / 'runtime.json'
+
+    def _write_runtime(self, state, updated_at, detail=''):
+        agent_ipc.write_snapshot(self.runtime, agent_ipc.RuntimeSnapshot(
+            'boot', state, False, '', detail, updated_at))
+
+    def test_a_fresh_snapshot_keeps_its_mapping_and_shows_the_detection_time(self):
+        fresh = dt.datetime.now().astimezone().replace(microsecond=0) - dt.timedelta(seconds=5)
+        self._write_runtime('online_external', fresh.isoformat(), detail='already authenticated')
+        self.bridge._tick()
+        network = self.bridge.snapshot()['network']
+        self.assertEqual(network['state'], 'online')
+        self.assertEqual(network['message'], 'already authenticated')
+        self.assertEqual(network['checked'], fresh.strftime('%H:%M:%S'),
+                         '新鲜快照要显示真实检测时间，而不是「尚未执行连接检测」')
+        self.assertEqual(self.bridge._last_agent.state, 'online_external')
+
+    def test_a_frozen_snapshot_is_reported_as_an_error_not_as_online(self):
+        frozen = (dt.datetime.now().astimezone().replace(microsecond=0)
+                  - dt.timedelta(minutes=40))
+        self._write_runtime('online_external', frozen.isoformat(), detail='already authenticated')
+        with patch.object(self.bridge._notification_tracker, 'evaluate') as evaluate, \
+                patch('desktop_bridge.windows_notifications.show_toast') as toast:
+            self.bridge._tick()
+        evaluate.assert_not_called()
+        toast.assert_not_called()
+        network = self.bridge.snapshot()['network']
+        self.assertEqual(network['state'], 'error', '冻结的快照绝不能继续显示「连接正常」')
+        self.assertEqual(network['message'],
+                         f'后台检测已停止响应（最近一次检测于 {frozen.strftime("%H:%M")}）')
+        self.assertEqual(network['checked'], frozen.strftime('%H:%M:%S'))
+        self.assertEqual(self.bridge._last_agent.state, 'online_external',
+                         '仍记录最后一份快照，重试/抑制通知还要用到它')
+
+    def test_a_snapshot_without_a_trustworthy_time_is_never_shown_as_fresh(self):
+        # 空、乱码、以及没有时区的本地时间都无法证明代理还活着，一律按过期处理。
+        for value in ('', 'not-a-time', '2026-10-24T14:08:04'):
+            with self.subTest(updated_at=value):
+                self._write_runtime('online_campus', value, detail='already authenticated')
+                with patch('desktop_bridge.windows_notifications.show_toast') as toast:
+                    self.bridge._tick()
+                network = self.bridge.snapshot()['network']
+                self.assertEqual(network['state'], 'error')
+                self.assertEqual(network['message'], '后台检测已停止响应',
+                                 '不知道时间时不能编一个 HH:MM 出来')
+                toast.assert_not_called()
+
+    def test_network_actions_report_a_pipe_timeout_as_its_own_message_quickly(self):
+        for action in ('network_check', 'network_start'):
+            with self.subTest(action=action):
+                with patch('desktop_bridge.agent_ipc.send_command',
+                           side_effect=TimeoutError('no reply from agent')):
+                    started = time.monotonic()
+                    result = self.bridge.dispatch(action)
+                    elapsed = time.monotonic() - started
+                self.assertFalse(result['ok'])
+                self.assertEqual(result['message'], '后台认证服务没有响应；请稍后重试，或重启电脑后再试。')
+                self.assertLess(elapsed, 2.0, '超时必须是有界失败，不能把界面挂住')
+
+    def test_update_check_timeout_does_not_fall_back_to_the_generic_message(self):
+        with patch('desktop_bridge.agent_ipc.send_command',
+                   side_effect=TimeoutError('no reply from agent')):
+            result = self.bridge.dispatch('update_check')
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['message'], '后台认证服务没有响应；请稍后重试，或重启电脑后再试。')
+
+    def test_an_ordinary_pipe_error_keeps_the_bounded_generic_message(self):
+        # 只把 TimeoutError 单独翻译；其它 OSError 仍是兜底的短句，不泄露原始异常。
+        with patch('desktop_bridge.agent_ipc.send_command', side_effect=OSError('broken pipe')):
+            result = self.bridge.dispatch('network_check')
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['message'], '操作未完成，请检查本机权限、配置和网络后重试。')
 
 
 if __name__ == '__main__':

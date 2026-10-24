@@ -45,6 +45,38 @@ LOGIN_UNVERIFIED_ESCALATE_AFTER = 5
 LOGIN_BLOCK_RETRY_SECONDS = 300
 # How often the two states that used to log nothing at all say something.
 STALLED_HEARTBEAT_SECONDS = 300
+# 手动指令（retry / reload-config）走在 named pipe 上，界面那边三秒就超时。整条指令
+# 通道只有一个 handler，所以这里**绝不能**发网络请求：2026-10-24 14:08，用户的 Wi-Fi
+# 刚在 campus / hotspot / 门户之间切换过，handler 里同步跑的 run_cycle(force_login=True)
+# 卡在网络探测上，pipe 一直 busy，界面那条没有超时上界的读取永远等不到回应，屏幕上
+# 于是留着一个过期的「连接正常」，日志和 runtime.json 也一起静默。指令现在只记账 +
+# 叫醒主循环，网络 I/O 只允许发生在主循环线程里。
+# 探测死线：一次探测内部要串行问几个端点，逐个 request_timeout 累加的正常上限就在
+# 这个量级；Windows 的 getaddrinfo/DNS 解析没有超时参数，才是真正会挂住的地方，所以
+# 光靠 urllib 的 socket timeout 不够，必须有墙钟死线兜底。
+PROBE_DEADLINE_FLOOR_SECONDS = 30.0
+PROBE_DEADLINE_TIMEOUT_MULTIPLIER = 5.0
+# 被放弃的探测线程收不回来（DNS 卡在系统调用里），所以最多同时挂这么多个；到顶就
+# 不再新开线程，直接按超时处理，绝不能让它无界增长。
+MAX_ABANDONED_PROBE_THREADS = 8
+# 到顶不等于「永远不再探测」：系统 DNS 可能只是暂时卡住，网络恢复后 agent 必须还能
+# 自己回来。所以到顶后每隔这么久仍放行一次新的探测（线程增长很慢：约 4 个/小时）；
+# 而真正的长时间故障另有硬上限，避免一整天下来线程无限增长。
+PROBE_AT_CAP_RETRY_SECONDS = 900.0
+PROBE_ABANDONED_HARD_CAP = 32
+# 巡检：卡住的循环不会再发布任何东西，界面会把最后一条状态（很可能是「连接正常」）
+# 当成当前状态一直显示。巡检线程定期替它说一句「还在检查」，让快照保持新鲜。
+WATCHDOG_INTERVAL_SECONDS = 15.0
+WATCHDOG_STALL_FLOOR_SECONDS = 120.0
+WATCHDOG_LOG_THROTTLE_SECONDS = 300.0
+
+
+class ProbeDeadlineExceeded(RuntimeError):
+    """探测线程在墙钟死线内没有返回 —— 结果是「不知道」，不是「网络不通」。"""
+
+    def __init__(self, waited_seconds: float):
+        super().__init__(f"network probe did not return within {waited_seconds:.0f}s")
+        self.waited_seconds = waited_seconds
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,6 +129,9 @@ class Agent:
         updater=None,
         update_interval_seconds: int = 6 * 60 * 60,
         update_reason: str = "",
+        probe_deadline_seconds: Optional[float] = None,
+        watchdog_interval_seconds: float = WATCHDOG_INTERVAL_SECONDS,
+        watchdog_stall_seconds: Optional[float] = None,
     ):
         self.config_loader = config_loader
         self.config = config_loader()
@@ -105,6 +140,36 @@ class Agent:
         self.snapshot_path = Path(snapshot_path)
         self.logger = logger
         self.boot_id = boot_id or current_boot_id()
+        # 快照是所有读者（界面 / 巡检 / 指令）共用的一份状态，写它必须串行；
+        # RLock 是因为 _publish 之间偶尔会互相嵌套（例如更新进度回调）。
+        self._snapshot_lock = threading.RLock()
+        self._pending_lock = threading.Lock()
+        # 主循环等下一轮时用的事件：手动指令把它 set 起来就能立刻插一轮。
+        self._wake_event = threading.Event()
+        self._pending_force_login = False
+        # 探测线程与巡检共用的运行状态：_cycle_started_at 只由主循环写，
+        # 巡检线程只读；None 表示当前没有周期在跑。
+        self._cycle_started_at = None
+        self._watchdog_logged_at = None
+        self._probe_timeout_logged_at = None
+        self._probe_threads: list[threading.Thread] = []
+        self._probe_lock = threading.Lock()
+        # 上一次真正发起探测的时刻：到顶冷启动用，保证卡死的旧线程不会把探测永久停掉。
+        self._last_probe_started_at = None
+        request_timeout = max(1, int(getattr(self.config, "request_timeout_seconds", 8) or 8))
+        if probe_deadline_seconds is None:
+            probe_deadline_seconds = max(
+                PROBE_DEADLINE_FLOOR_SECONDS,
+                PROBE_DEADLINE_TIMEOUT_MULTIPLIER * request_timeout,
+            )
+        self.probe_deadline_seconds = max(1.0, float(probe_deadline_seconds))
+        if watchdog_stall_seconds is None:
+            watchdog_stall_seconds = max(
+                WATCHDOG_STALL_FLOOR_SECONDS,
+                2 * self.probe_deadline_seconds + 30,
+            )
+        self.watchdog_stall_seconds = max(1.0, float(watchdog_stall_seconds))
+        self.watchdog_interval_seconds = max(0.01, float(watchdog_interval_seconds))
         self.retry_policy = RetryPolicy(self.config.check_interval_seconds)
         self.network_attempt_index = 0
         self.transient_failures = 0
@@ -144,6 +209,11 @@ class Agent:
     def _now() -> str:
         return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
+    def _current_snapshot(self) -> RuntimeSnapshot:
+        """给指令线程读一份一致的快照：发布方可能正在替换它。"""
+        with self._snapshot_lock:
+            return self.snapshot
+
     def _publish(
         self,
         state: AgentState,
@@ -151,19 +221,20 @@ class Agent:
         *,
         incident_id: Optional[str] = None,
     ) -> RuntimeSnapshot:
-        if incident_id is None:
-            incident_id = self.snapshot.incident_id if state is AgentState.AUTH_FAILED else ""
-        self.snapshot = RuntimeSnapshot(
-            boot_id=self.boot_id,
-            state=state.value,
-            notifications_suppressed=self.snapshot.notifications_suppressed,
-            incident_id=incident_id,
-            detail=sanitized_detail(detail),
-            updated_at=self._now(),
-            update=self.snapshot.update,
-        )
-        write_snapshot(self.snapshot_path, self.snapshot)
-        return self.snapshot
+        with self._snapshot_lock:
+            if incident_id is None:
+                incident_id = self.snapshot.incident_id if state is AgentState.AUTH_FAILED else ""
+            self.snapshot = RuntimeSnapshot(
+                boot_id=self.boot_id,
+                state=state.value,
+                notifications_suppressed=self.snapshot.notifications_suppressed,
+                incident_id=incident_id,
+                detail=sanitized_detail(detail),
+                updated_at=self._now(),
+                update=self.snapshot.update,
+            )
+            write_snapshot(self.snapshot_path, self.snapshot)
+            return self.snapshot
 
     def _failure_snapshot(self, detail: str, *, incident_id: Optional[str] = None) -> RuntimeSnapshot:
         incident_id = incident_id or self.snapshot.incident_id or uuid.uuid4().hex
@@ -205,13 +276,106 @@ class Agent:
             self.config.check_interval_seconds,
         )
 
+    def _prune_probe_threads(self) -> int:
+        """丢掉已经收工的探测线程，返回还在挂着的数量。"""
+        with self._probe_lock:
+            self._probe_threads = [
+                thread for thread in self._probe_threads if thread.is_alive()
+            ]
+            return len(self._probe_threads)
+
+    def _log_probe_timeout(self, deadline: float, *, at_cap: bool) -> None:
+        """探测死线到了要留一条记录 —— 这个状态以前是完全静默的（所以像进程死了）。"""
+        now = time.monotonic()
+        if self._probe_timeout_logged_at is not None:
+            if now - self._probe_timeout_logged_at < STALLED_HEARTBEAT_SECONDS:
+                return
+        self._probe_timeout_logged_at = now
+        if at_cap:
+            # 到上限只说明以前那几次确实没回来；再开线程只是继续堆垃圾。
+            self.logger.warning(
+                "network probe is still stuck in %s earlier cycles; skipping a new "
+                "probe and reporting the deadline as exceeded",
+                MAX_ABANDONED_PROBE_THREADS,
+            )
+            return
+        self.logger.warning(
+            "network probe did not return within %ss; it may be stuck in DNS "
+            "resolution (Windows has no timeout for that) -- continuing to retry",
+            int(deadline),
+        )
+
+    def _observe_with_deadline(self) -> NetworkObservation:
+        """在墙钟死线内拿一次网络观测，超时抛 ``ProbeDeadlineExceeded``。
+
+        urllib 的 ``timeout`` 只管 socket 读写，管不了 ``getaddrinfo``/DNS 解析：
+        在 Wi-Fi 刚切换（campus <-> hotspot <-> 门户）时它可能挂任意久。所以探测
+        放进 daemon 线程，这里的 ``join`` 是唯一的上界 —— 挂住的线程收不回来，
+        只能数着数量放弃它。
+        """
+        outcome: dict[str, object] = {}
+
+        def work() -> None:
+            try:
+                outcome["observation"] = self.probe.observe(self.config)
+            except BaseException as exc:  # noqa: BLE001 - 交给调用线程重抛，行为与同步探测一致
+                outcome["error"] = exc
+
+        deadline = self.probe_deadline_seconds
+        abandoned = self._prune_probe_threads()
+        if abandoned >= MAX_ABANDONED_PROBE_THREADS:
+            cooling_down = (
+                self._last_probe_started_at is not None
+                and time.monotonic() - self._last_probe_started_at < PROBE_AT_CAP_RETRY_SECONDS
+            )
+            if cooling_down or abandoned >= PROBE_ABANDONED_HARD_CAP:
+                self._log_probe_timeout(deadline, at_cap=True)
+                raise ProbeDeadlineExceeded(deadline)
+            # 冷却期已过且未到硬上限：放行一次新探测。系统 DNS 若已经恢复，这一下就能
+            # 把 agent 从「永久超时」里救回来；没恢复也只是很慢地多一个挂住的线程。
+        self._last_probe_started_at = time.monotonic()
+        worker = threading.Thread(
+            target=work, name="youziauth-agent-probe", daemon=True
+        )
+        worker.start()
+        worker.join(deadline)
+        if worker.is_alive():
+            with self._probe_lock:
+                self._probe_threads.append(worker)
+            self._log_probe_timeout(deadline, at_cap=False)
+            raise ProbeDeadlineExceeded(deadline)
+        if "error" in outcome:
+            raise outcome["error"]  # type: ignore[misc]
+        if "observation" not in outcome:
+            raise RuntimeError("network probe returned no observation")
+        return outcome["observation"]  # type: ignore[return-value]
+
     def run_cycle(self, force_login: bool = False) -> CycleResult:
+        # 巡检靠这个时刻判断「这一轮是不是卡住了」。卡住的循环不会再发布任何快照，
+        # 只能由巡检线程替它说话，否则界面一直显示卡住前的最后一条状态。
+        self._cycle_started_at = time.monotonic()
+        try:
+            return self._run_cycle(force_login)
+        finally:
+            self._cycle_started_at = None
+
+    def _run_cycle(self, force_login: bool) -> CycleResult:
         if not self.config.username or not self.config.password:
             snapshot = self._publish(AgentState.WAITING_FOR_NETWORK,
                                      "请先在校园网页面保存账号和密码。")
             return CycleResult(snapshot, self.config.check_interval_seconds, False)
         try:
-            observation: NetworkObservation = self.probe.observe(self.config)
+            observation: NetworkObservation = self._observe_with_deadline()
+        except ProbeDeadlineExceeded as timeout:
+            # 「不知道」也是一种必须说出来的状态：仍然报等待网络，但把「还在等」写进
+            # 详情，界面就不会把一条旧状态当成当前状态。
+            snapshot = self._publish(
+                AgentState.WAITING_FOR_NETWORK,
+                f"网络检测长时间没有返回（已等待约 {timeout.waited_seconds:.0f}s），仍在重试",
+            )
+            delay = self.retry_policy.delay(self.network_attempt_index)
+            self.network_attempt_index += 1
+            return CycleResult(snapshot, delay, False)
         except Exception as exc:  # noqa: BLE001 - probe failures are runtime state, not process failure.
             self.logger.warning("network probe failed: %s", exc)
             snapshot = self._publish(AgentState.WAITING_FOR_NETWORK, "网络检测暂时不可用")
@@ -396,7 +560,8 @@ class Agent:
             False,
         )
 
-    def retry_now(self) -> RuntimeSnapshot:
+    def _reset_login_blocks(self) -> None:
+        """用户要求重试 / 换了配置时要清掉的短期状态。"""
         self.automatic_login_blocked = False
         self.login_block_requires_action = False
         self.login_block_detail = ""
@@ -406,38 +571,79 @@ class Agent:
         # circuit breaker starts over rather than staying escalated.
         self.unverified_logins = 0
         self.unverified_incident_id = ""
+
+    def _set_pending_force_login(self) -> None:
+        with self._pending_lock:
+            self._pending_force_login = True
+
+    def _take_pending_force_login(self) -> bool:
+        with self._pending_lock:
+            forced = self._pending_force_login
+            self._pending_force_login = False
+        return forced
+
+    def retry_now(self) -> RuntimeSnapshot:
+        """**同步地**立刻强制认证一次。只给直接调用方/测试用。
+
+        走 named pipe 的指令不能调它：一次网络请求就可能挂住整条指令通道，
+        那是 2026-10-24 14:08 现场的直接原因。
+        """
+        self._reset_login_blocks()
         return self.run_cycle(force_login=True).snapshot
 
-    def reload_config(self) -> RuntimeSnapshot:
+    def request_retry(self) -> RuntimeSnapshot:
+        """界面点了「重新认证」：**立刻返回**，强制登录交给后台主循环。
+
+        这里只做记账 + 叫醒：清掉短期阻塞状态、记下「下一轮要强制登录」、设置唤醒
+        事件，然后返回当前快照。pipe handler 线程里绝不允许出现网络 I/O。
+        """
+        self._reset_login_blocks()
+        self._set_pending_force_login()
+        self._wake_event.set()
+        self.logger.info("manual retry requested; running a forced check now")
+        return self._current_snapshot()
+
+    def _reload_config_state(self) -> None:
+        """重读配置并清掉短期阻塞状态（本地文件 + DPAPI，不发网络请求）。"""
         self.config = self.config_loader()
         self.retry_policy = RetryPolicy(self.config.check_interval_seconds)
         # Clear the rejection block, but do not force: reloading settings is not
         # a reason to skip the cached session status.
-        self.automatic_login_blocked = False
-        self.login_block_requires_action = False
-        self.login_block_detail = ""
-        self.transient_failures = 0
-        self.unverified_logins = 0
-        self.unverified_incident_id = ""
+        self._reset_login_blocks()
+
+    def reload_config(self) -> RuntimeSnapshot:
+        """**同步地**重读配置并立刻检测一轮。只给直接调用方/测试用。"""
+        self._reload_config_state()
         return self.run_cycle().snapshot
 
+    def request_reload_config(self) -> RuntimeSnapshot:
+        """pipe 上的 reload-config：重读配置后**立刻返回**，检测交给主循环。"""
+        self._reload_config_state()
+        self._wake_event.set()
+        self.logger.info("configuration reloaded; running a check now")
+        return self._current_snapshot()
+
     def suppress_notifications_for_boot(self) -> RuntimeSnapshot:
-        self.snapshot = dataclasses.replace(
-            self.snapshot,
-            notifications_suppressed=True,
-            updated_at=self._now(),
-        )
-        write_snapshot(self.snapshot_path, self.snapshot)
-        return self.snapshot
+        with self._snapshot_lock:
+            self.snapshot = dataclasses.replace(
+                self.snapshot,
+                notifications_suppressed=True,
+                updated_at=self._now(),
+            )
+            write_snapshot(self.snapshot_path, self.snapshot)
+            return self.snapshot
 
     def handle_command(self, command: AgentCommand) -> dict[str, object]:
         self._recover_update()
         if command.command == "status":
-            snapshot = self.snapshot
+            snapshot = self._current_snapshot()
         elif command.command == "retry":
-            snapshot = self.retry_now()
+            # 立刻返回；强制登录由主循环执行。这个 handler 是单线程的，
+            # 在这里做网络 I/O 会让整条指令通道跟着一起卡住。
+            snapshot = self.request_retry()
         elif command.command == "reload-config":
-            snapshot = self.reload_config()
+            # 只重读配置（本地操作），一轮检测同样交给主循环。
+            snapshot = self.request_reload_config()
         elif command.command == "check-update":
             snapshot = self.request_update_check()
         else:
@@ -463,16 +669,17 @@ class Agent:
 
     def _publish_update(self, status) -> RuntimeSnapshot:
         """把自动更新状态并进运行时快照，界面经由同一条通道读到它。"""
-        self.snapshot = dataclasses.replace(
-            self.snapshot,
-            update=status.to_dict(),
-            updated_at=self._now(),
-        )
-        try:
-            write_snapshot(self.snapshot_path, self.snapshot)
-        except OSError:
-            pass
-        return self.snapshot
+        with self._snapshot_lock:
+            self.snapshot = dataclasses.replace(
+                self.snapshot,
+                update=status.to_dict(),
+                updated_at=self._now(),
+            )
+            try:
+                write_snapshot(self.snapshot_path, self.snapshot)
+            except OSError:
+                pass
+            return self.snapshot
 
     def _publish_disabled_reason(self) -> RuntimeSnapshot:
         """把「为什么没有后台更新」写进快照，让界面说出来而不是什么都不显示。"""
@@ -511,7 +718,7 @@ class Agent:
         三秒就超时。真正的更新在后台线程里跑，进度由运行时快照回报。
         """
         self._start_update_thread("requested")
-        return self.snapshot
+        return self._current_snapshot()
 
     def update_due(self) -> bool:
         return self.updater is not None and time.monotonic() >= self._next_update_at
@@ -551,6 +758,65 @@ class Agent:
             return True
         return False
 
+    def check_stall(self) -> bool:
+        """一轮循环超过 ``watchdog_stall_seconds`` 还没返回就说出来。
+
+        卡住的循环不会再发布任何快照，界面于是把最后一条状态（很可能是「连接正常」）
+        当成当前状态一直显示 —— 2026-10-24 14:08 现场。这里每次巡检都发布一条**新鲜**的
+        「仍在重试」，让界面不可能再显示过期状态；ERROR 日志按 300 秒节流，避免刷屏。
+        返回是否判定为卡住。
+        """
+        started = self._cycle_started_at
+        if started is None:
+            return False
+        elapsed = time.monotonic() - started
+        if elapsed < self.watchdog_stall_seconds:
+            return False
+        now = time.monotonic()
+        if (
+            self._watchdog_logged_at is None
+            or now - self._watchdog_logged_at >= WATCHDOG_LOG_THROTTLE_SECONDS
+        ):
+            self._watchdog_logged_at = now
+            self.logger.error(
+                "background check has been running for about %ss without returning; "
+                "publishing a fresh stuck snapshot so the interface cannot keep "
+                "showing a stale state",
+                int(elapsed),
+            )
+        minutes = max(1, int(elapsed // 60))
+        self._publish(
+            AgentState.WAITING_FOR_NETWORK,
+            f"后台检测已超过约 {minutes} 分钟没有返回；仍在重试",
+        )
+        return True
+
+    def _start_watchdog(self, stop_event: threading.Event) -> threading.Thread:
+        """起巡检线程：循环卡住时替它说话，进程其余部分照常工作。"""
+
+        def watch() -> None:
+            while not stop_event.wait(self.watchdog_interval_seconds):
+                try:
+                    self.check_stall()
+                except Exception as exc:  # noqa: BLE001 - 巡检自己不能让 agent 退出
+                    self.logger.error("agent watchdog failed: %s", type(exc).__name__)
+
+        thread = threading.Thread(
+            target=watch, name="youziauth-agent-watchdog", daemon=True
+        )
+        thread.start()
+        return thread
+
+    def _wait_for_next_cycle(self, stop_event: threading.Event, delay: float) -> bool:
+        """等到下一轮、或者被手动指令/退出信号提前叫醒。返回 True 表示应当退出。
+
+        两个 Event 不能一起 wait，所以 ``serve_forever`` 起了一个把 stop 转成唤醒信号
+        的桥接线程；这样手动指令不必等满一个轮询周期，退出也不必等。
+        """
+        self._wake_event.wait(max(0.0, delay))
+        self._wake_event.clear()
+        return stop_event.is_set()
+
     def serve_forever(
         self,
         stop_event: threading.Event,
@@ -570,10 +836,21 @@ class Agent:
                     self.logger.error("agent command channel failed: %s", exc)
 
         threading.Thread(target=command_loop, name="youziauth-agent-ipc", daemon=True).start()
+
+        def wake_on_stop() -> None:
+            # stop 和「手动指令」都是「别睡了」，但 Event 不能一起 wait；
+            # 把 stop 桥接成同一个唤醒信号，退出就能立刻生效。
+            stop_event.wait()
+            self._wake_event.set()
+
+        threading.Thread(
+            target=wake_on_stop, name="youziauth-agent-stop", daemon=True
+        ).start()
+        self._start_watchdog(stop_event)
         # 更新器没启用就先把原因写进快照：不必等到「有更新要检查」才让用户知道。
         self._publish_disabled_reason()
-        delay = 0
-        while not stop_event.wait(delay):
+        delay = 0.0
+        while not stop_event.is_set():
             self._recover_update()
             if self.update_due():
                 # 只在网络循环的间隙跑一次；安装会终止本进程，重启后由 next_update_at
@@ -582,8 +859,12 @@ class Agent:
                     self.periodic_update_check()
                 except Exception as exc:  # noqa: BLE001 - never let an update stop the agent
                     self.logger.error("periodic update check failed: %s", type(exc).__name__)
-            result = self.run_cycle()
+            # 手动指令只留下「下一轮要强制登录」这个标记，真正的一轮在这里跑。
+            force_login = self._take_pending_force_login()
+            result = self.run_cycle(force_login=force_login)
             delay = result.next_delay
+            if self._wait_for_next_cycle(stop_event, delay):
+                break
 
 
 def load_agent_config(path: Path) -> campus_auth.AuthConfig:

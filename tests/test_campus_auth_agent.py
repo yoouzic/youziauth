@@ -20,7 +20,7 @@ import campus_auth
 import campus_auth_agent
 import network_probe
 from agent_ipc import RuntimeSnapshot, read_snapshot, write_snapshot
-from auth_runtime import AuthAttempt, AttemptKind
+from auth_runtime import AgentState, AuthAttempt, AttemptKind
 from campus_auth_agent import ONLINE_HEARTBEAT_SECONDS, Agent, build_arg_parser
 from network_probe import NetworkObservation, NetworkProbe
 
@@ -28,11 +28,38 @@ from network_probe import NetworkObservation, NetworkProbe
 class FakeProbe:
     def __init__(self, observations):
         self.observations = list(observations)
+        self.calls = 0
 
     def observe(self, config):
+        self.calls += 1
         if len(self.observations) > 1:
             return self.observations.pop(0)
         return self.observations[0]
+
+
+class BlockingProbe:
+    """一直卡在探测里：模拟 Wi-Fi 切换时 Windows 的 DNS 解析挂住、没有超时。"""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def observe(self, config):
+        self.calls += 1
+        self.entered.set()
+        # 由测试放行，避免卡住的线程永远占着探测名额。
+        self.release.wait(30)
+        return NetworkObservation(True, False)
+
+
+def wait_until(predicate, timeout=10.0, interval=0.01):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
 
 
 class FakeAuthenticator:
@@ -296,9 +323,10 @@ class AgentLoopTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def make_agent(self, probe, authenticator, boot_id="boot-1", updater=None,
-                   update_interval_seconds=6 * 60 * 60, update_reason=""):
+                   update_interval_seconds=6 * 60 * 60, update_reason="",
+                   config_loader=None, **agent_options):
         agent = Agent(
-            config_loader=lambda: self.config,
+            config_loader=config_loader or (lambda: self.config),
             probe=probe,
             authenticator=authenticator,
             snapshot_path=self.snapshot_path,
@@ -307,6 +335,7 @@ class AgentLoopTests(unittest.TestCase):
             updater=updater,
             update_interval_seconds=update_interval_seconds,
             update_reason=update_reason,
+            **agent_options,
         )
         self._agents.append(agent)
         return agent
@@ -555,7 +584,9 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(first.snapshot.incident_id, second.snapshot.incident_id)
         self.assertEqual(authenticator.calls, 1)
 
-    def test_retry_command_clears_rejection_block(self):
+    def test_retry_now_stays_synchronous_for_direct_callers(self):
+        # retry_now 是给直接调用方/测试用的同步入口；走 named pipe 的 retry 指令
+        # 不能走它（见 AgentLivenessTests），否则会卡住整条指令通道。
         authenticator = FakeAuthenticator(
             [
                 AuthAttempt(AttemptKind.REJECTED, "账号或密码错误"),
@@ -968,6 +999,264 @@ class LoginBlockTests(AgentLoopTests):
         self.assertEqual(
             sum("portal is not reachable" in line for line in captured.output), 1
         )
+
+
+class AgentLivenessTests(AgentLoopTests):
+    """手动指令不准在 pipe 线程做网络 I/O；探测有墙钟死线；卡住时由巡检说话。
+
+    2026-10-24 14:08：用户刚在 Wi-Fi 之间切换过，handle_command("retry") 在 pipe
+    handler 里同步跑了一整轮 run_cycle(force_login=True)，网络探测卡死（Windows 的
+    getaddrinfo/DNS 解析没有超时），pipe 一直 busy，runtime.json 和 agent.log 一起
+    静默，界面那条没有超时上界的读取就把过期的「连接正常」一直留在屏幕上。
+    这一组测试锁住「再也不会那样静默地冻住」。
+    """
+
+    def test_the_retry_command_returns_without_doing_network_work(self):
+        probe = BlockingProbe()
+        authenticator = FakeAuthenticator([AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, "ok")])
+        agent = self.make_agent(probe, authenticator)
+
+        started = time.monotonic()
+        with self.assertLogs(agent.logger, level="INFO") as captured:
+            response = agent.handle_command(agent_ipc.AgentCommand("retry"))
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 2.0, "the retry command must not wait for the network")
+        self.assertTrue(response["ok"])
+        self.assertEqual(probe.calls, 0, "no network I/O on the pipe thread")
+        self.assertEqual(authenticator.calls, 0)
+        self.assertIn("manual retry requested", " ".join(captured.output))
+        self.assertTrue(agent._wake_event.is_set(), "the main loop must be woken")
+        self.assertTrue(agent._take_pending_force_login(), "the next cycle must be forced")
+        self.assertFalse(agent._take_pending_force_login(), "the flag is consumed once")
+
+    def test_the_retry_command_clears_the_block_without_authenticating(self):
+        authenticator = FakeAuthenticator(
+            [
+                AuthAttempt(AttemptKind.REJECTED, "账号或密码错误"),
+                AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, "ok"),
+            ]
+        )
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+        agent.run_cycle()
+        self.assertEqual(authenticator.calls, 1)
+        self.assertTrue(agent.login_block_requires_action)
+
+        response = agent.handle_command(agent_ipc.AgentCommand("retry"))
+
+        # 指令只清状态、叫醒主循环；真正的强制登录还没发生。
+        self.assertEqual(authenticator.calls, 1, "the pipe thread must not authenticate")
+        self.assertEqual(response["snapshot"]["state"], "auth_failed")
+        self.assertFalse(agent.automatic_login_blocked)
+        self.assertFalse(agent.login_block_requires_action)
+        self.assertEqual(agent.transient_failures, 0)
+        self.assertEqual(agent.unverified_logins, 0)
+
+    def test_the_main_loop_runs_the_forced_cycle_the_retry_asked_for(self):
+        authenticator = FakeAuthenticator(
+            [AuthAttempt(AttemptKind.REJECTED, "账号或密码错误")],
+            forced_attempts=[AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, "ok")],
+        )
+        agent = self.make_agent(FakeProbe([NetworkObservation(False, True)]), authenticator)
+        stop_event = threading.Event()
+
+        class FakePipeServer:
+            """代替真实 named pipe：只模拟「等连接」，不碰网络也不绑端口。"""
+
+            def __init__(inner, name, handler, allowed_user_sid=None):
+                inner.handler = handler
+
+            def serve_once(inner):
+                time.sleep(0.02)
+
+        with patch.object(campus_auth_agent, "NamedPipeServer", FakePipeServer):
+            loop = threading.Thread(target=agent.serve_forever, args=(stop_event,), daemon=True)
+            loop.start()
+            try:
+                self.assertTrue(
+                    wait_until(lambda: len(authenticator.force_flags) >= 1),
+                    "the loop must run its periodic cycle",
+                )
+                self.assertEqual(authenticator.force_flags, [False])
+
+                agent.handle_command(agent_ipc.AgentCommand("retry"))
+
+                self.assertTrue(
+                    wait_until(lambda: True in authenticator.force_flags),
+                    "the retry must reach the loop as a forced cycle",
+                )
+                self.assertEqual(agent.snapshot.state, "online_campus")
+            finally:
+                stop_event.set()
+                loop.join(5)
+        self.assertFalse(loop.is_alive(), "the main loop must stop promptly")
+
+    def test_the_reload_config_command_does_not_run_a_cycle(self):
+        configs = [
+            self.config,
+            campus_auth.AuthConfig(username="student", password="secret",
+                                   check_interval_seconds=30),
+        ]
+        probe = FakeProbe([NetworkObservation(True, False)])
+        authenticator = FakeAuthenticator([AuthAttempt(AttemptKind.REJECTED, "no")])
+        agent = self.make_agent(probe, authenticator, config_loader=lambda: configs.pop(0))
+
+        with self.assertLogs(agent.logger, level="INFO") as captured:
+            response = agent.handle_command(agent_ipc.AgentCommand("reload-config"))
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(probe.calls, 0, "reload-config must not run a cycle")
+        self.assertEqual(authenticator.calls, 0)
+        self.assertEqual(agent.config.check_interval_seconds, 30)
+        self.assertEqual(agent.retry_policy.regular_interval_seconds, 30)
+        self.assertTrue(agent._wake_event.is_set(), "the main loop must be woken")
+        self.assertFalse(agent._take_pending_force_login(), "a reload must not force a login")
+        self.assertIn("configuration reloaded", " ".join(captured.output))
+
+    def test_the_probe_deadline_default_bounds_a_request_timeout(self):
+        # 默认死线 = max(30s, 5 * request_timeout_seconds)；request_timeout 默认 8s。
+        agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]))
+        self.assertEqual(agent.probe_deadline_seconds, 40.0)
+        # 巡检阈值 = max(120s, 2 * 探测死线 + 30s)。
+        self.assertEqual(agent.watchdog_stall_seconds, 120.0)
+        self.assertEqual(agent.watchdog_interval_seconds, 15.0)
+
+    def test_a_blocked_probe_times_out_instead_of_hanging_the_cycle(self):
+        probe = BlockingProbe()
+        agent = self.make_agent(probe, FakeAuthenticator([]), probe_deadline_seconds=0.2)
+        try:
+            started = time.monotonic()
+            with self.assertLogs(agent.logger, level="WARNING") as captured:
+                result = agent.run_cycle()
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 5.0, "the cycle must return at the deadline")
+            self.assertGreaterEqual(elapsed, 0.15, "it must actually wait for the deadline")
+            self.assertTrue(probe.entered.wait(2), "the probe really was started")
+            self.assertEqual(result.snapshot.state, "waiting_for_network")
+            self.assertIn("网络检测长时间没有返回", result.snapshot.detail)
+            self.assertIn("仍在重试", result.snapshot.detail)
+            # 「正常重试节奏」：第一次失败还是 2 秒后再来，不是把循环拖死。
+            self.assertEqual(result.next_delay, 2)
+            self.assertTrue(any("did not return" in line for line in captured.output))
+            # 快照文件也是新的：界面不会读到一条过期状态。
+            self.assertEqual(read_snapshot(self.snapshot_path).state, "waiting_for_network")
+            self.assertEqual(len(agent._probe_threads), 1, "the hung worker is accounted for")
+        finally:
+            probe.release.set()
+            for thread in list(agent._probe_threads):
+                thread.join(5)
+
+    def test_abandoned_probe_threads_are_capped(self):
+        # 挂住的探测线程收不回来（DNS 卡在系统调用里），所以名额有上限：
+        # 到顶就不再新开线程，直接按超时处理，绝不允许无界增长。
+        probe = BlockingProbe()
+        agent = self.make_agent(probe, FakeAuthenticator([]), probe_deadline_seconds=0.05)
+        try:
+            with patch.object(campus_auth_agent, "MAX_ABANDONED_PROBE_THREADS", 2):
+                for _ in range(3):
+                    result = agent.run_cycle()
+                    self.assertEqual(result.snapshot.state, "waiting_for_network")
+                    self.assertIn("网络检测长时间没有返回", result.snapshot.detail)
+            self.assertEqual(len(agent._probe_threads), 2, "the cap must stop new threads")
+            self.assertEqual(probe.calls, 2, "at the cap no new probe is launched")
+        finally:
+            probe.release.set()
+            for thread in list(agent._probe_threads):
+                thread.join(5)
+
+    def test_the_capped_probe_recovers_after_the_retry_cooldown(self):
+        # 到顶不等于永久停止探测：系统 DNS 可能只是暂时卡住，恢复后 agent 必须还能
+        # 自己回来。冷却期一过就放行一次新探测；只有硬上限才是真的放弃。
+        probe = BlockingProbe()
+        agent = self.make_agent(probe, FakeAuthenticator([]), probe_deadline_seconds=0.05)
+        try:
+            with patch.object(campus_auth_agent, "MAX_ABANDONED_PROBE_THREADS", 1):
+                agent.run_cycle()  # 第一个挂住的探测线程
+                agent.run_cycle()  # 到顶且还在冷却期：不再新开线程
+                self.assertEqual(probe.calls, 1)
+
+                with patch.object(campus_auth_agent, "PROBE_AT_CAP_RETRY_SECONDS", 0.0):
+                    agent.run_cycle()
+                    self.assertEqual(
+                        probe.calls, 2, "a capped agent must probe again after the cooldown"
+                    )
+
+                    with patch.object(campus_auth_agent, "PROBE_ABANDONED_HARD_CAP", 2):
+                        agent.run_cycle()
+                    self.assertEqual(
+                        probe.calls, 2, "the hard cap must stop unbounded thread growth"
+                    )
+        finally:
+            probe.release.set()
+            for thread in list(agent._probe_threads):
+                thread.join(5)
+
+    def test_the_watchdog_publishes_a_fresh_stuck_snapshot(self):
+        agent = self.make_agent(
+            FakeProbe([NetworkObservation(True, False)]),
+            FakeAuthenticator([AuthAttempt(AttemptKind.REJECTED, "no")]),
+        )
+        agent.run_cycle()
+        self.assertEqual(agent.snapshot.state, "online_external")
+
+        # 模拟一轮卡住的循环：卡住的循环不会再发布任何快照。
+        agent._cycle_started_at = time.monotonic() - (agent.watchdog_stall_seconds + 5)
+        with self.assertLogs(agent.logger, level="ERROR") as captured:
+            self.assertTrue(agent.check_stall())
+
+        self.assertEqual(agent.snapshot.state, "waiting_for_network")
+        self.assertIn("后台检测已超过约", agent.snapshot.detail)
+        self.assertIn("仍在重试", agent.snapshot.detail)
+        self.assertEqual(read_snapshot(self.snapshot_path).state, "waiting_for_network")
+        self.assertTrue(any("without returning" in line for line in captured.output))
+
+        # ERROR 日志按 300 秒节流，但快照每次巡检都必须刷新：界面不能把过期的
+        # online 当成当前状态。这里先把快照「弄旧」，再确认巡检重新发布。
+        agent._publish(AgentState.ONLINE_EXTERNAL, "互联网连接正常")
+        with self.assertNoLogs(agent.logger, level="ERROR"):
+            self.assertTrue(agent.check_stall())
+        self.assertEqual(agent.snapshot.state, "waiting_for_network")
+
+    def test_the_watchdog_stays_quiet_when_nothing_is_stuck(self):
+        agent = self.make_agent(
+            FakeProbe([NetworkObservation(True, False)]),
+            FakeAuthenticator([AuthAttempt(AttemptKind.REJECTED, "no")]),
+        )
+        with self.assertNoLogs(agent.logger, level="ERROR"):
+            # 没有周期在跑
+            self.assertFalse(agent.check_stall())
+            # 周期刚开始，没到阈值
+            agent._cycle_started_at = time.monotonic()
+            self.assertFalse(agent.check_stall())
+        agent._cycle_started_at = None
+
+    def test_the_watchdog_thread_notices_a_stalled_loop(self):
+        agent = self.make_agent(
+            FakeProbe([NetworkObservation(True, False)]),
+            FakeAuthenticator([AuthAttempt(AttemptKind.REJECTED, "no")]),
+            watchdog_interval_seconds=0.02,
+            watchdog_stall_seconds=0.05,
+        )
+        agent.run_cycle()
+        self.assertEqual(agent.snapshot.state, "online_external")
+        stop_event = threading.Event()
+        agent._cycle_started_at = time.monotonic() - 1.0
+
+        watchdog = agent._start_watchdog(stop_event)
+        try:
+            with self.assertLogs(agent.logger, level="ERROR") as captured:
+                self.assertTrue(
+                    wait_until(lambda: "后台检测已超过约" in agent.snapshot.detail),
+                    "the watchdog must publish a stuck snapshot",
+                )
+            self.assertTrue(any("without returning" in line for line in captured.output))
+        finally:
+            stop_event.set()
+            agent._cycle_started_at = None
+            # 巡检线程必须在临时目录被删掉之前收工，否则它会往正在删除的目录里写快照。
+            watchdog.join(5)
+        self.assertFalse(watchdog.is_alive(), "the watchdog must stop with the agent")
 
 
 class BuildUpdaterTests(unittest.TestCase):

@@ -53,11 +53,53 @@ SIMULATION_SAMPLE = 'location-sample.json'
 # cached. The UI polls the snapshot often and the answer changes only when the
 # user edits their proxy.
 PROXY_REPORT_TTL_SECONDS = 60
+# 界面读的是 SYSTEM 代理落盘的 runtime.json，不是实时通话。代理一旦卡死，最后一条快照
+# 会永远停在原处 —— 若原样映射成「连接正常」，用户就会对着一台其实需要网页认证的机器
+# 反复点「立即检测」（2026-10-24 的现场）。所以超过「3 个检测间隔」且不少于 180 秒
+# 没有更新就按「后台检测已停止响应」报告，而不是继续相信旧状态。
+AGENT_STALE_MIN_SECONDS = 180
+AGENT_STALE_INTERVALS = 3
+AGENT_STALE_MESSAGE = '后台检测已停止响应'
+# agent_ipc 现在保证命令在预算内失败并抛 TimeoutError；这两个入口把它翻译成用户
+# 看得懂的短句，而不是笼统的「操作未完成」，更不能让 JS 的 pending 永远等下去。
+AGENT_COMMAND_TIMEOUT_MESSAGE = '后台认证服务没有响应；请稍后重试，或重启电脑后再试。'
 
 
 def tile_providers():
     """A fresh copy per call: the UI must never be able to mutate the module's own table."""
     return [dict(provider) for provider in TILE_PROVIDERS]
+
+
+def agent_snapshot_updated_at(snapshot):
+    """快照里代理最近一次检测的时间；缺失、不是 ISO 8601 或没有时区时返回 None。
+
+    没有时区的本地时间无法与「现在」比较，按读不出来处理 —— 宁可说「检测已停止响应」，
+    也不能凭一个不知道在哪个时区的时间证明代理还活着。
+    """
+    try:
+        parsed = dt.datetime.fromisoformat(getattr(snapshot, 'updated_at', ''))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def agent_snapshot_is_stale(snapshot, check_interval_seconds, now=None):
+    """代理是不是已经停止更新状态。时间读不出来也算停止：没法证明它还活着。"""
+    updated_at = agent_snapshot_updated_at(snapshot)
+    if updated_at is None:
+        return True
+    limit = max(AGENT_STALE_MIN_SECONDS, AGENT_STALE_INTERVALS * int(check_interval_seconds))
+    current = now or dt.datetime.now().astimezone()
+    return (current - updated_at).total_seconds() > limit
+
+
+def stale_agent_message(updated_at):
+    """过期提示：知道最近检测时间就把 HH:MM 带上，不知道就省掉，而不是编一个时间。"""
+    if updated_at is None:
+        return AGENT_STALE_MESSAGE
+    return f'{AGENT_STALE_MESSAGE}（最近一次检测于 {updated_at.strftime("%H:%M")}）'
 
 
 def network_settings(payload, previous):
@@ -541,7 +583,12 @@ class DesktopBridge(LocationProbe):
             return f'已写入 {written.name}，并备份了原文件；规则已生效'
         if action in ('network_check', 'network_start'):
             if self._agent:
-                self._agent_command('retry' if action == 'network_check' else 'reload-config')
+                try:
+                    self._agent_command('retry' if action == 'network_check' else 'reload-config')
+                except TimeoutError:
+                    # 命令管道到点没有回音（旧实现会永久阻塞，前端按钮从此一直禁用）。
+                    # 明确告诉用户「后台服务没响应」，而不是笼统的「操作未完成」。
+                    raise RuntimeError(AGENT_COMMAND_TIMEOUT_MESSAGE) from None
                 return ('已通知后台服务重新检测' if action == 'network_check'
                         else '已通知后台服务开始后台检测')
             if self._monitoring or not self._network_gate.acquire(blocking=False):
@@ -798,6 +845,9 @@ class DesktopBridge(LocationProbe):
             raise RuntimeError('后台检测未在运行；开启后会自动检查更新，也可以在这里立即请求一次。')
         try:
             self._agent_command('check-update')
+        except TimeoutError:
+            # 代理没在预算内回话：说清楚是「没响应」，不要退回笼统的失败提示。
+            raise RuntimeError(AGENT_COMMAND_TIMEOUT_MESSAGE) from None
         except OSError:
             raise RuntimeError('无法联系后台服务，请稍后重试或检查后台检测是否在运行。') from None
         return '已开始检查更新；发现新版本会自动安装，无需再确认。'
@@ -858,28 +908,51 @@ class DesktopBridge(LocationProbe):
                 windows_notifications.show_toast(windows_notifications.build_dorm_toast(
                     f'{label}：{result.message}' if label else result.message))
 
+    def _agent_check_interval(self):
+        """判定快照是否过期用的检测间隔；设置读不动时用默认 60 秒（更严格的一侧）。"""
+        try:
+            return gui.load_gui_settings(self._config).check_interval_seconds
+        except Exception:  # noqa: BLE001 - 轮询每秒都跑，读配置失败绝不能让它抛
+            return gui.GuiSettings().check_interval_seconds
+
     def _tick(self):
         self._collect_dorm()
         if self._agent:
             try:
                 snapshot = agent_ipc.read_snapshot(gui.agent_runtime_path(self._config))
-                state = {'online_external':'online', 'online_campus':'online',
-                         'waiting_for_network':'checking', 'auth_failed':'offline'}.get(snapshot.state, 'error')
-                with self._lock:
-                    self._state, self._message = state, snapshot.detail or snapshot.state
-                    self._last_agent = snapshot
-                # 自动更新状态跟着同一条快照进来：更新页显示的是提权代理的真实进度，
-                # 而不是界面自己另做一次检查。
-                if isinstance(getattr(snapshot, 'update', None), dict) and snapshot.update:
-                    self._updates.adopt(snapshot.update)
-                toast = self._notification_tracker.evaluate(snapshot)
-                if toast:
-                    windows_notifications.show_toast(toast)
             except (OSError, ValueError):
-                self._state, self._message = 'checking', '等待系统认证代理…'
+                with self._lock:
+                    self._state, self._message = 'checking', '等待系统认证代理…'
                 # 代理没在跑，就没有人在做更新：不能继续显示一个界面已经无法执行的
                 # 「可以安装」，那会让用户对着一个永远装不上的按钮点。
                 self._updates.disconnect('后台自动更新未在运行；在「校园网」页开启后台检测后会自动检查。')
+                return
+            updated_at = agent_snapshot_updated_at(snapshot)
+            if agent_snapshot_is_stale(snapshot, self._agent_check_interval()):
+                # 冻结的快照曾经恰好停在 online，于是界面一直说「连接正常」。过期数据
+                # 只能作为「代理停止响应」的证据：状态改报 error，时间照实写出来，
+                # 但绝不再用它触发托盘通知（那会把用户引向错误的处理方向）。
+                with self._lock:
+                    self._last_agent = snapshot
+                    self._state = 'error'
+                    self._message = stale_agent_message(updated_at)
+                    if updated_at is not None:
+                        self._checked = updated_at.strftime('%H:%M:%S')
+                return
+            state = {'online_external':'online', 'online_campus':'online',
+                     'waiting_for_network':'checking', 'auth_failed':'offline'}.get(snapshot.state, 'error')
+            with self._lock:
+                self._state, self._message = state, snapshot.detail or snapshot.state
+                self._last_agent = snapshot
+                # 面板显示「最近检测 · HH:MM:SS」，而不是永远停在「尚未执行连接检测」。
+                self._checked = updated_at.strftime('%H:%M:%S')
+            # 自动更新状态跟着同一条快照进来：更新页显示的是提权代理的真实进度，
+            # 而不是界面自己另做一次检查。
+            if isinstance(getattr(snapshot, 'update', None), dict) and snapshot.update:
+                self._updates.adopt(snapshot.update)
+            toast = self._notification_tracker.evaluate(snapshot)
+            if toast:
+                windows_notifications.show_toast(toast)
 
     def _close(self):
         self._closed.set()

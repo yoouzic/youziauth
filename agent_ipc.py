@@ -15,6 +15,10 @@ from typing import Callable, Mapping
 
 
 MAX_MESSAGE_BYTES = 16 * 1024
+# Granularity of the client-side reply poll. The agent is a local process, so a
+# short interval keeps the added latency unmeasurable while still releasing a
+# wedged caller promptly once the deadline passes.
+_READ_POLL_INTERVAL_SECONDS = 0.015
 ALLOWED_COMMANDS = {
     "status",
     "retry",
@@ -198,6 +202,15 @@ if os.name == "nt":
         ctypes.c_void_p,
     ]
     _kernel32.ReadFile.restype = wintypes.BOOL
+    _kernel32.PeekNamedPipe.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _kernel32.PeekNamedPipe.restype = wintypes.BOOL
     _kernel32.WriteFile.argtypes = [
         wintypes.HANDLE,
         ctypes.c_void_p,
@@ -319,10 +332,37 @@ class NamedPipeServer:
             raise OSError("incomplete named-pipe write")
 
 
+def _read_reply(handle, name: str, deadline: float) -> bytes:
+    """Read one reply message before the wall-clock deadline.
+
+    A wedged agent handler can keep the pipe connection open without ever
+    writing, so a blocking PIPE_WAIT ReadFile has no safe upper bound. Poll the
+    pending byte count with PeekNamedPipe and only issue ReadFile once a message
+    is actually queued; message-mode behavior and the MAX_MESSAGE_BYTES limit
+    are unchanged. A pipe that closes during the wait raises a bounded OSError
+    instead of blocking or being reported as a timeout.
+    """
+    available = wintypes.DWORD()
+    while True:
+        if not _kernel32.PeekNamedPipe(
+            handle, None, 0, None, ctypes.byref(available), None
+        ):
+            error = ctypes.get_last_error()
+            raise OSError(f"agent pipe closed while waiting for a reply (winerror {error})")
+        if available.value:
+            return NamedPipeServer._read(handle)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"timed out waiting for a reply from agent pipe {name}")
+        time.sleep(min(_READ_POLL_INTERVAL_SECONDS, remaining))
+
+
 def send_command(name: str, command: AgentCommand | UiCommand, timeout_ms: int = 2000) -> dict[str, object]:
     if os.name != "nt":
         raise OSError("named pipes are only available on Windows")
     path = _pipe_path(name)
+    # timeout_ms is a single budget for connecting, writing, and waiting for
+    # the reply; the agent must never be able to block the caller forever.
     deadline = time.monotonic() + timeout_ms / 1000
     handle = None
     while time.monotonic() < deadline:
@@ -352,7 +392,7 @@ def send_command(name: str, command: AgentCommand | UiCommand, timeout_ms: int =
             raise ctypes.WinError(ctypes.get_last_error())
         request = json.dumps(command.to_payload(), separators=(",", ":")).encode("utf-8")
         NamedPipeServer._write(handle, request)
-        response = NamedPipeServer._read(handle)
+        response = _read_reply(handle, name, deadline)
     finally:
         _kernel32.CloseHandle(handle)
     value = json.loads(response.decode("utf-8"))

@@ -1,6 +1,7 @@
 import os
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -74,6 +75,100 @@ class CommandTests(unittest.TestCase):
         thread.join(timeout=3)
         self.assertFalse(thread.is_alive())
         self.assertEqual(response, {"ok": True, "command": "status"})
+
+
+class _ClosingPipeServer(NamedPipeServer):
+    """Accept and read one request, then close the pipe without replying."""
+
+    def _write(self, handle, value):
+        # Simulates the agent dying between reading the request and replying;
+        # serve_once still closes the server handle in its finally block.
+        raise OSError("test server closed the pipe instead of replying")
+
+
+@unittest.skipUnless(os.name == "nt", "named pipes are Windows-only")
+class BoundedPipeReadTests(unittest.TestCase):
+    def start_server(self, handler, server_type=NamedPipeServer):
+        name = f"youziauth-test-{uuid.uuid4().hex}"
+        server = server_type(name, handler)
+        errors = []
+
+        def serve():
+            try:
+                server.serve_once()
+            except OSError as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        return name, thread, errors
+
+    def test_an_absent_pipe_still_reports_the_connect_timeout(self):
+        name = f"youziauth-test-missing-{uuid.uuid4().hex}"
+        started = time.monotonic()
+
+        with self.assertRaises(TimeoutError) as caught:
+            send_command(name, AgentCommand("status"), timeout_ms=200)
+
+        self.assertEqual(
+            str(caught.exception), f"timed out connecting to agent pipe {name}"
+        )
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_a_wedged_agent_times_out_without_hanging_the_caller(self):
+        request_seen = threading.Event()
+        release_reply = threading.Event()
+        received = []
+
+        def wedged_handler(command):
+            received.append(command.command)
+            request_seen.set()
+            release_reply.wait(10)
+            return {"ok": True, "command": command.command}
+
+        name, thread, errors = self.start_server(wedged_handler)
+        started = time.monotonic()
+        try:
+            with self.assertRaises(TimeoutError) as caught:
+                send_command(name, AgentCommand("status"), timeout_ms=500)
+            elapsed = time.monotonic() - started
+            self.assertEqual(
+                str(caught.exception),
+                f"timed out waiting for a reply from agent pipe {name}",
+            )
+            self.assertTrue(
+                request_seen.is_set(),
+                "the deadline must bound a connected read, not just connect retries",
+            )
+            self.assertGreaterEqual(elapsed, 0.3)
+            self.assertLess(elapsed, 3)
+            self.assertEqual(
+                received, ["status"], "a timed-out command must not be replayed"
+            )
+        finally:
+            release_reply.set()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(errors, "the late reply must fail on the caller's closed pipe")
+
+    def test_a_closed_agent_pipe_raises_a_bounded_oserror(self):
+        name, thread, errors = self.start_server(
+            lambda command: {"ok": True}, server_type=_ClosingPipeServer
+        )
+        try:
+            with self.assertRaises(OSError) as caught:
+                send_command(name, AgentCommand("status"), timeout_ms=1000)
+            self.assertNotIsInstance(
+                caught.exception,
+                TimeoutError,
+                "a closed pipe must not be reported as a reply timeout",
+            )
+            self.assertIn("winerror", str(caught.exception))
+            self.assertLess(len(str(caught.exception)), 300)
+        finally:
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(errors)
 
 
 if __name__ == "__main__":
