@@ -84,6 +84,20 @@ class FakeAuthenticator:
         return source[0]
 
 
+class FakeSessionVerifier:
+    """Answers "does the portal hold a session?" without touching the network."""
+
+    def __init__(self, statuses):
+        self.statuses = list(statuses)
+        self.calls = 0
+
+    def __call__(self, config, logger):
+        self.calls += 1
+        if len(self.statuses) > 1:
+            return self.statuses.pop(0)
+        return self.statuses[0]
+
+
 class NetworkProbeTests(unittest.TestCase):
     def test_external_internet_short_circuits_portal_probe(self):
         calls = []
@@ -1046,7 +1060,11 @@ class AgentLivenessTests(AgentLoopTests):
 
         # 指令只清状态、叫醒主循环；真正的强制登录还没发生。
         self.assertEqual(authenticator.calls, 1, "the pipe thread must not authenticate")
-        self.assertEqual(response["snapshot"]["state"], "auth_failed")
+        # 但快照必须马上变一下：命令立即返回，而一整轮探测可能要几十秒，中间界面若
+        # 一个字都不变，点按钮的人会以为没点到（2026-10-26：122 次点击无可见变化）。
+        self.assertEqual(response["snapshot"]["state"], "waiting_for_network")
+        self.assertIn("正在重新检测", response["snapshot"]["detail"])
+        self.assertEqual(read_snapshot(agent.snapshot_path).state, "waiting_for_network")
         self.assertFalse(agent.automatic_login_blocked)
         self.assertFalse(agent.login_block_requires_action)
         self.assertEqual(agent.transient_failures, 0)
@@ -1085,7 +1103,11 @@ class AgentLivenessTests(AgentLoopTests):
                     wait_until(lambda: True in authenticator.force_flags),
                     "the retry must reach the loop as a forced cycle",
                 )
-                self.assertEqual(agent.snapshot.state, "online_campus")
+                # 点击会先发布「正在重新检测」的临时快照，再等主循环跑完这一轮。
+                self.assertTrue(
+                    wait_until(lambda: agent.snapshot.state == "online_campus"),
+                    "the forced cycle must publish its result",
+                )
             finally:
                 stop_event.set()
                 loop.join(5)
@@ -1367,6 +1389,140 @@ class AgentUpdateStatusTests(unittest.TestCase):
         agent = self.make()
         agent._publish_disabled_reason()
         self.assertEqual(agent.snapshot.update, {})
+
+
+class UplinkProbeFalsePositiveTests(unittest.TestCase):
+    """A captive-portal whitelist must not turn「认证」into a no-op.
+
+    2026-10-26 现场：校园网会话已经过期，但门户放行了几个连通性探测域名，于是 uplink
+    探测报「外网可通」。界面显示「外网可通，但代理/VPN 不通」，用户点了 122 次「重新
+    认证」，每一次都在 internet_ok 分支直接返回 —— 既没问门户，也没尝试登录。与此同时
+    Windows 自己弹着「需要执行的操作」。这一组测试锁住：门户的回答优先于 uplink 探测，
+    而且点击必须有可见动作。
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.snapshot_path = Path(self.temporary.name) / "runtime.json"
+        self.config = campus_auth.AuthConfig(
+            username="student", password="secret", check_interval_seconds=60
+        )
+        self.logger = logging.getLogger(f"agent-false-positive-{id(self)}")
+        self.logger.addHandler(logging.NullHandler())
+
+    def make_agent(self, observation, authenticator, verifier=None):
+        return Agent(
+            config_loader=lambda: self.config,
+            probe=FakeProbe([observation]),
+            authenticator=authenticator,
+            session_verifier=verifier,
+            snapshot_path=self.snapshot_path,
+            logger=self.logger,
+            boot_id="boot-1",
+        )
+
+    def test_a_manual_retry_authenticates_even_when_the_uplink_probe_passed(self):
+        verifier = FakeSessionVerifier([campus_auth.AuthStatus.UNAUTHENTICATED])
+        authenticator = FakeAuthenticator(
+            [AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, "认证成功")]
+        )
+        agent = self.make_agent(
+            NetworkObservation(True, False, proxy_path_ok=False), authenticator, verifier
+        )
+
+        pending = agent.request_retry()
+        self.assertEqual(pending.state, "waiting_for_network")
+        self.assertIn("正在重新检测", pending.detail)
+        result = agent.run_cycle(force_login=agent._take_pending_force_login())
+
+        self.assertEqual(verifier.calls, 1, "the portal, not the uplink probe, decides")
+        self.assertEqual(authenticator.calls, 1, "the click must really authenticate")
+        self.assertEqual(result.snapshot.state, "online_campus")
+        self.assertIn("代理", result.snapshot.detail)
+
+    def test_a_manual_retry_while_the_browsing_path_works_needs_no_relogin(self):
+        # gstatic 204 都通了，说明普通 HTTP 真的被带出去了：此时校园网会话不可能还停在
+        # 未认证，所以不必打门户，只要让点击有一个看得见的答案。
+        verifier = FakeSessionVerifier([campus_auth.AuthStatus.UNAUTHENTICATED])
+        authenticator = FakeAuthenticator([])
+        agent = self.make_agent(NetworkObservation(True, False), authenticator, verifier)
+
+        agent.request_retry()
+        result = agent.run_cycle(force_login=agent._take_pending_force_login())
+
+        self.assertEqual(verifier.calls, 0)
+        self.assertEqual(authenticator.calls, 0)
+        self.assertEqual(result.snapshot.state, "online_external")
+        self.assertIn("无需重新认证", result.snapshot.detail)
+
+    def test_a_broken_browsing_path_with_an_expired_session_authenticates_automatically(self):
+        verifier = FakeSessionVerifier([campus_auth.AuthStatus.UNAUTHENTICATED])
+        authenticator = FakeAuthenticator(
+            [AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, "认证成功")]
+        )
+        agent = self.make_agent(
+            NetworkObservation(True, False, proxy_path_ok=False), authenticator, verifier
+        )
+
+        result = agent.run_cycle()
+
+        self.assertEqual(verifier.calls, 1)
+        self.assertEqual(authenticator.calls, 1)
+        self.assertEqual(result.snapshot.state, "online_campus")
+
+    def test_a_broken_browsing_path_with_a_live_session_still_blames_the_proxy(self):
+        verifier = FakeSessionVerifier([campus_auth.AuthStatus.AUTHENTICATED])
+        authenticator = FakeAuthenticator([])
+        agent = self.make_agent(
+            NetworkObservation(True, False, proxy_path_ok=False), authenticator, verifier
+        )
+
+        result = agent.run_cycle()
+
+        self.assertEqual(result.snapshot.state, "online_external")
+        self.assertIn("会话有效", result.snapshot.detail)
+        self.assertIn("代理", result.snapshot.detail)
+        self.assertEqual(authenticator.calls, 0)
+
+    def test_a_broken_browsing_path_without_a_portal_answer_keeps_the_proxy_warning(self):
+        verifier = FakeSessionVerifier([campus_auth.AuthStatus.UNKNOWN])
+        authenticator = FakeAuthenticator([])
+        agent = self.make_agent(
+            NetworkObservation(True, False, proxy_path_ok=False), authenticator, verifier
+        )
+
+        result = agent.run_cycle()
+
+        self.assertEqual(result.snapshot.state, "online_external")
+        self.assertIn("代理/VPN", result.snapshot.detail)
+        self.assertEqual(authenticator.calls, 0)
+
+    def test_a_manual_retry_that_cannot_get_a_portal_answer_says_so(self):
+        verifier = FakeSessionVerifier([campus_auth.AuthStatus.UNKNOWN])
+        authenticator = FakeAuthenticator([])
+        agent = self.make_agent(
+            NetworkObservation(True, False, proxy_path_ok=False), authenticator, verifier
+        )
+
+        agent.request_retry()
+        result = agent.run_cycle(force_login=agent._take_pending_force_login())
+
+        self.assertEqual(result.snapshot.state, "online_external")
+        self.assertIn("代理/VPN", result.snapshot.detail)
+        self.assertIn("未能确认校园网会话", result.snapshot.detail)
+        self.assertEqual(authenticator.calls, 0)
+
+    def test_the_plain_online_path_does_not_ask_the_portal(self):
+        verifier = FakeSessionVerifier([campus_auth.AuthStatus.UNAUTHENTICATED])
+        authenticator = FakeAuthenticator([])
+        agent = self.make_agent(NetworkObservation(True, False), authenticator, verifier)
+
+        result = agent.run_cycle()
+
+        self.assertEqual(result.snapshot.state, "online_external")
+        self.assertEqual(result.snapshot.detail, "互联网连接正常")
+        self.assertEqual(verifier.calls, 0, "a healthy uplink and browsing path needs no portal query")
 
 
 if __name__ == "__main__":

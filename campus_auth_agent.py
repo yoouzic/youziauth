@@ -125,6 +125,7 @@ class Agent:
         authenticator: Callable[..., AuthAttempt],
         snapshot_path: Path,
         logger: logging.Logger,
+        session_verifier: Optional[Callable[..., object]] = None,
         boot_id: Optional[str] = None,
         updater=None,
         update_interval_seconds: int = 6 * 60 * 60,
@@ -137,6 +138,10 @@ class Agent:
         self.config = config_loader()
         self.probe = probe
         self.authenticator = authenticator
+        # 门户侧的会话状态查询。uplink 探测证明不了校园网会话：captive portal 常把几个
+        # 连通性探测域名放进白名单，于是「外网可通」和「需要网页认证」可以同时成立。
+        # 只有门户自己的会话视图能回答这个问题，所以这里给它一个独立的查询入口。
+        self.session_verifier = session_verifier
         self.snapshot_path = Path(snapshot_path)
         self.logger = logger
         self.boot_id = boot_id or current_boot_id()
@@ -395,18 +400,8 @@ class Agent:
             self.unverified_logins = 0
             self.unverified_incident_id = ""
             self._stalled_logged_at = None
-            # The uplink works. If the browsing path does not, the campus session
-            # is not the problem -- the proxy/VPN carrying ordinary traffic is --
-            # and saying "互联网连接正常" there is what made this app look like it
-            # was lying while nothing loaded.
-            if observation.proxy_path_ok:
-                detail = "互联网连接正常"
-            else:
-                detail = "外网可通，但代理/VPN 不通（请检查 Clash 节点）"
             previous = self.snapshot.state
-            snapshot = self._publish(AgentState.ONLINE_EXTERNAL, detail)
-            self._log_online_heartbeat(previous)
-            return CycleResult(snapshot, self.config.check_interval_seconds, False)
+            return self._run_online_cycle(observation, force_login, previous)
 
         if not observation.portal_reachable:
             snapshot = self._publish(AgentState.WAITING_FOR_NETWORK, "等待网络或校园网门户")
@@ -418,6 +413,75 @@ class Agent:
             )
             return CycleResult(snapshot, delay, False)
 
+        return self._authenticate(observation, force_login)
+
+    def _run_online_cycle(
+        self, observation: NetworkObservation, force_login: bool, previous_state: str
+    ) -> CycleResult:
+        """Uplink reaches the Internet; decide whether the campus session still needs work.
+
+        The uplink probe alone cannot prove the campus session is alive: a captive
+        portal commonly leaves a few connectivity-check hosts on a whitelist, so
+        "外网可通" and "needs web authentication" can be true at the same time.
+        2026-10-26 现场：界面显示「外网可通，但代理/VPN 不通」，一分钟后门户才回答
+        unauthenticated 并登录成功；这期间用户点了 122 次「重新认证」，每一次都在这里
+        直接返回，既没问门户也没尝试登录 —— 所以「点击没有反应」。
+
+        判断顺序：抓取路径（gstatic 204）能通就说明普通 HTTP 真的被带出去了，校园网
+        会话不可能还停在未认证 —— 只有它不通时才去问门户这个权威（死代理和未认证门户
+        在那里长得一模一样）。手动重试在两种情况下都要给出可见的答案。
+        """
+        status = self._verify_session() if not observation.proxy_path_ok else None
+        if status is campus_auth.AuthStatus.AUTHENTICATED:
+            detail = "校园网会话有效"
+            detail += "；但代理/VPN 不通（请检查 Clash 节点）"
+            return self._publish_online(detail, previous_state)
+        if status is campus_auth.AuthStatus.UNAUTHENTICATED:
+            # The probe was answered by something that does not carry authenticated
+            # traffic (a captive-portal whitelist host). Authenticate for real.
+            self.logger.info(
+                "uplink probe passed but the portal reports no campus session; "
+                "authenticating anyway"
+            )
+            return self._authenticate(observation, force_login)
+        if observation.proxy_path_ok:
+            detail = "互联网连接正常，无需重新认证" if force_login else "互联网连接正常"
+            return self._publish_online(detail, previous_state)
+        if force_login:
+            # The user asked, and the only thing that failed is the browsing path.
+            return self._publish_online(
+                "外网可通，但代理/VPN 不通（请检查 Clash 节点）；未能确认校园网会话",
+                previous_state,
+            )
+        return self._publish_online(
+            "外网可通，但代理/VPN 不通（请检查 Clash 节点）", previous_state
+        )
+
+    def _verify_session(self) -> Optional[campus_auth.AuthStatus]:
+        """Ask the portal whether this machine still has a live campus session.
+
+        The uplink probes cannot answer it, and neither can a log line: only the
+        portal's own session view is authoritative. Any failure is "unknown", never
+        a crash and never a reason to claim the session is gone.
+        """
+        if self.session_verifier is None:
+            return None
+        try:
+            status = self.session_verifier(self.config, self.logger)
+        except Exception as exc:  # noqa: BLE001 - a failed check must not stop authentication
+            self.logger.warning("campus session check failed: %s", sanitized_detail(str(exc)))
+            return None
+        return status if isinstance(status, campus_auth.AuthStatus) else None
+
+    def _publish_online(self, detail: str, previous_state: str) -> CycleResult:
+        snapshot = self._publish(AgentState.ONLINE_EXTERNAL, detail)
+        self._log_online_heartbeat(previous_state)
+        return CycleResult(snapshot, self.config.check_interval_seconds, False)
+
+    def _authenticate(
+        self, observation: NetworkObservation, force_login: bool
+    ) -> CycleResult:
+        """Run one authentication attempt and report what the portal said."""
         self.network_attempt_index = 0
         if self.automatic_login_blocked and not force_login:
             if self.login_block_requires_action:
@@ -492,7 +556,12 @@ class Agent:
             self.automatic_login_blocked = False
             self.unverified_logins = 0
             self.unverified_incident_id = ""
-            snapshot = self._publish(AgentState.ONLINE_CAMPUS, attempt.message or "校园网已认证")
+            detail = attempt.message or "校园网已认证"
+            # The session is authenticated now; if ordinary browsing still cannot be
+            # carried, say why, or the next screenshot looks like the app is lying.
+            if observation.internet_ok and not observation.proxy_path_ok:
+                detail += "；但代理/VPN 不通（请检查 Clash 节点）"
+            snapshot = self._publish(AgentState.ONLINE_CAMPUS, detail)
             return CycleResult(snapshot, self.config.check_interval_seconds, False)
 
         if attempt.kind is AttemptKind.REJECTED:
@@ -596,12 +665,16 @@ class Agent:
 
         这里只做记账 + 叫醒：清掉短期阻塞状态、记下「下一轮要强制登录」、设置唤醒
         事件，然后返回当前快照。pipe handler 线程里绝不允许出现网络 I/O。
+
+        返回之前先把「正在重新检测」写进快照：命令本身立刻返回，而一轮探测可能要几十秒
+        （探测有 40s 死线），期间如果快照一个字都不变，用户点了按钮就像没点到一样。
+        2026-10-26 现场：外网探测恰好说「可通」时，界面连续点了 122 次都没有任何可见变化。
         """
         self._reset_login_blocks()
         self._set_pending_force_login()
         self._wake_event.set()
         self.logger.info("manual retry requested; running a forced check now")
-        return self._current_snapshot()
+        return self._publish(AgentState.WAITING_FOR_NETWORK, "正在重新检测校园网…")
 
     def _reload_config_state(self) -> None:
         """重读配置并清掉短期阻塞状态（本地文件 + DPAPI，不发网络请求）。"""
@@ -891,6 +964,18 @@ def load_runtime_config(path: Path) -> campus_auth.AuthConfig:
         return campus_auth.AuthConfig()
 
 
+def portal_session_status(
+    config: campus_auth.AuthConfig, logger: logging.Logger
+) -> campus_auth.AuthStatus:
+    """Answer "does this machine still have a campus session?" from the portal.
+
+    Deliberately a separate callable from the login attempt: this question is also
+    asked when nothing needs fixing yet (uplink probe passed but the browsing path
+    did not), and asking it must not log in or touch the session.
+    """
+    return campus_auth.CampusAuthClient(config, logger).check_status()
+
+
 def configure_agent_logging(log_path: Path, verbose: bool = False) -> logging.Logger:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("youziauth.agent")
@@ -1029,6 +1114,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 force_login=force_login,
             )
         ),
+        session_verifier=portal_session_status,
         snapshot_path=snapshot_path,
         logger=logger,
         updater=updater,

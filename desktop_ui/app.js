@@ -126,6 +126,12 @@ function netLabel(message){
   if((m = /^update result recovery failed: (.*)$/.exec(message))) return '更新结果处理失败（' + m[1] + '）';
   if((m = /^periodic update check failed: (.*)$/.exec(message))) return '定时检查更新失败（' + m[1] + '）';
   if((m = /^network probe failed: (.*)$/.exec(message))) return '网络检测失败：' + m[1];
+  // 「外网可通」是探测端点给的答案，不是门户给的：captive portal 常把探测域名放行，
+  // 于是用户会看到「外网可通」和登录成功前后脚出现。这条日志就是解释它为什么去登录。
+  if(/^uplink probe passed but the portal reports no campus session; authenticating anyway$/.test(message))
+    return '探测显示外网可通，但门户说这台机器未认证，正在重新认证';
+  if((m = /^campus session check failed: (.*)$/.exec(message))) return '校园网会话检查失败：' + m[1];
+  if(/^manual retry requested; running a forced check now$/.test(message)) return '收到手动检测请求，立刻检查一轮';
   if((m = /^agent command channel failed: (.*)$/.exec(message))) return '界面通道异常：' + m[1];
   return '';
 }

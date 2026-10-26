@@ -47,6 +47,10 @@ DIRECT_204_PROBES: tuple[str, ...] = (
     "http://connect.rom.miui.com/generate_204",
     "http://wifi.vivo.com.cn/generate_204",
 )
+# 反面同样存在（2026-10-26）：captive portal 常把这类中文厂商的连通性端点放行，好让手机
+# 别一直提示登录，于是机器其实未认证时它们仍会返回 204 —— 「外网可通」并不等于会话有效。
+# 它们只能证明有一小撮流量出得去；agent 在抓取路径（PROXY_PATH_PROBES）不通时会再问
+# 门户，以门户自己的会话视图为准（campus_auth_agent._run_online_cycle）。
 
 
 @dataclasses.dataclass(frozen=True)
