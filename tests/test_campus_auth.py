@@ -1134,5 +1134,185 @@ class PostLoginVerificationTests(unittest.TestCase):
         )
 
 
+class CaptivePortalEntryTests(unittest.TestCase):
+    """2026-11-05：门户留下失效会话记录，根路径只肯跳 success.jsp。
+
+    那天的界面只会说「请在自助服务厅释放会话」，可是用户点 Windows 的
+    「打开浏览器并连接」就能正常认证。浏览器走的是网络的 captive-portal 跳转：
+    它把登录页（index.jsp?wlanuserip=...&mac=...）交出来，而那个 URL 的查询串就是
+    登录要用的 queryString。这一组测试锁住：根路径拿不到 queryString 时，客户端要
+    顺着同一个跳转去拿登录页，而不是把「会话须释放」当成结论。
+    """
+
+    ENTRY_QUERY = (
+        "wlanuserip=10.65.104.219&wlanacname=NAS&ssid=Ruijie&nasip=172.28.255.4"
+        "&mac=9c67d6cf0d5f&t=wireless-v2-plain"
+        "&url=http%3A%2F%2Fwww.msftconnecttest.com%2Fredirect"
+    )
+    TRIGGER = campus_auth.CAPTIVE_PORTAL_TRIGGER_URLS[0]
+
+    class FakeClient(campus_auth.CampusAuthClient):
+        def __init__(self, responses=None):
+            super().__init__(campus_auth.AuthConfig(username="student", password="pw"))
+            self.responses = dict(responses or {})
+            self.asked = []
+
+        def request(self, url, data=None, allow_redirects=True, referer=None):
+            self.asked.append(url)
+            response = self.responses.get(url)
+            if response is None:
+                return campus_auth.HttpResponse(200, {}, "", url)
+            return response
+
+    def entry_url(self, client):
+        return client.portal_url("/eportal/index.jsp?" + self.ENTRY_QUERY)
+
+    def test_the_captive_redirect_supplies_the_login_page_and_its_query(self):
+        client = self.FakeClient()
+        entry = self.entry_url(client)
+        client.responses[self.TRIGGER] = campus_auth.HttpResponse(
+            302, {"Location": entry}, "", self.TRIGGER
+        )
+        client.responses[entry] = campus_auth.HttpResponse(
+            200, {}, "<html>login page</html>", entry
+        )
+
+        self.assertEqual(client.get_query_string(), self.ENTRY_QUERY)
+        self.assertIn(self.TRIGGER, client.asked)
+        self.assertIn(entry, client.asked)
+
+    def test_a_meta_refresh_redirect_is_followed_like_a_browser_would(self):
+        client = self.FakeClient()
+        entry = self.entry_url(client)
+        client.responses[self.TRIGGER] = campus_auth.HttpResponse(
+            200,
+            {},
+            '<meta http-equiv="refresh" content="0;url=/eportal/index.jsp?'
+            + self.ENTRY_QUERY
+            + '">',
+            self.TRIGGER,
+        )
+
+        self.assertEqual(client.captive_portal_entry(), entry)
+
+    def test_a_redirect_to_somewhere_else_is_not_an_entry(self):
+        client = self.FakeClient(
+            {
+                url: campus_auth.HttpResponse(
+                    302,
+                    {"Location": "http://go.microsoft.com/fwlink/?LinkID=219472"},
+                    "",
+                    url,
+                )
+                for url in campus_auth.CAPTIVE_PORTAL_TRIGGER_URLS
+            }
+        )
+
+        self.assertIsNone(client.captive_portal_entry())
+
+    def test_the_success_redirect_is_still_refused_when_no_entry_exists(self):
+        client = self.FakeClient(
+            {
+                campus_auth.DEFAULT_PORTAL_URL: campus_auth.HttpResponse(
+                    200,
+                    {},
+                    "<html>success page</html>",
+                    campus_auth.DEFAULT_PORTAL_URL
+                    + "/eportal/./success.jsp?userIndex=6432343835",
+                )
+            }
+        )
+
+        with self.assertRaises(campus_auth.PortalSessionHeld) as caught:
+            client.get_query_string()
+
+        # Carrying the session key out is still right: the caller asks the portal
+        # about that exact session instead of guessing.
+        self.assertEqual(caught.exception.user_index, "6432343835")
+
+    def test_a_held_portal_session_can_still_be_logged_in_through_the_entry_page(self):
+        import http.server
+        import threading
+        import unittest.mock
+        import urllib.parse
+
+        entry_query = self.ENTRY_QUERY
+        captured = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _send(self, code, body="", headers=None):
+                payload = body.encode("utf-8") if isinstance(body, str) else body
+                self.send_response(code)
+                for key, value in (headers or {}).items():
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_GET(self):
+                path = self.path.split("?")[0]
+                if path == "/trigger":
+                    self._send(302, headers={"Location": "/eportal/index.jsp?" + entry_query})
+                elif path == "/":
+                    self._send(302, headers={"Location": "/eportal/redirectortosuccess.jsp"})
+                elif path == "/eportal/redirectortosuccess.jsp":
+                    self._send(
+                        302,
+                        headers={"Location": "/eportal/success.jsp?userIndex=6432343835"},
+                    )
+                elif path == "/eportal/success.jsp":
+                    self._send(200, "<html>登录成功</html>")
+                elif path == "/eportal/index.jsp":
+                    self._send(200, "<html>login page</html>")
+                elif path == "/eportal/InterFace.do":
+                    query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    if (query.get("method") or [""])[0] == "getOnlineUserInfo":
+                        self._send(200, '{"result":"success","message":"ok"}')
+                    else:
+                        self._send(200, "{}")
+                else:
+                    self._send(404)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length).decode("utf-8")
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                method = (query.get("method") or [""])[0]
+                if method == "pageInfo":
+                    self._send(200, '{"passwordEncrypt":"false"}')
+                elif method == "login":
+                    captured["login_body"] = body
+                    self._send(
+                        200,
+                        '{"result":"success","message":"认证成功","userIndex":"abc123"}',
+                    )
+                else:
+                    self._send(200, "{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        portal = f"http://127.0.0.1:{server.server_address[1]}"
+
+        with unittest.mock.patch.object(
+            campus_auth, "CAPTIVE_PORTAL_TRIGGER_URLS", (portal + "/trigger",)
+        ):
+            client = campus_auth.CampusAuthClient(
+                campus_auth.AuthConfig(portal_url=portal, username="student", password="pw")
+            )
+            attempt = campus_auth.attempt_authentication(
+                client, logging.getLogger("test"), force_login=True
+            )
+
+        self.assertEqual(attempt.kind.value, "login_succeeded")
+        self.assertEqual(attempt.message, "认证成功")
+        posted = urllib.parse.parse_qs(captured.get("login_body", ""))
+        self.assertEqual(posted.get("queryString"), [entry_query])
+
+
 if __name__ == "__main__":
     unittest.main()

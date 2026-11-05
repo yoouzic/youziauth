@@ -168,6 +168,30 @@ LOGIN_QUERY_KEYS = (
 
 USER_INDEX_PATTERN = re.compile(r"[?&]userIndex=([^&'\"]+)", re.IGNORECASE)
 
+# URLs a browser (and the OS captive-portal prompt) is sent to when ordinary
+# HTTP is intercepted. On a network that requires web authentication the
+# interception answers one of these with a redirect to the ePortal entry page
+# (``/eportal/index.jsp?wlanuserip=...&wlanacname=...&mac=...``), and that
+# entry page's query string is exactly the ``queryString`` a login POST needs.
+# The bare portal root cannot supply it while the ePortal still holds a session
+# record: it redirects to success.jsp instead. 2026-11-05: every attempt then
+# ended with "the session must be released" even though the portal's own login
+# page -- reached by Windows'「打开浏览器并连接」through this redirect -- accepted
+# a fresh login.
+CAPTIVE_PORTAL_TRIGGER_URLS = (
+    "http://www.msftconnecttest.com/redirect",
+    "http://www.msftconnecttest.com/connecttest.txt",
+    "http://www.msftncsi.com/ncsi.txt",
+)
+META_REFRESH_PATTERN = re.compile(
+    r"""<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["'][^"']*?url=([^"'>\s]+)""",
+    re.IGNORECASE,
+)
+JS_REDIRECT_PATTERN = re.compile(
+    r"""(?:window\.|top\.|self\.)?location(?:\.href|\.replace)?\s*(?:=|\.replace\()\s*["']([^"']+)["']""",
+    re.IGNORECASE,
+)
+
 # What a session confirmed without a working uplink is reported as. The agent
 # owns the uplink half of that sentence and replaces this placeholder when it
 # has something more specific to say, so both halves live in one place.
@@ -584,6 +608,99 @@ class CampusAuthClient:
             return AuthStatus.UNAUTHENTICATED
         return AuthStatus.UNKNOWN
 
+    def captive_portal_entry(self, triggers=None) -> Optional[str]:
+        """The ePortal login-page URL, obtained the way a browser obtains it.
+
+        A network that intercepts ordinary HTTP answers a captive-portal trigger
+        URL with a redirect to its login page. That entry URL carries the ePortal
+        ``queryString`` parameters (wlanuserip, wlanacname, mac, ...), which is
+        exactly what a fresh login needs when the portal still holds a session
+        record and its root therefore redirects to success.jsp instead.
+
+        Returns ``None`` when the triggers reach the real Internet (the machine
+        is already authenticated) or when no redirect points back at this portal,
+        so a caller never has to guess.
+        """
+        portal_host = (urllib.parse.urlparse(self.config.portal_url).hostname or "").lower()
+        if not portal_host:
+            return None
+        trigger_urls = (
+            tuple(triggers) if triggers is not None else CAPTIVE_PORTAL_TRIGGER_URLS
+        )
+        for trigger in trigger_urls:
+            try:
+                response = self.request(trigger, allow_redirects=False)
+            except OSError as exc:
+                self.logger.debug("captive-portal trigger %s failed: %s", trigger, exc)
+                continue
+            for candidate in self._captive_entry_candidates(response):
+                url = self._as_portal_entry_url(candidate, portal_host)
+                if url:
+                    self.logger.info(
+                        "captive-portal redirect found the ePortal login page"
+                    )
+                    return url
+        return None
+
+    @staticmethod
+    def _captive_entry_candidates(response: HttpResponse):
+        """URLs a captive-portal answer points at (Location header / meta / JS)."""
+        candidates = []
+        for key in ("Location", "location"):
+            location = response.headers.get(key)
+            if location:
+                candidates.append(location)
+        if not candidates and response.text:
+            # Some portals answer with 200 + a browser-side redirect instead of a
+            # 302; the browser follows those, so this client has to as well.
+            candidates.extend(META_REFRESH_PATTERN.findall(response.text))
+            candidates.extend(JS_REDIRECT_PATTERN.findall(response.text))
+        return candidates
+
+    def _as_portal_entry_url(self, candidate: str, portal_host: str) -> Optional[str]:
+        """Resolve one candidate and keep it only if it is this portal's entry page."""
+        candidate = html.unescape((candidate or "").strip().strip("'\""))
+        if not candidate:
+            return None
+        if candidate.startswith("/"):
+            url = self.portal_url(candidate)
+        elif candidate.lower().startswith(("http://", "https://")):
+            url = candidate
+        else:
+            url = self.portal_url("/" + candidate.lstrip("./"))
+        parsed = urllib.parse.urlparse(url)
+        if (parsed.hostname or "").lower() != portal_host:
+            return None
+        if not looks_like_login_query_string(parsed.query):
+            return None
+        return url
+
+    def _query_string_from_captive_entry(self) -> Optional[str]:
+        """Ask the network's intercepting redirect for the browser's login page.
+
+        The bare portal root cannot answer this while it holds a session record
+        (``success.jsp`` instead of the login page), but the network's captive
+        portal still hands a browser the ePortal entry URL. Its query string is
+        the login ``queryString``; use it instead of declaring the held session a
+        dead end the user has to release.
+        """
+        entry = self.captive_portal_entry()
+        if not entry:
+            return None
+        try:
+            entry_response = self.request(entry)
+        except OSError as exc:
+            self.logger.debug("captive-portal entry page failed: %s", exc)
+            return None
+        entry_query = urllib.parse.urlparse(entry_response.url).query
+        if looks_like_login_query_string(entry_query):
+            return html.unescape(entry_query)
+        extracted = extract_query_string(entry_response.text)
+        if extracted:
+            return extracted
+        self.logger.debug("captive-portal entry page carried no login queryString")
+        return None
+
     def get_query_string(self) -> str:
         if self.config.login_url:
             configured_query = urllib.parse.urlparse(self.config.login_url).query
@@ -599,6 +716,17 @@ class CampusAuthClient:
         extracted = extract_query_string(response.text)
         if extracted:
             return extracted
+
+        # The portal root redirects to success.jsp while it still holds a session
+        # record, so it no longer offers the login page itself. The network's
+        # captive-portal redirect still points a browser at that login page
+        # (entry URL with wlanuserip/mac/...), so ask it before giving up: a fresh
+        # login from there is accepted even when "getOnlineUserInfo" refuses the
+        # held session record (2026-11-05: the browser login worked while this
+        # client kept telling the user to release the session).
+        captive_query = self._query_string_from_captive_entry()
+        if captive_query:
+            return captive_query
 
         if redirected_query:
             # While the portal still holds a session it answers with
@@ -771,11 +899,13 @@ def held_session_attempt(
     if status is AuthStatus.UNAUTHENTICATED:
         logger.warning(
             "portal kept a session record that no longer authorises this machine; "
-            "only the portal self-service can release it"
+            "the captive-portal entry page did not provide a login queryString "
+            "either, so only the browser or the portal self-service can recover it"
         )
         return AuthAttempt(
             AttemptKind.TRANSIENT_ERROR,
-            "门户保留了会话记录，但该会话已不再授权本机；请在门户自助服务厅"
+            "门户保留了会话记录，但该会话已不再授权本机；可在浏览器里点"
+            "「打开浏览器并连接」重新认证，或在门户自助服务厅"
             "「查看和退出我的登录设备」释放后重试",
         )
 
