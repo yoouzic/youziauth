@@ -7,7 +7,7 @@
 Windows 的「打开浏览器并连接」，在门户登录页重新认证一次就能正常上网。根因是客户端拿
 不到登录 `queryString` 就收工；浏览器走的是网络的 captive-portal 跳转，登录页
 `index.jsp?wlanuserip=…&mac=…` 的查询串**就是**登录要用的 `queryString`。源码已修，
-目标版本 **v1.8.40**。
+**v1.8.40 已于 2026-11-05 22:40 发布并自动更新到本机**（见 §7）。
 
 ## 1. 现场证据（本机，2026-11-05 22:15–22:22）
 
@@ -62,3 +62,26 @@ Windows 的「打开浏览器并连接」，在门户登录页重新认证一次
 装的是 1.8.39。v1.8.40 发布后系统代理会自动更新；在那之前若再出现同样提示：点
 Windows 的「打开浏览器并连接」手动认证一次即可立即恢复（脚本无法在无提权、不打断现有
 会话的前提下替你做这一步）。
+
+## 7. 发布与装机验证（v1.8.40，2026-11-05 22:34–22:49）
+
+- `v1.8.40` tag → Signed Windows release 工作流 **5m45s 全部成功**（测试、前端测试、
+  VERSION/tag 一致、构建、Ed25519 签名、签名校验、发布）。
+- Release：<https://github.com/yoouzic/youziauth/releases/tag/v1.8.40>；资产齐全
+  （`youziauth.msi` 66,151,388 B、`.ed25519`、`SHA256SUMS.txt`、`release-notes.md`、
+  `release-provenance.json`）。
+- `release-provenance.json`：`git_commit = cdc00d1f…`（本修复后的 version commit），
+  `git_tag = v1.8.40`。
+- 本机系统代理自动更新：`checking → downloading(21%…90%) → installing → installed`
+  （22:41–22:49），注册表 `DisplayVersion = 1.8.40`、`_internal/VERSION = 1.8.40`，
+  `youziauth.exe` / `youziauth-agent.exe` 于 22:49:00 重启，新 agent 快照
+  `update.detail = "agent restarted"`。
+- **装机二进制核对**：用 PyInstaller 归档读取器解出已安装
+  `youziauth-agent.exe` 里的 `campus_auth` 模块，确认包含
+  `captive_portal_entry`、`CAPTIVE_PORTAL_TRIGGER_URLS` 与新增日志字符串
+  （“captive-portal redirect found the ePortal login page”）—— 修复确实进了这台机器。
+- 健康会话下实测：`captive_portal_entry()` = `None`（不误判），强制重试返回
+  `already_online`「门户仍持有有效会话，无需重新登录」。
+- 失效记录状态下的真实复测要等它下次发生；届时 `agent.log` 应出现
+  `captive-portal redirect found the ePortal login page` 并直接完成登录。若仍失败，
+  日志会保留“未找到入口”的证据，文案也会提示用浏览器认证。
