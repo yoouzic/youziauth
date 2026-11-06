@@ -1014,6 +1014,119 @@ class LoginBlockTests(AgentLoopTests):
             sum("portal is not reachable" in line for line in captured.output), 1
         )
 
+    def test_a_stuck_authentication_attempt_is_abandoned_by_its_deadline(self):
+        # 2026-11-06: the main thread sat in a native call for five hours. The
+        # login path resolves hostnames (captive-portal entry), and Windows'
+        # getaddrinfo has no timeout, so the attempt runs behind a wall clock.
+        entered, release = threading.Event(), threading.Event()
+
+        class HangingAuthenticator:
+            def __call__(inner, config, logger, force_login=False):
+                entered.set()
+                release.wait(30)
+                return AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, "ok")
+
+        agent = self.make_agent(
+            FakeProbe([NetworkObservation(False, True)]),
+            HangingAuthenticator(),
+            auth_deadline_seconds=0.2,
+        )
+        try:
+            started = time.monotonic()
+            result = agent.run_cycle()
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+        self.assertLess(elapsed, 5.0, "the cycle must not wait for a stuck authenticator")
+        self.assertTrue(entered.is_set())
+        self.assertEqual(result.snapshot.state, "waiting_for_network")
+        self.assertIn("没有返回", result.snapshot.detail)
+
+    def test_the_liveness_sentinel_dumps_and_exits_after_the_heartbeat_stops(self):
+        exits = []
+        agent = self.make_agent(
+            FakeProbe([]),
+            FakeAuthenticator([]),
+            liveness_timeout_seconds=0.05,
+            liveness_check_seconds=0.02,
+            exit_hook=exits.append,
+        )
+        stop = threading.Event()
+        agent._start_liveness_sentinel(stop)
+        try:
+            self.assertTrue(
+                wait_until(lambda: 75 in exits, timeout=10.0),
+                "the sentinel must exit when the cycle heartbeat stops",
+            )
+        finally:
+            stop.set()
+        text = agent.failsafe_log_path.read_text(encoding="utf-8")
+        self.assertIn("heartbeat stopped", text)
+        self.assertIn("Thread", text)
+
+    def test_the_liveness_sentinel_stays_quiet_while_the_heartbeat_moves(self):
+        exits = []
+        agent = self.make_agent(
+            FakeProbe([]),
+            FakeAuthenticator([]),
+            liveness_timeout_seconds=0.3,
+            liveness_check_seconds=0.05,
+            exit_hook=exits.append,
+        )
+        stop = threading.Event()
+        agent._start_liveness_sentinel(stop)
+        try:
+            for _ in range(20):
+                agent._heartbeat()
+                time.sleep(0.02)
+        finally:
+            stop.set()
+        self.assertEqual(exits, [], "a live heartbeat must never trigger the sentinel")
+
+    def test_a_failed_cycle_does_not_stop_the_main_loop(self):
+        # serve_forever used to call run_cycle without a try/except: one unexpected
+        # exception silently ended the main loop while the watchdog said nothing
+        # (the finally block had already cleared _cycle_started_at).
+        agent = self.make_agent(
+            FakeProbe([NetworkObservation(True, False)]), FakeAuthenticator([])
+        )
+        calls = {"count": 0}
+        real_run_cycle = agent.run_cycle
+
+        def flaky(force_login=False):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("boom")
+            return real_run_cycle(force_login=force_login)
+
+        agent.run_cycle = flaky
+        stop_event = threading.Event()
+
+        class FakePipeServer:
+            def __init__(inner, name, handler, allowed_user_sid=None):
+                inner.handler = handler
+
+            def serve_once(inner):
+                time.sleep(0.02)
+
+        with patch.object(campus_auth_agent, "NamedPipeServer", FakePipeServer):
+            loop = threading.Thread(
+                target=agent.serve_forever, args=(stop_event,), daemon=True
+            )
+            loop.start()
+            try:
+                self.assertTrue(
+                    wait_until(lambda: calls["count"] >= 2, timeout=15.0),
+                    "the loop must keep running after a failed cycle",
+                )
+                self.assertTrue(
+                    wait_until(lambda: agent.snapshot.state == "online_external", timeout=15.0)
+                )
+            finally:
+                stop_event.set()
+                loop.join(5)
+        self.assertFalse(loop.is_alive(), "the main loop must stop promptly")
+
 
 class AgentLivenessTests(AgentLoopTests):
     """手动指令不准在 pipe 线程做网络 I/O；探测有墙钟死线；卡住时由巡检说话。

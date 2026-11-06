@@ -8,8 +8,10 @@ import configparser
 import ctypes
 import dataclasses
 import datetime as dt
+import faulthandler
 import logging
 import logging.handlers
+import os
 import re
 import subprocess
 import sys
@@ -69,6 +71,22 @@ PROBE_ABANDONED_HARD_CAP = 32
 WATCHDOG_INTERVAL_SECONDS = 15.0
 WATCHDOG_STALL_FLOOR_SECONDS = 120.0
 WATCHDOG_LOG_THROTTLE_SECONDS = 300.0
+# 认证请求的死线（2026-11-06）：登录路径里也会解析域名（captive-portal 入口），而
+# Windows 的 getaddrinfo 没有超时参数，主循环一旦卡在那里就再也不发布任何东西。
+# 和探测一样放进 daemon 线程，``join`` 是唯一上界；挂住的线程收不回来，只能限量。
+# 90s 是「一次正常登录最慢也差不多」的量级：门户根 + captive 跳转 + 入口页 + pageInfo
+# + login + 校验，每一步都吃满 request_timeout 才会到；真正卡住（DNS）不会返回。
+AUTH_DEADLINE_FLOOR_SECONDS = 90.0
+AUTH_DEADLINE_TIMEOUT_MULTIPLIER = 10.0
+MAX_ABANDONED_AUTH_THREADS = 4
+AUTH_ABANDONED_HARD_CAP = 12
+# 存活哨兵（2026-11-06 现场）：agent 的主线程卡在内核调用里整整 5 小时，巡检和界面
+# 都只能看着，最后靠提权重启才恢复。进程内的普通锁救不了「连巡检一起卡住」的情况，
+# 所以哨兵线程不碰日志锁、不碰快照锁：只读一个单调时钟心跳，心跳停了就 dump 全部
+# 线程栈并 os._exit，让计划任务（RestartOnFailure，1 分钟后）把 agent 自己拉起来。
+LIVENESS_TIMEOUT_SECONDS = 300.0
+LIVENESS_CHECK_SECONDS = 30.0
+STUCK_EXIT_CODE = 75
 
 
 class ProbeDeadlineExceeded(RuntimeError):
@@ -76,6 +94,14 @@ class ProbeDeadlineExceeded(RuntimeError):
 
     def __init__(self, waited_seconds: float):
         super().__init__(f"network probe did not return within {waited_seconds:.0f}s")
+        self.waited_seconds = waited_seconds
+
+
+class AuthDeadlineExceeded(RuntimeError):
+    """认证尝试在墙钟死线内没有返回 —— 通常卡在 DNS 或门户请求里。"""
+
+    def __init__(self, waited_seconds: float):
+        super().__init__(f"authentication did not return within {waited_seconds:.0f}s")
         self.waited_seconds = waited_seconds
 
 
@@ -133,6 +159,10 @@ class Agent:
         probe_deadline_seconds: Optional[float] = None,
         watchdog_interval_seconds: float = WATCHDOG_INTERVAL_SECONDS,
         watchdog_stall_seconds: Optional[float] = None,
+        auth_deadline_seconds: Optional[float] = None,
+        liveness_timeout_seconds: Optional[float] = None,
+        liveness_check_seconds: float = LIVENESS_CHECK_SECONDS,
+        exit_hook: Optional[Callable[[int], None]] = None,
     ):
         self.config_loader = config_loader
         self.config = config_loader()
@@ -175,6 +205,28 @@ class Agent:
             )
         self.watchdog_stall_seconds = max(1.0, float(watchdog_stall_seconds))
         self.watchdog_interval_seconds = max(0.01, float(watchdog_interval_seconds))
+        if auth_deadline_seconds is None:
+            auth_deadline_seconds = max(
+                AUTH_DEADLINE_FLOOR_SECONDS,
+                AUTH_DEADLINE_TIMEOUT_MULTIPLIER * request_timeout,
+            )
+        self.auth_deadline_seconds = max(1.0, float(auth_deadline_seconds))
+        self._last_auth_started_at = None
+        self._auth_threads: list[threading.Thread] = []
+        self._auth_lock = threading.Lock()
+        self._auth_timeout_logged_at = None
+        if liveness_timeout_seconds is None:
+            # 一次正常轮次的上界大致是「探测死线 + 认证死线 + 门户余量」；再放宽到
+            # 10 分钟，只有真正卡住才会触发哨兵。
+            liveness_timeout_seconds = max(
+                LIVENESS_TIMEOUT_SECONDS,
+                self.probe_deadline_seconds + self.auth_deadline_seconds + 300.0,
+            )
+        self.liveness_timeout_seconds = max(0.01, float(liveness_timeout_seconds))
+        self.liveness_check_seconds = max(0.005, float(liveness_check_seconds))
+        self._liveness = time.monotonic()
+        self._exit_hook = exit_hook or os._exit
+        self.failsafe_log_path = self.snapshot_path.parent / "logs" / "agent-failsafe.log"
         self.retry_policy = RetryPolicy(self.config.check_interval_seconds)
         self.network_attempt_index = 0
         self.transient_failures = 0
@@ -226,6 +278,7 @@ class Agent:
         *,
         incident_id: Optional[str] = None,
     ) -> RuntimeSnapshot:
+        error: Optional[OSError] = None
         with self._snapshot_lock:
             if incident_id is None:
                 incident_id = self.snapshot.incident_id if state is AgentState.AUTH_FAILED else ""
@@ -238,8 +291,16 @@ class Agent:
                 updated_at=self._now(),
                 update=self.snapshot.update,
             )
-            write_snapshot(self.snapshot_path, self.snapshot)
-            return self.snapshot
+            try:
+                write_snapshot(self.snapshot_path, self.snapshot)
+            except OSError as exc:
+                # 快照写不出去只影响界面的「最近检测」，不能把主循环带走；下一次发布
+                # 会再写一次。日志放在锁外，避免日志锁和快照锁互相拖住。
+                error = exc
+            snapshot = self.snapshot
+        if error is not None:
+            self.logger.warning("runtime snapshot write failed: %s", error)
+        return snapshot
 
     def _failure_snapshot(self, detail: str, *, incident_id: Optional[str] = None) -> RuntimeSnapshot:
         incident_id = incident_id or self.snapshot.incident_id or uuid.uuid4().hex
@@ -355,14 +416,96 @@ class Agent:
             raise RuntimeError("network probe returned no observation")
         return outcome["observation"]  # type: ignore[return-value]
 
+    def _heartbeat(self) -> None:
+        """主循环存活心跳。只是一个 float：不拿锁，存活哨兵只读它。"""
+        self._liveness = time.monotonic()
+
+    def _prune_auth_threads(self) -> int:
+        with self._auth_lock:
+            self._auth_threads = [
+                thread for thread in self._auth_threads if thread.is_alive()
+            ]
+            return len(self._auth_threads)
+
+    def _log_auth_timeout(self, deadline: float, *, at_cap: bool) -> None:
+        """认证死线到了要留一条记录 —— 否则界面只看到「没变化」。"""
+        now = time.monotonic()
+        if self._auth_timeout_logged_at is not None:
+            if now - self._auth_timeout_logged_at < STALLED_HEARTBEAT_SECONDS:
+                return
+        self._auth_timeout_logged_at = now
+        if at_cap:
+            self.logger.warning(
+                "authentication attempt is still stuck in %s earlier cycles; "
+                "skipping a new attempt and reporting the deadline as exceeded",
+                MAX_ABANDONED_AUTH_THREADS,
+            )
+            return
+        self.logger.warning(
+            "authentication attempt did not return within %ss; it may be stuck in "
+            "DNS resolution (Windows has no timeout for that) -- continuing to retry",
+            int(deadline),
+        )
+
+    def _authenticate_with_deadline(self, force_login: bool) -> AuthAttempt:
+        """Run one authenticator call with a wall-clock deadline.
+
+        The login path resolves hostnames (the captive-portal entry page), and
+        Windows' getaddrinfo has no timeout; a main-loop hang there is invisible
+        until the liveness sentinel fires. The call therefore runs in a daemon
+        thread, exactly like the network probe, and a stuck lookup is abandoned
+        (bounded count) instead of taking the main loop with it.
+        """
+        outcome: dict[str, object] = {}
+
+        def work() -> None:
+            try:
+                outcome["attempt"] = self.authenticator(
+                    self.config, self.logger, force_login=force_login
+                )
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller thread
+                outcome["error"] = exc
+
+        deadline = self.auth_deadline_seconds
+        abandoned = self._prune_auth_threads()
+        if abandoned >= MAX_ABANDONED_AUTH_THREADS:
+            cooling_down = (
+                self._last_auth_started_at is not None
+                and time.monotonic() - self._last_auth_started_at
+                < PROBE_AT_CAP_RETRY_SECONDS
+            )
+            if cooling_down or abandoned >= AUTH_ABANDONED_HARD_CAP:
+                self._log_auth_timeout(deadline, at_cap=True)
+                raise AuthDeadlineExceeded(deadline)
+            # 冷却期过了且没到硬上限：放行一次新尝试。系统 DNS 若已恢复，这一下就能
+            # 把 agent 从「永久跳过认证」里救回来；没恢复也只是很慢地多一个挂住线程。
+        self._last_auth_started_at = time.monotonic()
+        worker = threading.Thread(
+            target=work, name="youziauth-agent-auth", daemon=True
+        )
+        worker.start()
+        worker.join(deadline)
+        if worker.is_alive():
+            with self._auth_lock:
+                self._auth_threads.append(worker)
+            self._log_auth_timeout(deadline, at_cap=False)
+            raise AuthDeadlineExceeded(deadline)
+        if "error" in outcome:
+            raise outcome["error"]  # type: ignore[misc]
+        if "attempt" not in outcome:
+            raise RuntimeError("authenticator returned no attempt")
+        return outcome["attempt"]  # type: ignore[return-value]
+
     def run_cycle(self, force_login: bool = False) -> CycleResult:
         # 巡检靠这个时刻判断「这一轮是不是卡住了」。卡住的循环不会再发布任何快照，
         # 只能由巡检线程替它说话，否则界面一直显示卡住前的最后一条状态。
         self._cycle_started_at = time.monotonic()
+        self._heartbeat()
         try:
             return self._run_cycle(force_login)
         finally:
             self._cycle_started_at = None
+            self._heartbeat()
 
     def _run_cycle(self, force_login: bool) -> CycleResult:
         if not self.config.username or not self.config.password:
@@ -518,7 +661,17 @@ class Agent:
             # back by the previous one's heartbeat.
             self._stalled_logged_at = None
 
-        attempt = self.authenticator(self.config, self.logger, force_login=force_login)
+        try:
+            attempt = self._authenticate_with_deadline(force_login)
+        except AuthDeadlineExceeded as timeout:
+            # 「不知道」也要说出来：卡在 DNS/门户请求里时，界面不能一直停在上一轮。
+            snapshot = self._publish(
+                AgentState.WAITING_FOR_NETWORK,
+                f"认证请求长时间没有返回（已等待约 {timeout.waited_seconds:.0f}s），仍在重试",
+            )
+            delay = self.retry_policy.delay(self.network_attempt_index)
+            self.network_attempt_index += 1
+            return CycleResult(snapshot, delay, False)
 
         if attempt.kind is AttemptKind.ALREADY_ONLINE and not observation.internet_ok:
             self.unverified_logins = 0
@@ -880,13 +1033,70 @@ class Agent:
         thread.start()
         return thread
 
+    def _start_liveness_sentinel(self, stop_event: threading.Event) -> threading.Thread:
+        """起存活哨兵：主循环心跳停了就 dump 全部线程栈并退出，交给计划任务重启。
+
+        这是 2026-11-06 那 5 小时静默卡死的兜底：进程还活着，但主线程卡在内核调用里，
+        唯一 pipe 实例被占住，巡检也没再发布任何东西，界面只能报「后台认证服务没有
+        响应」，最后靠提权重启才恢复。哨兵线程刻意只读一个 float 心跳，不碰日志锁、
+        快照锁或任何共享状态 —— 它比普通 watchdog 更底层，换来的是「卡住也能自己回来」。
+        计划任务带着 RestartOnFailure（1 分钟、最多 3 次），退出即重启。
+        """
+
+        def guard() -> None:
+            while not stop_event.wait(self.liveness_check_seconds):
+                try:
+                    idle = time.monotonic() - self._liveness
+                    if idle < self.liveness_timeout_seconds:
+                        continue
+                    self._dump_stuck_and_exit(idle)
+                except Exception:  # noqa: BLE001 - 哨兵自己不能让进程带着锁退出
+                    pass
+
+        thread = threading.Thread(
+            target=guard, name="youziauth-agent-sentinel", daemon=True
+        )
+        thread.start()
+        return thread
+
+    def _dump_stuck_and_exit(self, idle_seconds: float) -> None:
+        """Write every thread stack straight to the failsafe log, then exit.
+
+        The dump is the missing evidence for this class of freeze: when the main
+        thread is stuck in a native call, only the Python frames of the other
+        threads would survive in a normal log, and even those are lost on a
+        reboot. faulthandler writes all of them without touching a logger lock.
+        """
+        timestamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        try:
+            self.failsafe_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.failsafe_log_path, "a", encoding="utf-8") as stream:
+                stream.write(
+                    f"=== {timestamp} agent heartbeat stopped for {idle_seconds:.0f}s; "
+                    f"dumping threads and exiting (code {STUCK_EXIT_CODE}) so the "
+                    f"scheduled task restarts it ===\n"
+                )
+                faulthandler.dump_traceback(file=stream, all_threads=True)
+                stream.flush()
+        finally:
+            self._exit_hook(STUCK_EXIT_CODE)
+
     def _wait_for_next_cycle(self, stop_event: threading.Event, delay: float) -> bool:
         """等到下一轮、或者被手动指令/退出信号提前叫醒。返回 True 表示应当退出。
 
         两个 Event 不能一起 wait，所以 ``serve_forever`` 起了一个把 stop 转成唤醒信号
         的桥接线程；这样手动指令不必等满一个轮询周期，退出也不必等。
+        等待期间分段更新存活心跳：最长一次等待是 check_interval（可达 1 小时），
+        不能让存活哨兵把「正常等待」当成卡死。
         """
-        self._wake_event.wait(max(0.0, delay))
+        deadline = time.monotonic() + max(0.0, delay)
+        while True:
+            self._heartbeat()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if self._wake_event.wait(min(remaining, max(self.liveness_check_seconds, 1.0))):
+                break
         self._wake_event.clear()
         return stop_event.is_set()
 
@@ -920,22 +1130,38 @@ class Agent:
             target=wake_on_stop, name="youziauth-agent-stop", daemon=True
         ).start()
         self._start_watchdog(stop_event)
+        self._start_liveness_sentinel(stop_event)
         # 更新器没启用就先把原因写进快照：不必等到「有更新要检查」才让用户知道。
         self._publish_disabled_reason()
         delay = 0.0
         while not stop_event.is_set():
-            self._recover_update()
-            if self.update_due():
-                # 只在网络循环的间隙跑一次；安装会终止本进程，重启后由 next_update_at
-                # 拦住，不会变成「装一次、重启、马上又装」的循环。
+            try:
+                self._recover_update()
+                if self.update_due():
+                    # 只在网络循环的间隙跑一次；安装会终止本进程，重启后由 next_update_at
+                    # 拦住，不会变成「装一次、重启、马上又装」的循环。
+                    try:
+                        self.periodic_update_check()
+                    except Exception as exc:  # noqa: BLE001 - never let an update stop the agent
+                        self.logger.error("periodic update check failed: %s", type(exc).__name__)
+                # 手动指令只留下「下一轮要强制登录」这个标记，真正的一轮在这里跑。
+                force_login = self._take_pending_force_login()
+                result = self.run_cycle(force_login=force_login)
+                delay = result.next_delay
+            except Exception as exc:  # noqa: BLE001 - 一轮异常不能停掉整个主循环
+                # 以前这里没有 try：run_cycle 抛出的任何异常会静默终结主循环线程，
+                # 而巡检因为 _cycle_started_at 已被 finally 清空而什么都不说。
+                self.logger.error(
+                    "background check cycle failed: %s", type(exc).__name__
+                )
                 try:
-                    self.periodic_update_check()
-                except Exception as exc:  # noqa: BLE001 - never let an update stop the agent
-                    self.logger.error("periodic update check failed: %s", type(exc).__name__)
-            # 手动指令只留下「下一轮要强制登录」这个标记，真正的一轮在这里跑。
-            force_login = self._take_pending_force_login()
-            result = self.run_cycle(force_login=force_login)
-            delay = result.next_delay
+                    self._publish(
+                        AgentState.WAITING_FOR_NETWORK,
+                        "后台检测本轮异常；仍在重试",
+                    )
+                except Exception:  # noqa: BLE001 - 发布失败也不能停掉循环
+                    pass
+                delay = TRANSIENT_RETRY_DELAYS[0]
             if self._wait_for_next_cycle(stop_event, delay):
                 break
 
