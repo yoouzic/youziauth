@@ -7,7 +7,7 @@
 唯一的 named pipe 实例一直是 BUSY；界面于是显示「后台检测已停止响应（最近一次检测于
 10:28）」，点「立即检测」提示「后台认证服务没有响应」。15:33 用提权脚本先抓线程栈、
 再结束进程并重新运行计划任务，新 agent（PID 28792）15:33:19 启动并立刻恢复。源码已修，
-目标版本 **v1.8.41**。
+**v1.8.41 已于 15:50 发布并自动更新到本机**（见 §6）。
 
 ## 1. 现场证据（2026-11-06）
 
@@ -63,3 +63,23 @@ Thread 2852 (idle): "youziauth-agent-watchdog"     # Event.wait（巡检正在 1
 已经恢复：提权脚本按「py-spy dump → `taskkill /F /PID 24024` →
 `schtasks /Run /TN \youziauth\SystemAgent`」执行，新 agent PID 28792 健康运行。
 v1.8.41 安装后，同类卡死会自愈，不再需要人工重启电脑。
+
+## 6. 发布与装机验证（v1.8.41，2026-11-06 15:44–15:59）
+
+- `v1.8.41` tag → Signed Windows release 工作流 **4m47s 全部成功**（测试、前端测试、
+  VERSION/tag 一致、构建、Ed25519 签名、签名校验、发布）。
+- Release：<https://github.com/yoouzic/youziauth/releases/tag/v1.8.41>；资产齐全；
+  `release-provenance.json` 的 `git_commit = fd832cd…`（本修复后的 version commit）。
+- 本机系统代理自动更新：`checking → downloading → installing → installed`
+  （15:50–15:58），注册表 `DisplayVersion = 1.8.41`、`_internal/VERSION = 1.8.41`；
+  新进程 `youziauth.exe` / `youziauth-agent.exe` 于 15:58:47/48 重启，新 agent 快照
+  `update.detail = "agent restarted"`，pipe `status` 正常回复。
+- **装机二进制核对**：PyInstaller 归档读取器解出已安装 `youziauth-agent.exe` 里的
+  `campus_auth_agent` 模块，确认包含 `youziauth-agent-sentinel`、
+  `_authenticate_with_deadline`、`_dump_stuck_and_exit`、`agent-failsafe.log`、
+  `heartbeat stopped`、`LIVENESS_TIMEOUT_SECONDS`、`AuthDeadlineExceeded` —— 自愈代码
+  确实进了这台机器。
+- 下次同类卡死的预期：主循环心跳停 300s → 哨兵把全部线程栈写进
+  `%ProgramData%\youziauth-system\logs\agent-failsafe.log` → 以退出码 75 退出 →
+  计划任务 RestartOnFailure（PT1M/3 次）在约 1 分钟内拉起；界面则从「已停止响应」
+  自动恢复为最新状态。
