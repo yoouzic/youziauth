@@ -1215,5 +1215,82 @@ class AgentSnapshotTickTests(unittest.TestCase):
         self.assertEqual(result['message'], '操作未完成，请检查本机权限、配置和网络后重试。')
 
 
+class LptiyuBridgeTests(unittest.TestCase):
+    """乐跑区块: 快照脱敏、动作分发、独立降级。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        from lptiyu_panel import LptiyuController
+        from lptiyu_store import Settings, Store
+
+        self.store = Store(Path(self.tmp.name) / 'lptiyu')
+        self.store.save_identity({'name': '陈同学', 'student_num': '222025321102104',
+                                  'uid': '17987537', 'school_id': '837',
+                                  'card_id': '222025321102104'})
+        self.store.save_token_record('LP-SECRET-TOKEN', issued_at='2026-11-11T01:07:18',
+                                     source='test')
+        self.store.save_settings(Settings(enabled=True, run_time='06:30'))
+        self.controller = LptiyuController(store=self.store,
+                                           clock=lambda: _at('2026-11-11T07:00:00'))
+        self.addCleanup(self.controller.close)
+        # 测试隔离: 本机研究库真实存在, 绝不能让它被后台同步读到; 采集 subprocess 钉死。
+        lab = patch.object(Store, 'lab_dir', lambda self: '')
+        grab = patch('lptiyu_panel.subprocess.run')
+        lab.start(); grab.start()
+        self.addCleanup(lab.stop); self.addCleanup(grab.stop)
+        with patch('desktop_bridge.gui.ensure_user_config', side_effect=lambda p: p), \
+             patch('desktop_bridge.gui.load_gui_settings', return_value=GuiSettings('student', 'never-expose', 60)), \
+             patch('desktop_bridge.gui.is_startup_enabled', return_value=False):
+            self.bridge = DesktopBridge(Path(self.tmp.name) / 'config.ini',
+                                        dorm=MagicMock(), lptiyu=self.controller)
+
+    def test_snapshot_exposes_state_without_the_token_itself(self):
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertTrue(state['available'])
+        self.assertTrue(state['has_token'])
+        self.assertNotIn('LP-SECRET-TOKEN', str(state), 'token 绝不能出现在快照里')
+        self.assertEqual(state['identity']['name'], '陈同学')
+        self.assertIn('自动跑步', state['schedule'])
+
+    def test_snapshot_degrades_when_the_store_is_unreadable(self):
+        self.controller.store.settings = lambda: (_ for _ in ()).throw(OSError('bad'))
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertFalse(state['available'])
+        self.assertEqual(state['message'], '乐跑设置暂时无法读取')
+
+    def test_lptiyu_save_roundtrips_settings(self):
+        result = self.bridge.dispatch('lptiyu_save', {
+            'enabled': True, 'run_time': '06:30', 'dist_lo': 2.9, 'dist_hi': 3.1,
+            'pace_target': 240, 'anchor_max_m': 20, 'max_per_day': 1,
+            'time_lo': '06:00', 'time_hi': '23:00'})
+        self.assertTrue(result['ok'])
+        settings = self.store.settings()
+        self.assertTrue(settings.enabled)
+        self.assertEqual(settings.pace_target, 240)
+
+    def test_lptiyu_save_rejects_inverted_range_with_the_specific_reason(self):
+        result = self.bridge.dispatch('lptiyu_save', {
+            'enabled': False, 'run_time': '06:30', 'dist_lo': 3.0, 'dist_hi': 2.0,
+            'pace_target': 0, 'anchor_max_m': 20, 'max_per_day': 1,
+            'time_lo': '06:00', 'time_hi': '23:00'})
+        self.assertFalse(result['ok'])
+        self.assertIn('距离范围', result['message'])
+
+    def test_lptiyu_actions_start_the_controller(self):
+        self.assertTrue(self.bridge.dispatch('lptiyu_sync')['ok'])
+        self.assertTrue(self.bridge.dispatch('lptiyu_cancel')['ok'])
+        # sync 在后台线程写状态文件, 等它收尾再进入临时目录清理, 否则清理会撞上写入
+        self.controller._wait_for_work()
+
+    def test_preview_bridge_has_a_self_consistent_lptiyu_block(self):
+        preview = PreviewBridge()
+        state = preview.snapshot()['lptiyu']
+        self.assertTrue(state['available'])
+        self.assertIn('settings', state)
+        self.assertTrue(preview.dispatch('lptiyu_run')['ok'])
+        self.assertEqual(preview.snapshot()['lptiyu']['state'], 'signed')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -7,3 +7,7 @@ numpy==2.4.4
 # 必须显式钉住：它在开发机上只是别的包的传递依赖，CI 只装本文件，缺了它
 # proxy_rules 会读不了配置，程序会降级成「代理配置无法读取」。
 PyYAML==6.0.3
+
+# 乐跑(lptiyu)模块的协议信封加密：AES-128-CBC + PKCS7。
+# lptiyu.cipher 直接依赖；缺失时乐跑功能整体降级为不可用。
+pycryptodome==4.4.0

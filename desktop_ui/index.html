@@ -20,6 +20,7 @@
       <a class="nav-link active" href="#overview" aria-current="page"><i class="bi bi-house-door" aria-hidden="true"></i><span>今日概览</span></a>
       <a class="nav-link" href="#network"><i class="bi bi-wifi" aria-hidden="true"></i><span>校园网</span></a>
       <a class="nav-link" href="#dorm"><i class="bi bi-journal-check" aria-hidden="true"></i><span>寝室打卡</span></a>
+      <a class="nav-link" href="#lptiyu"><i class="bi bi-stopwatch" aria-hidden="true"></i><span>乐跑</span></a>
       <a class="nav-link" href="#records"><i class="bi bi-clock-history" aria-hidden="true"></i><span>运行记录</span></a>
       <a class="nav-link" href="#updates" aria-label="软件更新"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i><span>软件更新</span></a>
     </nav>
@@ -36,8 +37,9 @@
         <div class="summary-grid">
           <article class="paper-card summary"><div class="card-label"><span><i class="bi bi-wifi" aria-hidden="true"></i> 校园网连接</span><span id="network-badge" class="badge">等待检测</span></div><h2 id="network-headline">尚未检测</h2><p class="muted" id="network-summary">正在读取状态…</p><a href="#network" class="card-link">连接与设置 <i class="bi bi-arrow-up-right" aria-hidden="true"></i></a></article>
           <article class="paper-card summary"><div class="card-label"><span><i class="bi bi-journal-check" aria-hidden="true"></i> 今日寝室打卡</span><span id="dorm-badge" class="badge">待查询</span></div><h2 id="dorm-headline">查看今日安排</h2><p class="muted" id="dorm-summary">正在读取状态…</p><a href="#dorm" class="card-link">前往寝室打卡 <i class="bi bi-arrow-up-right" aria-hidden="true"></i></a></article>
+          <article class="paper-card summary"><div class="card-label"><span><i class="bi bi-stopwatch" aria-hidden="true"></i> 今日乐跑</span><span id="lp-badge" class="badge">待安排</span></div><h2 id="lp-headline">看看今天的安排</h2><p class="muted" id="lp-summary">正在读取状态…</p><a href="#lptiyu" class="card-link">前往乐跑 <i class="bi bi-arrow-up-right" aria-hidden="true"></i></a></article>
         </div>
-        <div class="bottom-grid"><article class="paper-card compact"><h3><i class="bi bi-sliders" aria-hidden="true"></i> 后台安排</h3><div class="info-row"><span>校园网自动检测</span><strong id="monitor-summary">未开启</strong></div><div class="info-row"><span>寝室自动打卡</span><strong id="auto-summary">未开启</strong></div><div class="info-row"><span>打卡定位来源</span><strong id="overview-location-source">真实定位（Windows）</strong></div></article><article class="paper-card compact"><h3><i class="bi bi-arrow-up-right-circle" aria-hidden="true"></i> 快捷入口</h3><a class="quick-link" href="#network">管理校园网账号 <i class="bi bi-chevron-right" aria-hidden="true"></i></a><a class="quick-link" href="#records">查看最近运行记录 <i class="bi bi-chevron-right" aria-hidden="true"></i></a></article></div>
+        <div class="bottom-grid"><article class="paper-card compact"><h3><i class="bi bi-sliders" aria-hidden="true"></i> 后台安排</h3><div class="info-row"><span>校园网自动检测</span><strong id="monitor-summary">未开启</strong></div><div class="info-row"><span>寝室自动打卡</span><strong id="auto-summary">未开启</strong></div><div class="info-row"><span>乐跑自动跑步</span><strong id="lp-auto-summary">未开启</strong></div><div class="info-row"><span>打卡定位来源</span><strong id="overview-location-source">真实定位（Windows）</strong></div></article><article class="paper-card compact"><h3><i class="bi bi-arrow-up-right-circle" aria-hidden="true"></i> 快捷入口</h3><a class="quick-link" href="#network">管理校园网账号 <i class="bi bi-chevron-right" aria-hidden="true"></i></a><a class="quick-link" href="#lptiyu">查看乐跑安排 <i class="bi bi-chevron-right" aria-hidden="true"></i></a><a class="quick-link" href="#records">查看最近运行记录 <i class="bi bi-chevron-right" aria-hidden="true"></i></a></article></div>
       </section>
 
       <section class="page" id="network" aria-labelledby="network-title" hidden>
@@ -114,6 +116,32 @@
         </div>
       </section>
 
+      <section class="page" id="lptiyu" aria-labelledby="lptiyu-title" hidden>
+        <div class="page-heading"><div><div class="eyebrow">清晨的操场，从容出发</div><h1 id="lptiyu-title">乐跑</h1><p class="muted">在有效时段完成一次课外跑，成绩自动核对。</p></div><span class="section-mark"><i class="bi bi-stopwatch" aria-hidden="true"></i></span></div>
+        <article class="paper-card task-card"><div class="card-label"><span><i class="bi bi-stopwatch" aria-hidden="true"></i> 今日跑步</span><span class="badge" id="lp-task-badge">待安排</span></div><h2 id="lp-headline-page">看看今天的安排</h2><p class="muted" id="lp-message">开启自动跑步后，每天在设定时间自动完成。</p><div class="task-details" id="lp-details" hidden><div><span>跑区</span><strong id="lp-zone">以学校配置为准</strong></div><div><span>目标距离</span><strong id="lp-distance">2.03–2.35 km</strong></div><div><span>目标配速</span><strong id="lp-pace">自动</strong></div><div><span>最近成绩</span><strong id="lp-last">—</strong></div></div><div class="task-actions"><button class="primary" id="lp-submit">开始今天的跑步 <i class="bi bi-arrow-right" aria-hidden="true"></i></button><button class="secondary" data-action="lptiyu_dry">先验证一次</button><button class="text-button" data-action="lptiyu_cancel" id="lp-cancel">取消当前操作</button></div></article>
+        <div class="detail-grid">
+          <form class="paper-card form-card" id="lptiyu-form">
+            <div class="card-label"><h3>自动跑步</h3><input id="lp-enabled" type="checkbox" role="switch" aria-label="启用自动跑步"></div>
+            <p class="muted small">每天在设定时间自动完成一次课外跑，保存后生效。</p>
+            <div class="time-fields"><div><label for="lp-run-time">开始时间</label><input id="lp-run-time" type="time" value="06:30" required></div></div>
+            <div class="setting-row"><div><label for="lp-dist-lo">距离范围</label><p class="field-hint">单次里程，公里</p></div><div class="number-field wide"><input id="lp-dist-lo" type="number" min="0.5" max="9.9" step="0.01" value="2.03" required><span>至</span><input id="lp-dist-hi" type="number" min="1" max="10" step="0.01" value="2.35" required><span>km</span></div></div>
+            <div class="setting-row"><div><label for="lp-pace">目标配速</label><p class="field-hint">秒/公里，0 为自动</p></div><div class="number-field"><input id="lp-pace" type="number" min="0" max="700" step="1" value="0" required><span id="lp-pace-hint">自动</span></div></div>
+            <div class="setting-row"><div><label for="lp-anchor">采点精度</label><p class="field-hint">经过打卡点的贴近程度</p></div><div class="number-field"><input id="lp-anchor" type="number" min="5" max="40" step="1" value="20" required><span>米</span></div></div>
+            <p class="schedule" id="lp-schedule">自动跑步：关闭</p>
+            <div class="form-footer"><span class="form-state" id="lptiyu-save-state">设置已同步</span><button type="submit" class="primary">保存跑步设置</button></div>
+          </form>
+          <aside class="side-stack">
+            <article class="paper-card compact">
+              <h3><i class="bi bi-person-badge" aria-hidden="true"></i> 跑步凭证</h3>
+              <span class="badge" id="lp-token-badge">待同步</span>
+              <p class="muted" id="lp-credential-line">正在读取凭证状态…</p>
+              <p class="field-hint" id="lp-identity-line"></p>
+              <div class="stack-actions"><button class="primary" data-action="lptiyu_sync">同步凭证</button></div>
+            </article>
+          </aside>
+        </div>
+      </section>
+
       <dialog id="map-dialog" class="map-dialog" aria-labelledby="map-title">
         <article class="paper-card compact map-card" id="map-card">
           <h3 id="map-title"><i class="bi bi-map" aria-hidden="true"></i> 地图选点</h3>
@@ -149,7 +177,7 @@
         </article>
       </dialog>
 
-      <section class="page" id="records" aria-labelledby="records-title" hidden><div class="page-heading"><div><div class="eyebrow">每一步，都有迹可循</div><h1 id="records-title">运行记录</h1><p class="muted">查看最近的连接检测与寝室打卡结果。</p></div><button class="secondary" id="refresh-records"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i> 刷新记录</button></div><article class="paper-card records-card"><div class="records-header"><div class="segmented" role="group" aria-label="记录类型"><button class="selected" data-log="network" aria-pressed="true">校园网</button><button data-log="dorm" aria-pressed="false">寝室打卡</button></div><span class="little-label">仅保存在本机</span></div><div id="empty-records" class="empty-state"><i class="bi bi-journal-text" aria-hidden="true"></i><h2>还没有运行记录</h2><p class="muted">完成一次检测或任务查询后，记录会出现在这里。</p></div><pre id="log-output" tabindex="0" hidden></pre><button class="log-jump" id="log-jump" type="button" hidden>↓ <span id="log-jump-count">0</span> 条新记录</button></article></section>
+      <section class="page" id="records" aria-labelledby="records-title" hidden><div class="page-heading"><div><div class="eyebrow">每一步，都有迹可循</div><h1 id="records-title">运行记录</h1><p class="muted">查看最近的连接检测与寝室打卡结果。</p></div><button class="secondary" id="refresh-records"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i> 刷新记录</button></div><article class="paper-card records-card"><div class="records-header"><div class="segmented" role="group" aria-label="记录类型"><button class="selected" data-log="network" aria-pressed="true">校园网</button><button data-log="dorm" aria-pressed="false">寝室打卡</button><button data-log="lptiyu" aria-pressed="false">乐跑</button></div><span class="little-label">仅保存在本机</span></div><div id="empty-records" class="empty-state"><i class="bi bi-journal-text" aria-hidden="true"></i><h2>还没有运行记录</h2><p class="muted">完成一次检测或任务查询后，记录会出现在这里。</p></div><pre id="log-output" tabindex="0" hidden></pre><button class="log-jump" id="log-jump" type="button" hidden>↓ <span id="log-jump-count">0</span> 条新记录</button></article></section>
       <section class="page" id="updates" aria-labelledby="updates-title" hidden>
         <div class="page-heading"><div><div class="eyebrow">保持最新，更新自动完成</div><h1 id="updates-title">软件更新</h1><p class="muted">有新版本时会自动更新，不需要你确认。</p></div></div>
         <article class="paper-card compact update-card">

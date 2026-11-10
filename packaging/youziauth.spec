@@ -32,7 +32,12 @@ gui_analysis = Analysis(
                    # idm_http 是纯 HTTP 提交登录（绕开站点 WAF 对浏览器 POST 的拦截），
                    # 由 idm_login 在函数内 import，同样需要显式声明。
                    # dorm_accounts 由 CampusAuthGui 在函数内 import（账号档案目录 + 账号清单）。
-                   "captcha_ocr", "idm_login", "idm_http", "idm_credentials", "dorm_accounts"],
+                   "captcha_ocr", "idm_login", "idm_http", "idm_credentials", "dorm_accounts",
+                   # 乐跑模块：desktop_bridge 首次访问控制器时才 import lptiyu_panel，
+                   # 协议核心整包都是延迟导入，必须显式声明才会进包。
+                   "lptiyu", "lptiyu.spec", "lptiyu.cipher", "lptiyu.tls", "lptiyu.wire",
+                   "lptiyu.client", "lptiyu.tracks", "lptiyu.upfile", "lptiyu.flow",
+                   "lptiyu_store", "lptiyu_panel"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

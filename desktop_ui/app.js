@@ -1,9 +1,9 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const titles = {overview:'今日概览',network:'校园网',dorm:'寝室打卡',records:'运行记录',updates:'软件更新'};
+const titles = {overview:'今日概览',network:'校园网',dorm:'寝室打卡',lptiyu:'乐跑',records:'运行记录',updates:'软件更新'};
 let state = null, logType = 'network', pending = false, refreshTask = null, epoch = 0, syncedEpoch = -1, timer, proxyIgnored = false;
-const dirty = {network:false, dorm:false};
-const revisions = {network:0, dorm:0};
+const dirty = {network:false, dorm:false, lptiyu:false};
+const revisions = {network:0, dorm:0, lptiyu:0};
 let sourceDirty = false, sourceRevision = 0;
 let api;
 let mapState = null;
@@ -80,6 +80,19 @@ function compactDormLog(text){
     lines.push(block.title);
     for(const record of block.entries){
       if(done && record.message === DORM_ROUTINE) continue;
+      lines.push('  ' + record.time + '  ' + dormRecordText(record));
+    }
+  }
+  return lines.join('\n');
+}
+
+/* 乐跑：history.log 与寝室打卡同一行格式，按天分段展示即可，无需再合并重复。 */
+function compactLptiyuLog(text){
+  const lines = [];
+  for(const block of groupByDay(text, dormRecord)){
+    if(!block.entries){lines.push(block.raw); continue;}
+    lines.push(block.title);
+    for(const record of block.entries){
       lines.push('  ' + record.time + '  ' + dormRecordText(record));
     }
   }
@@ -171,7 +184,9 @@ function compactNetworkLog(text){
 function logText(){
   const raw = (state && state.logs && state.logs[logType]) || '';
   // 两份日志都是给人看的：寝室打卡那份是后端写好的中文，校园网那份要在这里换成短句。
-  return logType === 'dorm' ? compactDormLog(raw) : compactNetworkLog(raw);
+  if(logType === 'dorm')return compactDormLog(raw);
+  if(logType === 'lptiyu')return compactLptiyuLog(raw);
+  return compactNetworkLog(raw);
 }
 // 例行 status 行每分钟一条，不该被算成「新记录」。压缩后的心跳/例行检测行同样不算。
 function isStatusLine(line){return LOG_STATUS_LINE.test(line) || LOG_ROUTINE_LINE.test(line);}
@@ -297,7 +312,7 @@ function markDirty(kind, value) {
   $(kind+'-save-state').textContent = value ? '有未保存的修改' : '设置已同步';
   $(kind+'-save-state').classList.toggle('dirty',value);
 }
-['network','dorm'].forEach(kind=>$(kind+'-form').addEventListener('input',()=>{revisions[kind]++;markDirty(kind,true);}));
+['network','dorm','lptiyu'].forEach(kind=>$(kind+'-form').addEventListener('input',()=>{revisions[kind]++;markDirty(kind,true);}));
 
 function savedLocationSource(){return state?.dorm.settings.location_source||'windows';}
 function requireSavedLocationSource(){
@@ -322,6 +337,11 @@ function renderProxyHint(p){
     : `${p.message}。请到 ${proxy} 重新加载配置后生效。`;
   const apply=$('proxy-apply');
   if(apply)apply.hidden=!p.can_apply;
+}
+function paceLabel(seconds){
+  const s=Math.round(Number(seconds)||0);
+  if(!s)return '自动';
+  return `${Math.floor(s/60)}'${String(s%60).padStart(2,'0')}"`;
 }
 function render() {
   if(!state) return;
@@ -382,6 +402,7 @@ function render() {
   $('idm-clear').disabled=!d.has_idm_credentials||pending||d.busy;
   $('idm-username').disabled=pending||d.busy;
   $('idm-password').disabled=pending||d.busy;
+  renderLptiyu();
   renderAccounts();
   if(!simulation&&mapState)closeMap();
   $('open-map-picker').hidden=!simulation||!!mapState;
@@ -533,6 +554,21 @@ $('network-form').addEventListener('submit',async event=>{
   if(await act('network_save',payload)){if(revision===revisions.network){markDirty('network',false);$('password').value='';}render();}
 });
 $('location-source').addEventListener('change',()=>{sourceRevision++;sourceDirty=true;markDirty('dorm',true);});
+$('lp-pace').addEventListener('input',()=>{$('lp-pace-hint').textContent=paceLabel($('lp-pace').value);});
+$('lptiyu-form').addEventListener('submit',async event=>{
+  event.preventDefault();
+  const payload={enabled:$('lp-enabled').checked,run_time:$('lp-run-time').value,
+    dist_lo:Number($('lp-dist-lo').value),dist_hi:Number($('lp-dist-hi').value),
+    pace_target:Number($('lp-pace').value),anchor_max_m:Number($('lp-anchor').value)};
+  if(payload.dist_lo>=payload.dist_hi){notify('距离下限要小于上限，暂不支持倒序范围。',true);return;}
+  const revision=revisions.lptiyu;
+  if(await act('lptiyu_save',payload)){
+    if(revision===revisions.lptiyu)markDirty('lptiyu',false);
+    render();
+  }
+});
+$('lp-submit').onclick=()=>confirmAction('开始今天的跑步？',
+  '将使用保存的凭证完成一次课外跑，并自动核对学校的判定。',()=>act('lptiyu_run'));
 $('dorm-form').addEventListener('submit',async event=>{
   event.preventDefault();
   const payload={enabled:$('auto-enabled').checked,start:$('auto-start').value,end:$('auto-end').value,interval:Number($('auto-interval').value)};
@@ -642,6 +678,53 @@ function requireAccountSync(){
   // 清单读不出来时后端会拒绝每一个账号操作，这里先按它的原话说明，不让按钮白点。
   if(state.accounts?.error){notify(state.accounts.error,true);return false;}
   return true;
+}
+/* 乐跑 --------------------------------------------------------------------------------------
+   快照只给「有没有凭证、什么时候同步的」，不给凭证本身；状态词与后端的受控词表一一对应。
+   老快照可能没有 lptiyu 区块，整页按「尚未开始」呈现，其余功能照常。 */
+const LP_NAMES={signed:'今日已完成',running:'正在跑步',checked:'验证通过',idle:'看看今天的安排',
+  synced:'凭证已同步',need_token:'等待凭证',quota:'今日已完成',uncertain:'结果待确认',
+  waiting:'等待时段',error:'需要检查',cancelled:'操作已取消'};
+function renderLptiyu(){
+  if(!$('lp-task-badge'))return;
+  const lp=state.lptiyu||{state:'idle',message:'',busy:false,settings:{},identity:{},
+    has_token:false,token_age_hours:null,zone:{},today_done:0,today_max:1,last:null};
+  const label=lp.busy?'正在处理…':(LP_NAMES[lp.state]||'请查看任务状态');
+  const tone=lp.state==='signed'?'success':['need_token','error','uncertain','quota'].includes(lp.state)?'warning':'';
+  badge('lp-badge',label,tone);badge('lp-task-badge',label,tone);
+  $('lp-headline').textContent=label;
+  $('lp-headline-page').textContent=label;
+  $('lp-summary').textContent=lp.message;
+  $('lp-message').textContent=lp.busy?'正在处理，请稍候。':lp.message;
+  const s=lp.settings||{};
+  $('lp-details').hidden=!s.run_time;
+  if(s.run_time){
+    $('lp-zone').textContent=s.zone_name?`${s.zone_name}（${s.zone_id}）`:'以学校配置为准';
+    $('lp-distance').textContent=`${s.dist_lo}–${s.dist_hi} km`;
+    $('lp-pace').textContent=paceLabel(s.pace_target);
+    $('lp-last').textContent=lp.last
+      ?`${lp.last.date} · ${lp.last.distance||''}${lp.last.zone?' · '+lp.last.zone:''}`:'—';
+  }
+  if(!dirty.lptiyu){
+    $('lp-enabled').checked=!!s.enabled;
+    $('lp-run-time').value=s.run_time||'06:30';
+    $('lp-dist-lo').value=s.dist_lo??2.03;
+    $('lp-dist-hi').value=s.dist_hi??2.35;
+    $('lp-pace').value=s.pace_target??0;
+    $('lp-anchor').value=s.anchor_max_m??20;
+    $('lp-pace-hint').textContent=paceLabel(s.pace_target);
+    $('lp-schedule').textContent=lp.schedule||'自动跑步：关闭';
+  }
+  $('lp-auto-summary').textContent=s.enabled?`${s.run_time||'06:30'} 自动`:'未开启';
+  badge('lp-token-badge',lp.has_token?'凭证就绪':'待同步',lp.has_token?'success':'warning');
+  const age=lp.token_age_hours;
+  $('lp-credential-line').textContent=lp.has_token
+    ?`凭证已加密保存在本机${age!=null?`，${age<1?Math.max(1,Math.round(age*60))+' 分钟前':age.toFixed(1)+' 小时前'}同步`:''}，跑步前会自动确认可用。`
+    :'在小程序里打开一次跑步首页，然后点「同步凭证」。';
+  $('lp-identity-line').textContent=lp.identity?.name?`当前成员：${lp.identity.name}`:'';
+  document.querySelectorAll('[data-action="lptiyu_dry"],[data-action="lptiyu_sync"]').forEach(b=>b.disabled=pending||lp.busy);
+  $('lp-submit').disabled=pending||syncedEpoch!==epoch||lp.busy||['signed','quota'].includes(lp.state);
+  $('lp-cancel').disabled=pending||!lp.busy;
 }
 /* 学校登录 ---------------------------------------------------------------------------------
    登录态只有后端能回答：快照里的 has_session 直接读本机保存的学校会话。不用 state 反推 ——

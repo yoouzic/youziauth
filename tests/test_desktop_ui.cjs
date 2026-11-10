@@ -45,7 +45,7 @@ function harness(source='windows',extras={}){
       set innerHTML(value){assert.fail('Backend text must never be rendered as HTML: '+value);},
       classList:{toggle(name,on){if(on)classes.add(name);else classes.delete(name);},contains(name){return classes.has(name);}},
       listeners:{},addEventListener(event,fn){this.listeners[event]=fn;},
-      fire(event){this.listeners[event]?.({});},
+      fire(event){this.listeners[event]?.({preventDefault(){}});},
       // 运行记录的提示胶囊按这个矩形贴到日志框下缘；桩里给个固定值就够断言位置被算过。
       getBoundingClientRect(){return {bottom:700,top:200,left:0,right:600,width:600,height:500};},
       setAttribute(name,value){this.attributes[name]=value;},removeAttribute(name){delete this.attributes[name];},
@@ -68,7 +68,14 @@ function harness(source='windows',extras={}){
   if(canvas)canvas.getContext=()=>stubContext();
   if(canvas&&extras.canvasRect)canvas.getBoundingClientRect=()=>extras.canvasRect;
   const stop=actions.find(button=>button.dataset.action==='network_stop');
-  const data={preview:true,update:updateFixture(),location:{state:'idle',message:'尚未检测',accuracy:null,checked:'',busy:false},network:{username:'saved',interval:60,startup:false,monitoring:true,busy:false,state:'online',message:'online',checked:'',has_password:true},dorm:{state:'idle',message:'pending',busy:false,task:null,settings:{enabled:false,start:'21:00',end:'23:30',interval:300,location_source:source},schedule:'off'},logs:{network:extras.logs?.network||'',dorm:extras.logs?.dorm||''}};
+  const data={preview:true,update:updateFixture(),location:{state:'idle',message:'尚未检测',accuracy:null,checked:'',busy:false},network:{username:'saved',interval:60,startup:false,monitoring:true,busy:false,state:'online',message:'online',checked:'',has_password:true},dorm:{state:'idle',message:'pending',busy:false,task:null,settings:{enabled:false,start:'21:00',end:'23:30',interval:300,location_source:source},schedule:'off'},logs:{network:extras.logs?.network||'',dorm:extras.logs?.dorm||'',lptiyu:extras.logs?.lptiyu||''}};
+  // 老快照没有 lptiyu 层（lptiyu:false 就是那种机器）；有则给一份完整默认区块。
+  if(extras.lptiyu!==false)data.lptiyu={state:'idle',message:'尚未开始今天的跑步',busy:false,available:true,
+    settings:{enabled:false,run_time:'06:30',zone_id:'',zone_name:'',dist_lo:2.03,dist_hi:2.35,
+              pace_target:0,anchor_max_m:20,max_per_day:1,time_lo:'06:00',time_hi:'23:00',api_proxy:'',lab_dir:''},
+    schedule:'自动跑步：关闭',identity:{name:'演示同学',student_num:'2026000000'},
+    has_token:false,token_age_hours:null,zone:{id:'',name:''},today_done:0,today_max:1,last:null,
+    ...(extras.lptiyu||{})};
   // 老快照没有账号层；accounts:false 就是那种机器，别的 extras 只覆盖清单里的字段。
   if(extras.accounts!==false)data.accounts={...accountsFixture(),...(extras.accounts||{})};
   // 每个账号在 state.dorm 里各有一份设置：切换后整份内容跟着换，测试靠这个差异证明表单真的换过来了。
@@ -86,6 +93,7 @@ function harness(source='windows',extras={}){
   const api={snapshot:async()=>structuredClone(data),dispatch:async(action,payload)=>{
     calls.push({action,payload});
     if(action==='dorm_save')Object.assign(data.dorm.settings,payload);
+    if(action==='lptiyu_save')Object.assign(data.lptiyu.settings,payload);
     if(action==='location_source_save')data.dorm.settings.location_source=payload.location_source;
     if(action==='simulation_point_save'){
       if(payload.latitude===null||typeof payload.latitude!=='number')return {ok:false,message:'选点坐标无效，请在地图上重新选择。'};
@@ -2052,4 +2060,81 @@ test('records written before the streak fix still read correctly',async()=>{
     + '· 响应超时 20.7s／直连／本轮已重试 2 次／连续第 连续第 2 次');
   assert.equal(h.el('log-output').textContent,
     '10月12日 周一\n  21:08  学校接口响应超时（20 秒未回应），请稍后重试 · 响应超时 20.7s／直连／本轮已重试 2 次／连续第 2 次');
+});
+
+/* 乐跑 --------------------------------------------------------------------------------------- */
+async function lptiyuPage(lptiyu){
+  const h=harness('windows',{lptiyu});
+  h.navigate('lptiyu');
+  await h.refresh();
+  return h;
+}
+
+test('a snapshot without the lptiyu layer still renders every page',async()=>{
+  const h=harness('windows',{lptiyu:false});
+  h.navigate('lptiyu');
+  await h.refresh();
+  assert.equal(h.el('lp-badge').textContent,'看看今天的安排','老快照没有乐跑区块时按「尚未开始」呈现');
+  assert.equal(h.el('lp-summary').textContent,'');
+});
+
+test('lptiyu states read as their own words on the overview card and the page',async()=>{
+  const h=await lptiyuPage({state:'signed',message:"今日跑步已完成 · 2.98km · 配速 4'02\"/km",
+    has_token:true,token_age_hours:3.2,identity:{name:'陈同学',student_num:'222025321102104'}});
+  assert.equal(h.el('lp-badge').textContent,'今日已完成');
+  assert.equal(h.el('lp-summary').textContent,"今日跑步已完成 · 2.98km · 配速 4'02\"/km");
+  assert.equal(h.el('lp-token-badge').textContent,'凭证就绪');
+  assert.match(h.el('lp-credential-line').textContent,/3\.2 小时前同步/);
+  assert.equal(h.el('lp-identity-line').textContent,'当前成员：陈同学');
+  assert.equal(h.el('lp-submit').disabled,true,'今日已完成时不再提供第二次提交');
+});
+
+test('lptiyu waiting for credentials explains the one thing to do',async()=>{
+  const h=await lptiyuPage({state:'need_token',message:'还没有可用的跑步凭证',has_token:false});
+  assert.equal(h.el('lp-badge').textContent,'等待凭证');
+  assert.match(h.el('lp-token-badge').textContent,/待同步/);
+  assert.match(h.el('lp-credential-line').textContent,/打开一次跑步首页/);
+});
+
+test('lptiyu settings sync from the snapshot and save through the bridge',async()=>{
+  const h=await lptiyuPage({settings:{enabled:true,run_time:'06:30',dist_lo:2.9,dist_hi:3.1,
+    pace_target:240,anchor_max_m:20,max_per_day:1,time_lo:'06:00',time_hi:'23:00'}});
+  assert.equal(h.el('lp-enabled').checked,true);
+  assert.equal(String(h.el('lp-dist-lo').value),'2.9');
+  assert.equal(String(h.el('lp-pace').value),'240');
+  assert.equal(h.el('lp-pace-hint').textContent,"4'00\"",'配速输入框的旁注要换成分钟秒');
+  assert.equal(h.el('lp-auto-summary').textContent,'06:30 自动');
+  h.el('lp-dist-hi').value='3.2';
+  await h.el('lptiyu-form').fire('submit');
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1))),{action:'lptiyu_save',payload:{enabled:true,run_time:'06:30',
+    dist_lo:2.9,dist_hi:3.2,pace_target:240,anchor_max_m:20}},
+    '合法修改按表单内容发往后台');
+});
+
+test('an inverted distance range is refused before reaching the bridge',async()=>{
+  const h=await lptiyuPage({});
+  h.el('lp-dist-lo').value='3.2';
+  h.el('lp-dist-hi').value='2.8';
+  await h.el('lptiyu-form').fire('submit');
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(h.calls.filter(call=>call.action==='lptiyu_save').length,0,
+    '下限大于上限的设置不发往后台');
+});
+
+test('lptiyu records read as one line per run, grouped by day',async()=>{
+  const h=harness('windows',{logs:{lptiyu:
+    '2026-11-10T06:33:12 [signed] 今日跑步已完成 · 2.31km · 配速 4\'05"/km · 第二运动场\n'
+    +'2026-11-10T06:35:02 [need_token] 凭证已失效：在小程序里打开一次跑步首页\n'
+    +'2026-11-11T06:31:40 [signed] 今日跑步已完成 · 3.01km · 配速 3\'58"/km · 第二运动场'}});
+  h.showLog('lptiyu');
+  h.navigate('records');
+  await h.refresh();
+  assert.equal(h.el('log-output').textContent,[
+    '11月10日 周二',
+    "  06:33  今日跑步已完成 · 2.31km · 配速 4'05\"/km · 第二运动场",
+    '  06:35  凭证已失效：在小程序里打开一次跑步首页',
+    '11月11日 周三',
+    "  06:31  今日跑步已完成 · 3.01km · 配速 3'58\"/km · 第二运动场"].join('\n'),
+    '乐跑记录与寝室打卡同一套按天分组展示');
 });

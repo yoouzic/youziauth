@@ -124,3 +124,5 @@
 .proxy-hint h2{font-size:17px}
 .proxy-hint .stack-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;flex:0 0 auto}
 @media(max-width:760px){.proxy-hint{flex-direction:column;align-items:flex-start}.proxy-hint .stack-actions{width:100%}}
+
+.number-field.wide{max-width:236px}

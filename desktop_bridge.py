@@ -120,6 +120,36 @@ def dorm_settings(payload):
                     payload.get('location_source', 'windows')).validate()
 
 
+def lptiyu_settings(payload):
+    from lptiyu_store import Settings as LptiyuSettings  # noqa: PLC0415
+
+    def _float(value, default):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _int(value, default):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    return LptiyuSettings(
+        enabled=bool(payload.get('enabled', False)),
+        run_time=str(payload.get('run_time', '')).strip() or '06:30',
+        zone_id=str(payload.get('zone_id', '')).strip(),
+        zone_name=str(payload.get('zone_name', '')).strip(),
+        dist_lo=_float(payload.get('dist_lo'), 2.03),
+        dist_hi=_float(payload.get('dist_hi'), 2.35),
+        pace_target=_int(payload.get('pace_target'), 0),
+        anchor_max_m=_float(payload.get('anchor_max_m'), 20.0),
+        max_per_day=_int(payload.get('max_per_day'), 1),
+        time_lo=str(payload.get('time_lo', '')).strip() or '06:00',
+        time_hi=str(payload.get('time_hi', '')).strip() or '23:00',
+    ).validate()
+
+
 def sample_point(sample):
     """Map-ready view of a stored simulation sample; None when it cannot be read."""
     if not isinstance(sample, dict):
@@ -247,7 +277,8 @@ class LocationProbe:
 
 
 class DesktopBridge(LocationProbe):
-    def __init__(self, config_path=None, dorm=None, startup_mode=False, accounts=None):
+    def __init__(self, config_path=None, dorm=None, startup_mode=False, accounts=None,
+                 lptiyu=None):
         self._init_location()
         self._config = gui.ensure_user_config(config_path or gui.DEFAULT_CONFIG_PATH)
         # 多账号：正式运行时由账号层提供「当前活动账号」的控制器（同一时刻只有一个活着，
@@ -256,6 +287,10 @@ class DesktopBridge(LocationProbe):
         self._accounts = accounts
         if self._accounts is None and self._dorm_override is None:
             self._accounts = DormAccounts()
+        # 乐跑：测试注入控制器；正式路径首次访问时才构造（加密库缺失时安静降级）。
+        self._lptiyu_override = lptiyu
+        self._lptiyu_instance = None
+        self._lptiyu_notice = None
         self._lock = threading.RLock()
         self._mutation = threading.Lock()
         self._network_gate = threading.Lock()
@@ -305,6 +340,89 @@ class DesktopBridge(LocationProbe):
         if self._accounts is not None:
             return self._accounts.any_busy()
         return bool(self._dorm.busy)
+
+    @property
+    def _lptiyu(self):
+        """乐跑控制器。加密依赖缺失时安静降级为 None —— 由快照呈现，不拖垮整页。"""
+        if self._lptiyu_override is not None:
+            return self._lptiyu_override
+        if self._lptiyu_instance is None:
+            try:
+                from lptiyu_panel import LptiyuController  # noqa: PLC0415
+
+                self._lptiyu_instance = LptiyuController()
+            except Exception:  # noqa: BLE001 —— 缺依赖/坏安装都不该让界面挂掉
+                return None
+        return self._lptiyu_instance
+
+    def _lptiyu_snapshot(self):
+        """乐跑区块：独立降级，绝不拖垮整个快照；**绝不包含 token 本身**。"""
+        empty = {'state': 'idle', 'message': '尚未开始今天的跑步', 'busy': False,
+                 'available': False, 'settings': None, 'schedule': '',
+                 'identity': {}, 'has_token': False, 'token_age_hours': None,
+                 'zone': {'id': '', 'name': ''}, 'today_done': 0, 'today_max': 1,
+                 'last': None}
+        controller = self._lptiyu
+        if controller is None:
+            empty['message'] = '乐跑功能在本机暂不可用'
+            return empty
+        try:
+            store = controller.store
+            settings = store.settings()
+            identity = store.identity()
+            daily = store.daily()
+            latest = controller.latest or {}
+            status = store.status()
+            state = latest.get('state') or 'idle'
+            message = latest.get('message') or ''
+            if state == 'idle' and status.get('state'):
+                state = status['state']
+                message = status.get('message') or message
+            if store.is_signed_today() and state in ('idle', 'running'):
+                signed = store.signed_record()
+                state = 'signed'
+                message = '今日跑步已完成' + (
+                    f" · {signed.get('distance')}" if signed.get('distance') else '')
+            issued = store.token_issued_at() if store.has_token() else ''
+            age = None
+            if issued:
+                try:
+                    issued_at = dt.datetime.fromisoformat(issued)
+                    age = round((dt.datetime.now() - issued_at).total_seconds() / 3600.0, 1)
+                except ValueError:
+                    age = None
+            signed = store.signed_record()
+            last = None
+            if signed.get('date'):
+                last = {'date': signed.get('date'), 'distance': signed.get('distance', ''),
+                        'pace': signed.get('pace', ''), 'zone': signed.get('zone', '')}
+            return {
+                'state': state, 'message': message, 'busy': bool(controller.busy),
+                'available': True,
+                'settings': dataclasses.asdict(settings),
+                'schedule': controller.schedule_text(),
+                'identity': {'name': identity.get('name', ''),
+                             'student_num': identity.get('student_num', '')},
+                'has_token': store.has_token(),
+                'token_age_hours': age,
+                'zone': {'id': settings.zone_id, 'name': settings.zone_name},
+                'today_done': int(daily.get('run', 0)),
+                'today_max': settings.max_per_day,
+                'last': last,
+            }
+        except Exception:  # noqa: BLE001 —— 乐跑区块读不动时只降级这一块
+            empty['message'] = '乐跑设置暂时无法读取'
+            return empty
+
+    def _lptiyu_log(self):
+        """乐跑的历史记录文本；读不动时给空串，由前端按「暂无记录」呈现。"""
+        controller = self._lptiyu
+        if controller is None:
+            return ''
+        try:
+            return controller.store.history()
+        except Exception:  # noqa: BLE001
+            return ''
 
     def _accounts_snapshot(self):
         """账号列表：只给界面「谁、叫什么、当前用哪个、今天什么状态」，不含任何路径。"""
@@ -480,9 +598,11 @@ class DesktopBridge(LocationProbe):
                     # 只暴露「是否已保存」与学号，绝不回传密码；多账号下读的是当前账号那一份。
                     **self._idm_status_for_active(),
                 },
+                'lptiyu': self._lptiyu_snapshot(),
                 'logs': {
                     'network': gui.tail_log(gui.resolve_log_path(self._config, settings.log_file)),
                     'dorm': dorm_log,
+                    'lptiyu': self._lptiyu_log(),
                 },
                 'proxy': self._proxy_snapshot(),
             }
@@ -616,6 +736,33 @@ class DesktopBridge(LocationProbe):
             if not self._dorm.start(action.removeprefix('dorm_')):
                 raise RuntimeError('打卡操作正在进行，请等待完成或取消当前操作。')
             return '操作已开始，请查看任务状态'
+        if action in ('lptiyu_run', 'lptiyu_dry', 'lptiyu_sync'):
+            controller = self._lptiyu
+            if controller is None:
+                raise RuntimeError('乐跑功能在本机暂不可用')
+            if not controller.start(action.removeprefix('lptiyu_')):
+                raise RuntimeError('乐跑操作正在进行，请等待完成或取消当前操作。')
+            if action == 'lptiyu_sync':
+                return '正在同步凭证，请稍候'
+            return '操作已开始，请查看任务状态'
+        if action == 'lptiyu_cancel':
+            controller = self._lptiyu
+            if controller is None:
+                raise RuntimeError('乐跑功能在本机暂不可用')
+            controller.cancel_work()
+            return '已请求取消当前操作；已发出的提交不能撤回。'
+        if action == 'lptiyu_save':
+            controller = self._lptiyu
+            if controller is None:
+                raise RuntimeError('乐跑功能在本机暂不可用')
+            if controller.busy:
+                raise RuntimeError('请等待当前跑步操作完成后再保存设置。')
+            try:
+                settings = lptiyu_settings(payload)
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from None
+            controller.store.save_settings(settings)
+            return '自动跑步设置已保存'
         if action == 'dorm_cancel':
             # 多账号：每个账号都有自己的控制器在跑，「取消当前操作」必须能取消所有账号里
             # 正在进行的那一个，否则用户看着 A 的页面就取消不了 B 的操作。
@@ -908,6 +1055,24 @@ class DesktopBridge(LocationProbe):
                 windows_notifications.show_toast(windows_notifications.build_dorm_toast(
                     f'{label}：{result.message}' if label else result.message))
 
+    def _collect_lptiyu(self):
+        """乐跑自动流水线跑一拍 + 通知。组件不可用时安静跳过，错误由快照呈现。"""
+        controller = self._lptiyu
+        if controller is None:
+            return
+        try:
+            controller.poll()
+            events = controller.drain()
+        except Exception:  # noqa: BLE001
+            return
+        for result in events:
+            notice = (result.get('at', '')[:10], result.get('state'), result.get('message'))
+            if result.get('state') in ('signed', 'uncertain', 'need_token', 'error', 'quota') \
+                    and notice != self._lptiyu_notice:
+                self._lptiyu_notice = notice
+                windows_notifications.show_toast(windows_notifications.build_dorm_toast(
+                    f"乐跑：{result.get('message', '')}"))
+
     def _agent_check_interval(self):
         """判定快照是否过期用的检测间隔；设置读不动时用默认 60 秒（更严格的一侧）。"""
         try:
@@ -917,6 +1082,7 @@ class DesktopBridge(LocationProbe):
 
     def _tick(self):
         self._collect_dorm()
+        self._collect_lptiyu()
         if self._agent:
             try:
                 snapshot = agent_ipc.read_snapshot(gui.agent_runtime_path(self._config))
@@ -958,6 +1124,12 @@ class DesktopBridge(LocationProbe):
         self._closed.set()
         self._stop.set()
         self._updates.close()
+        try:
+            lptiyu = self._lptiyu
+            if lptiyu is not None:
+                lptiyu.close()
+        except Exception:  # noqa: BLE001 —— 退出流程不因乐跑组件受阻
+            pass
         close = self._accounts.close if self._accounts is not None else None
         try:
             if close is not None:
@@ -993,6 +1165,14 @@ class PreviewBridge(LocationProbe):
                      # 真实 bridge 会补上这三项；演示里也让它们跟着账号走，界面文案才自洽。
                      'has_session':True,
                      'has_idm_credentials':True, 'idm_username':'2026000000'},
+            'lptiyu': {'state':'idle', 'message':'今天的跑步，安排在清晨', 'busy':False,
+                       'available':True, 'schedule':'自动跑步：关闭',
+                       'settings':dataclasses.asdict(lptiyu_settings({})),
+                       'identity':{'name':'演示同学', 'student_num':'2026000000'},
+                       'has_token':True, 'token_age_hours':3.2,
+                       'zone':{'id':'', 'name':''}, 'today_done':0, 'today_max':1,
+                       'last':{'date':dt.date.today().isoformat(), 'distance':'2.31km',
+                               'pace':"4'05\"", 'zone':'第一运动场'}},
             'accounts': {'error':'', 'max':MAX_ACCOUNTS, 'active':'demo1', 'busy':False,
                          'items':[{'id':'demo1', 'name':'演示账号一', 'active':True,
                                    'has_idm_credentials':True, 'idm_username':'2026000000',
@@ -1012,7 +1192,7 @@ class PreviewBridge(LocationProbe):
                                dorm_points.empty(), name='演示·宿舍楼下',
                                latitude=29.823693, longitude=106.422310, accuracy=100.0,
                                saved_at=now().isoformat(timespec='seconds'))},
-            'logs': {'network':'', 'dorm':''},
+            'logs': {'network':'', 'dorm':'', 'lptiyu':''},
         }
 
     def _preview_reference(self):
@@ -1201,6 +1381,24 @@ class PreviewBridge(LocationProbe):
                 d.update(state='login_required', message='请重新登录学校账号', task=None, has_session=False)
                 d['settings']['enabled'] = False
                 d['schedule'] = '自动打卡：关闭'
+            elif action == 'lptiyu_save':
+                lp = self._data['lptiyu']
+                lp['settings'] = dataclasses.asdict(lptiyu_settings(payload))
+                lp['schedule'] = '自动跑步：' + ('开启（演示）' if lp['settings']['enabled'] else '关闭')
+            elif action == 'lptiyu_run':
+                lp = self._data['lptiyu']
+                lp.update(state='signed', message="今日跑步已完成 · 2.98km · 配速 4'02\"/km（演示）",
+                          busy=False, today_done=1, has_token=True)
+                lp['last'] = {'date': dt.date.today().isoformat(), 'distance': '2.98km',
+                              'pace': "4'02\"", 'zone': lp['zone']['name'] or '第二运动场'}
+                self._data['logs']['lptiyu'] += f'{dt.datetime.now().isoformat(timespec="seconds")} [signed] {lp["message"]}\n'
+            elif action == 'lptiyu_dry':
+                lp = self._data['lptiyu']
+                lp.update(state='checked', message='全链验证通过，未提交（演示）', busy=False)
+            elif action == 'lptiyu_sync':
+                self._data['lptiyu'].update(has_token=True, message='已同步研究库的最新凭证（演示）')
+            elif action in ('lptiyu_cancel',):
+                self._data['lptiyu'].update(busy=False, state='idle', message='已取消当前操作（演示）')
             elif action in ('account_add', 'account_switch', 'account_rename', 'account_delete'):
                 return self._preview_account(action, payload)
             elif action in ('hide', 'quit'):
