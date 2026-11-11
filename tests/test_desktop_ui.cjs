@@ -2202,6 +2202,15 @@ test('lptiyu capture walks from certificate to waiting',async()=>{
   assert.equal(waiting.calls.at(-1).action,'lptiyu_capture_stop');
 });
 
+test('lptiyu can run the capture self-check',async()=>{
+  const h=await lptiyuPage({has_token:true});
+  const button=h.el('lp-diagnose');
+  assert.ok(button,'采集区里要有自检按钮');
+  button.listeners.click();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(h.calls.at(-1).action,'lptiyu_diagnose');
+});
+
 test('lptiyu can export the trajectory samples',async()=>{
   const h=await lptiyuPage({has_token:true});
   const button=h.el('lp-export-samples');

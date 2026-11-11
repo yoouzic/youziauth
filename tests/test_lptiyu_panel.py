@@ -395,6 +395,9 @@ class FakeCapture:
         self.started = 0
         self.stops = []
         self.logs = []
+        self.state = "idle"
+        self.message = ""
+        self.connects = 0
 
     def log(self, message):
         self.logs.append(message)
@@ -427,6 +430,39 @@ class FakeCapture:
     def cert_status(self):
         return {"installed": self.ca.installed(),
                 "fingerprint": self.ca.fingerprint()}
+
+
+class DiagnoseTests(PanelTestCase):
+    def diagnose(self, installed=True, running=True, proxy_ok=True, connects=0):
+        controller = self.make_controller(capture=FakeCapture(installed=installed))
+        controller.capture.connects = connects
+        with patch.object(lptiyu_panel, 'wechat_protocol_registered', lambda: installed), \
+                patch.object(lptiyu_panel, 'wechat_installed', lambda: installed), \
+                patch.object(lptiyu_panel, '_wechat_running', lambda: running), \
+                patch('lptiyu_capture.proxy_self_test',
+                      lambda ca, **_kw: (proxy_ok, '代理链可用（200）')):
+            return controller.capture_diagnose()
+
+    def test_a_missing_wechat_is_the_verdict(self):
+        report = self.diagnose(installed=False)
+        self.assertIn('没有找到微信', report['verdict'])
+        self.assertFalse(report['wechat_installed'])
+
+    def test_wechat_not_running_is_the_verdict(self):
+        report = self.diagnose(running=False)
+        self.assertIn('没在运行', report['verdict'])
+
+    def test_a_broken_proxy_chain_is_the_verdict(self):
+        report = self.diagnose(proxy_ok=False)
+        self.assertIn('代理链不通', report['verdict'])
+
+    def test_zero_connections_with_a_healthy_chain_points_at_wechat(self):
+        report = self.diagnose(connects=0)
+        self.assertIn('没把流量交出来', report['verdict'])
+
+    def test_a_healthy_chain_with_traffic_says_capture_is_fine(self):
+        report = self.diagnose(connects=3)
+        self.assertIn('采集链正常', report['verdict'])
 
 
 class AutoCaptureTests(PanelTestCase):

@@ -59,6 +59,22 @@ def wechat_protocol_registered():
         return False
 
 
+def _wechat_running():
+    """微信进程在不在(tasklist 很轻, 一次 0.2s 左右)。"""
+    try:
+        done = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq WeChat.exe'],
+                              capture_output=True, text=True, timeout=8,
+                              creationflags=CREATE_NO_WINDOW, errors='replace')
+        if 'WeChat.exe' in (done.stdout or ''):
+            return True
+        done = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq Weixin.exe'],
+                              capture_output=True, text=True, timeout=8,
+                              creationflags=CREATE_NO_WINDOW, errors='replace')
+        return 'Weixin.exe' in (done.stdout or '')
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def wechat_installed():
     return wechat_protocol_registered() or any(os.path.isfile(p) for p in WECHAT_EXES)
 
@@ -302,7 +318,7 @@ class LptiyuController:
             settings = self.store.settings()
         except Exception:  # noqa: BLE001 —— 设置坏了不轰炸，由快照呈现
             return
-        if not settings.enabled or self.store.is_signed_today():
+        if not settings.enabled or self.store.is_signed_today(self._clock().date()):
             return
         current = self._clock()
         try:
@@ -436,6 +452,59 @@ class LptiyuController:
             pass
         self._capture_auto = True
         return bool(self.start('capture'))
+
+    def capture_diagnose(self):
+        """采集自检: 一条条量给你看, 外加一次真实的代理链测试。
+
+        这一套是为了回答「明明点了开始采集, 为什么一个请求都没有」——
+        微信在不在、跑的什么版本、代理链通不通、上次采集收没收到连接。
+        """
+        from lptiyu_capture import proxy_self_test
+
+        protocol = wechat_protocol_registered()
+        installed = wechat_installed()
+        running = _wechat_running()
+        try:
+            cert = self.capture.cert_status()
+        except Exception:              # noqa: BLE001
+            cert = {'installed': False, 'fingerprint': ''}
+        try:
+            enable, server, _override = self.capture.proxy.read()
+            proxy = {'enable': int(enable), 'server': str(server)}
+        except Exception:              # noqa: BLE001
+            proxy = {'enable': None, 'server': ''}
+        proxy_ok, proxy_detail = proxy_self_test(self.capture.ca)
+        connects = int(getattr(self.capture, 'connects', 0))
+        try:
+            log_tail = (self.store.root / 'capture' / 'capture.log').read_text(
+                encoding='utf-8', errors='replace').splitlines()[-15:]
+        except OSError:
+            log_tail = []
+        report = {
+            'wechat_protocol': protocol,
+            'wechat_installed': installed,
+            'wechat_running': running,
+            'cert': cert,
+            'proxy': proxy,
+            'proxy_ok': proxy_ok,
+            'proxy_detail': proxy_detail,
+            'capture_state': self.capture.status().get('state'),
+            'connects': connects,
+            'log_tail': log_tail,
+        }
+        if not installed:
+            verdict = '本机没有找到微信（精简版/商店版也算没有）：装官方经典版微信后再试'
+        elif not running:
+            verdict = '微信没在运行：先打开微信、确认能进小程序，再点开始采集'
+        elif not proxy_ok:
+            verdict = f'代理链不通（{proxy_detail}）：先关掉 Clash 之类的代理软件再试'
+        elif connects == 0:
+            verdict = ('代理链没问题，但微信没把流量交出来：'
+                       '微信设置里不要单独设代理，或换经典版微信')
+        else:
+            verdict = '采集链正常：微信已经连上，只是还没拿到凭证'
+        report['verdict'] = verdict
+        return report
 
     def capture_stop(self):
         self.capture.stop('idle', '已停止采集')
@@ -644,7 +713,7 @@ class LptiyuController:
         成功时不写 latest —— 续期是维护动作, 不该把「今日跑步已完成」顶成
         「凭证可用」。台账(renewal.json)与历史里已经留了痕。
         """
-        if self.store.is_signed_today():
+        if self.store.is_signed_today(self._clock().date()):
             return None
         outcome = self.renewer.renew(force=False)
         if outcome.state == 'need_user':

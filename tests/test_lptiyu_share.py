@@ -89,6 +89,24 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(cell['status'], '1')
 
 
+class DiagnoseTests(unittest.TestCase):
+    def test_the_report_states_the_verdict_and_the_facts(self):
+        from lptiyu_share import build_diagnose
+        text = build_diagnose({
+            'verdict': '代理链没问题，但微信没把流量交出来',
+            'wechat_protocol': True, 'wechat_installed': True, 'wechat_running': False,
+            'cert': {'installed': True, 'fingerprint': '9B51D65FE21C8576'},
+            'proxy': {'enable': 1, 'server': '127.0.0.1:7897'},
+            'proxy_ok': True, 'proxy_detail': '代理链可用（api2.lptiyu.com 返回 200）',
+            'capture_state': 'timeout', 'connects': 0,
+            'log_tail': ['[23:52:00] 采集开始 127.0.0.1:5100'],
+        }, version='1.9.10')
+        self.assertIn('代理链没问题', text)
+        self.assertIn('没运行', text)
+        self.assertIn('9B51D65FE21C8576', text)
+        self.assertIn('CONNECT', text.replace('采集开始', 'CONNECT'))
+
+
 class TrackAxisTests(unittest.TestCase):
     """从真实通过点估朝向: 点太少不猜, 点够且主方向明确才给值。"""
 

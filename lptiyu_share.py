@@ -151,6 +151,46 @@ def capture_log_tail(store, lines=40):
     return [line for line in text.splitlines() if line.strip()][-lines:]
 
 
+def build_diagnose(report, version="", now=None):
+    """采集自检结果写成一份能直接发回来的小报告。"""
+    now = now or dt.datetime.now()
+    report = report or {}
+    cert = report.get("cert") or {}
+    proxy = report.get("proxy") or {}
+    lines = [
+        "# 乐跑采集自检（youziauth）",
+        "",
+        f"- 时间：{now.isoformat(timespec='seconds')}",
+        f"- 版本：{version or '—'}",
+        "",
+        "## 结论",
+        "",
+        f"**{report.get('verdict') or '—'}**",
+        "",
+        "## 逐项",
+        "",
+        "| 检查 | 结果 |",
+        "|---|---|",
+        f"| weixin:// 协议 | {'已注册' if report.get('wechat_protocol') else '未注册'} |",
+        f"| 微信安装 | {'找到' if report.get('wechat_installed') else '没找到'} |",
+        f"| 微信进程 | {'在运行' if report.get('wechat_running') else '没运行'} |",
+        f"| 采集证书 | {'已安装 ' + str(cert.get('fingerprint') or '')[:16] if cert.get('installed') else '未安装'} |",
+        f"| 系统代理 | {proxy.get('server') or '—'}（{'开' if proxy.get('enable') else '关'}） |",
+        f"| 代理链自测 | {report.get('proxy_detail') or '—'} |",
+        f"| 上次采集 | {report.get('capture_state') or '—'}，收到 {report.get('connects', 0)} 个连接 |",
+        "",
+    ]
+    tail = [str(line) for line in (report.get("log_tail") or [])]
+    if tail:
+        lines.append("## capture.log 末尾")
+        lines.append("")
+        lines.append("```")
+        lines.extend(tail)
+        lines.append("```")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def build_markdown(store, version="", now=None):
     """整份报告。store 需要 samples() / zones() / settings()。"""
     now = now or dt.datetime.now()

@@ -380,8 +380,12 @@ class Store:
             record.update(summary)
         self._write('signed.json', record)
 
-    def is_signed_today(self):
-        return self.signed_record().get('date') == now().date().isoformat()
+    def is_signed_today(self, today=None):
+        """今天打过卡没有。today 由调用方按自己的时钟给, 测试才不会跨零点漂移。"""
+        day = today or now().date()
+        if hasattr(day, 'isoformat'):
+            day = day.isoformat()
+        return self.signed_record().get('date') == str(day)
 
     # ------------------------------------------------------------- 跑区目录
     def zones(self):

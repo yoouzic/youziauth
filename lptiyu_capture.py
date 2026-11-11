@@ -31,6 +31,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from lptiyu.cipher import CipherError, unseal
@@ -130,6 +131,54 @@ def host_in_scope(host: str) -> bool:
 
 
 # ================================================================ 证书
+class _NullSink:
+    """自检用: 不关心抓到的内容。"""
+
+    connects = 0
+    requests = 0
+
+    def on_request(self, *_args):
+        pass
+
+    def on_login(self, *_args):
+        pass
+
+
+def proxy_self_test(ca, host="api2.lptiyu.com", timeout=15):
+    """临时起一个代理, 用它自己访问一次 lptiyu 接口。
+
+    证明的是「代理链本身通」: 起服务 → CONNECT → 用我们签的证书做 MITM →
+    上游 TLS → 拿到响应。这一步过了, 采集却 0 连接, 那问题一定在微信那一侧
+    (没打开小程序 / 不走系统代理), 不用再猜。
+    """
+    try:
+        ca.ensure()
+    except Exception as exc:              # noqa: BLE001
+        return False, f'证书生成失败: {exc}'
+    server = _ProxyServer(ca, _NullSink())
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever,
+                              name='youziauth-proxy-selftest', daemon=True)
+    thread.start()
+    try:
+        context = ssl.create_default_context(cafile=str(ca.cert_path))
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({'https': f'http://127.0.0.1:{port}'}),
+            urllib.request.HTTPSHandler(context=context))
+        with opener.open(f'https://{host}/v3/api.php/WpLogin/getSchoolInfo',
+                         timeout=timeout) as resp:
+            resp.read(64)
+            return True, f'代理链可用（{host} 返回 {resp.status}）'
+    except Exception as exc:              # noqa: BLE001
+        return False, f'{type(exc).__name__}: {exc}'
+    finally:
+        try:
+            server.shutdown()
+            server.server_close()
+        except OSError:
+            pass
+
+
 class CertificateAuthority:
     """本机专用 CA: 生成、签发站点证书、装卸(只动当前用户库)。"""
 
