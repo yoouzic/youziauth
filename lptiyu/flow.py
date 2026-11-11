@@ -49,10 +49,19 @@ def pace_text(seconds_per_km):
 
 class DailyFlow:
     def __init__(self, slot, policy=None, verbose=True, stop_event=None,
-                 log_fn=None, template_path=""):
+                 log_fn=None, template_path="", zone_profile=None, zone_tuning=None,
+                 zone_sink=None):
         self.slot = slot
+        # zone_tuning: 该跑区的人工特调(方向/贴点半径/跑道偏移); 每次读到真机
+        # 点位后由 zones.profile() 折成 zone_profile。zone_sink 让调用方留档。
+        self.zone_profile = dict(zone_profile or {})
+        self.zone_tuning = dict(zone_tuning) if zone_tuning is not None else None
+        self.zone_sink = zone_sink
+        # pace_lo/pace_hi = 用户指定的配速区间(秒/公里, 0/0=交给模板);
+        # pace_min/pace_max = 引擎自己的人工配速合理区间, 只用来兜住「不像人跑」的结果。
         self.policy = dict({"max_per_day": 1, "style": "template",
-                            "pace_lo": 185, "pace_hi": 560,
+                            "pace_lo": 0, "pace_hi": 0,
+                            "pace_min": 185, "pace_max": 560,
                             "dist_lo": 2.03, "dist_hi": 2.35}, **(policy or {}))
         self.v = verbose
         self.log_fn = log_fn or (lambda msg: None)   # UI/无控制台环境必须可注入
@@ -60,6 +69,24 @@ class DailyFlow:
         self.rnd = random.Random()
         self.stop_event = stop_event or threading.Event()
         self.lines = []                              # 本次运行的过程日志(留档)
+
+    def _pace_window(self):
+        """用户配速区间 (lo, hi) 秒/公里; (0, 0) = 不指定, 交给模板/默认。
+
+        pace_target 是 1.9.0 的单点写法, 外部调用方可能还在用: 当成上下限相同。
+        """
+        try:
+            lo = int(self.policy.get("pace_lo") or 0)
+            hi = int(self.policy.get("pace_hi") or 0)
+        except (TypeError, ValueError):
+            return (0, 0)
+        if lo and hi and lo <= hi:
+            return (lo, hi)
+        try:
+            legacy = int(self.policy.get("pace_target") or 0)
+        except (TypeError, ValueError):
+            legacy = 0
+        return (legacy, legacy) if legacy and not (lo or hi) else (0, 0)
 
     # ------------------------------------------------------------ 基础
     def log(self, msg):
@@ -103,6 +130,18 @@ class DailyFlow:
         if len(pts) < 2:
             raise ApiError(4, "跑区打卡点缺失")
         rule0 = (cfg.get("time_rule_arr") or [{}])[0]
+        if self.zone_tuning is not None:
+            # 用这一次真机返回的点位算场地几何: 每块场地的朝向/宽窄都不同,
+            # 贴点半径、跑道与起步方位必须按场地算, 不能吃全局默认。
+            from . import zones as zone_geom
+            self.zone_profile = zone_geom.profile([(p[0], p[1]) for p in pts],
+                                                  self.zone_tuning)
+            self.log(f"[1a] 场地 长轴={self.zone_profile.get('long_axis_deg')}° "
+                     f"长宽={self.zone_profile.get('length_m')}x"
+                     f"{self.zone_profile.get('width_m')}m "
+                     f"方向={self.zone_profile.get('direction')} "
+                     f"跑道={self.zone_profile.get('lane_m')}m "
+                     f"贴点={self.zone_profile.get('anchor_m')}m")
         rule = {
             "zone": str(cfg.get("run_zone_id") or ""),
             "zone_name": str(cfg.get("run_zone_name") or ""),
@@ -111,6 +150,13 @@ class DailyFlow:
             "min_d": float(rule0.get("min_distance") or 2.0),
             "max_d": float(rule0.get("max_distance") or 10.0),
         }
+        if self.zone_sink:      # 跑区点位与清单: 界面据此为每块场地做选点特调
+            try:
+                self.zone_sink(rule["zone"], rule["zone_name"],
+                               [{"id": p[2], "lat": p[0], "lng": p[1]} for p in pts],
+                               cfg.get("run_zone_list") or [])
+            except Exception:   # noqa: BLE001 —— 留档失败不该拦住这一次跑步
+                pass
         self.log(f"[1] 跑区={rule['zone']}({rule['zone_name']}) "
                  f"打卡点x{len(pts)} 学期={rule['term_id']} "
                  f"距离窗={rule['min_d']}~{rule['max_d']}km")
@@ -145,13 +191,19 @@ class DailyFlow:
     def _gen_track(self, rule, style):
         """返回 (track, kind, used_s, dist_km, meta)。重试保证覆盖+窗口。
 
+        配速区间(pace_lo~pace_hi 秒/公里)对两个引擎都生效:
+          * template: 直接按区间采样每公里用时, 反推全程 used(模板点只提供形状);
+          * ring: 引擎有自己的速度曲线, 生成后把时间轴整体缩放, 让实配速落进区间。
         模板不可用时自动落到 ring 引擎: ring 不依赖个人数据, 永远可用。
         """
         lo = max(rule["min_d"] + 0.02, self.policy["dist_lo"])
         hi = min(self.policy["dist_hi"], rule["max_d"] - 0.02)
+        pace_lo, pace_hi = self._pace_window()
+        # 跑区特调优先于全局采点精度: 窄场地必须贴得更紧
+        anchor_max = float(self.zone_profile.get("anchor_m")
+                           or self.policy.get("anchor_max_m",
+                                              spec.CHECKIN_RADIUS_M))
         if style == "template":
-            anchor_max = float(self.policy.get("anchor_max_m",
-                                               spec.CHECKIN_RADIUS_M))
             try:
                 for attempt in range(10):
                     target = self.rnd.uniform(lo, hi)
@@ -159,24 +211,24 @@ class DailyFlow:
                                      "longtitude": p[1]} for p in rule["pts"]]
                     gen = TRK.TemplateShift(anchor_dicts, distance_km=target,
                                             seed=self.rnd.randint(0, 10 ** 9),
-                                            template_path=self.template_path)
+                                            template_path=self.template_path,
+                                            profile=self.zone_profile)
                     track, meta = gen.generate(return_meta=True)
                     dist_km = meta["path_m"] / 1000.0
                     covered = all(c <= anchor_max for c in meta["anchor_cover"])
                     self.log(f"[4.{attempt}] tpl 点={len(track)} 距离={dist_km:.2f}km "
                              f"锚点近距={meta['anchor_cover']}")
                     if covered and rule["min_d"] <= dist_km <= rule["max_d"]:
-                        pt = self.policy.get("pace_target")   # 秒/公里; 0=模板自动
-                        if pt:
-                            used = max(60, int(round(
-                                dist_km * float(pt) * self.rnd.uniform(0.99, 1.01))))
+                        if pace_lo:
+                            pace = self.rnd.uniform(pace_lo, pace_hi)
+                            used = max(60, int(round(dist_km * pace)))
                         else:
                             used = TRK.used_seconds(track)
-                            if not (self.policy["pace_lo"] <= used / dist_km
-                                    <= self.policy["pace_hi"]):
+                            if not (self.policy["pace_min"] <= used / dist_km
+                                    <= self.policy["pace_max"]):
                                 used = int(dist_km * self.rnd.uniform(230, 480))
                         self.log(f"[4] tpl 用时={used}s 实配速={used / dist_km:.1f}s/km "
-                                 f"(pace_target={pt or 'auto'})")
+                                 f"(区间={f'{pace_lo}-{pace_hi}' if pace_lo else 'auto'})")
                         return track, "template", used, dist_km, meta
             except FileNotFoundError:
                 self.log("[4] 模板缺失 → 自动改用 ring 引擎")
@@ -184,14 +236,24 @@ class DailyFlow:
         for attempt in range(12):
             target_m = self.rnd.uniform(lo, hi) * 1000
             track, crossings, used, dist_km = TRK.ring_track(
-                rule["pts"], target_m, self.rnd)
+                rule["pts"], target_m, self.rnd, profile=self.zone_profile)
             pace = used / dist_km if dist_km > 0 else 9e9
             covered = all(p[2] in crossings for p in rule["pts"])
             self.log(f"[4.{attempt}] ring 点={len(track)} 距离={dist_km}km "
                      f"用时={used}s 配速={pace:.0f}s/km 覆盖={covered}")
             if covered and rule["min_d"] <= dist_km <= rule["max_d"] \
-                    and self.policy["pace_lo"] <= pace <= self.policy["pace_hi"]:
-                return track, "ring", used, dist_km, {"crossings": crossings}
+                    and self.policy["pace_min"] <= pace <= self.policy["pace_max"]:
+                scale = 1.0
+                if pace_lo:
+                    # ring 的速度曲线是引擎自己的; 把时间轴整体缩放, 让实配速落进区间。
+                    want = max(60, int(round(dist_km * self.rnd.uniform(pace_lo, pace_hi))))
+                    scale = want / max(used, 1)
+                    used = want
+                    self.log(f"[4] ring 时间轴缩放 x{scale:.3f} → "
+                             f"实配速={used / dist_km:.1f}s/km "
+                             f"(区间={pace_lo}-{pace_hi})")
+                return track, "ring", used, dist_km, {"crossings": crossings,
+                                                      "time_scale": scale}
         raise ApiError(4, f"轨迹生成失败 style={style} (重试耗尽)")
 
     # ------------------------------------------------------------ 主入口
@@ -233,7 +295,8 @@ class DailyFlow:
                                                  start_time, end_time)
             else:
                 log_rows = TRK.log_data_ring(rule["pts"], track,
-                                             meta["crossings"], start_time)
+                                             meta["crossings"], start_time,
+                                             scale=meta.get("time_scale", 1.0))
             steps = TRK.step_info(used)
             step_num = int(sum(steps["list"]))
 

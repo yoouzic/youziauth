@@ -2,6 +2,7 @@
 import datetime
 import json
 import math
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -146,9 +147,10 @@ class FakeClient:
                            'distance': 2.31})
 
 
-def make_flow(slot, policy=None, template_path=''):
+def make_flow(slot, policy=None, template_path='', zone_tuning=None, zone_sink=None):
     flow = lptiyu_flow.DailyFlow(slot, policy=policy, log_fn=lambda message: None,
-                                 template_path=template_path)
+                                 template_path=template_path,
+                                 zone_tuning=zone_tuning, zone_sink=zone_sink)
     flow._sleep = lambda sec: None          # 测试不等真实间隔
     return flow
 
@@ -256,6 +258,143 @@ class SubmitTests(unittest.TestCase):
         distance = out['stopRun_biz']['distance']
         self.assertTrue(0.95 <= used / (distance * 240) <= 1.05,
                         'pace_target=240 时全程用时应贴近 4\'00"/km')
+
+    def test_pace_window_lands_inside_the_range(self):
+        slot = FakeSlot()
+        slot.client = FakeClient({})
+        flow = make_flow(slot, policy={'pace_lo': 245, 'pace_hi': 255, 'dist_lo': 2.9,
+                                       'dist_hi': 3.1},
+                         template_path=self.template)
+        out, code = flow.run(submit=False)
+        self.assertEqual(code, 0)
+        used = out['stopRun_biz']['used_time']
+        distance = out['stopRun_biz']['distance']
+        pace = used / distance
+        self.assertTrue(245 <= pace <= 255,
+                        f'配速区间 4\'05"–4\'15" 要真的落在区间里, 实际 {pace:.1f}s/km')
+
+    def test_ring_fallback_still_honours_the_pace_window(self):
+        # 没有模板时走 ring: 引擎有自己的速度曲线, 靠缩放时间轴把配速拉进区间。
+        slot = FakeSlot()
+        slot.client = FakeClient({})
+        flow = make_flow(slot, policy={'pace_lo': 300, 'pace_hi': 320, 'dist_lo': 2.9,
+                                       'dist_hi': 3.1})
+        out, code = flow.run(submit=False)
+        self.assertEqual(code, 0)
+        used = out['stopRun_biz']['used_time']
+        distance = out['stopRun_biz']['distance']
+        self.assertTrue(300 <= used / distance <= 320,
+                        f'ring 路径也要按区间跑, 实际 {used / distance:.1f}s/km')
+        start = out['stopRun_biz']['start_time']
+        self.assertLessEqual(max(row['time'] for row in out['log_data']), start + used,
+                             '缩放后日志时间不能超出本次用时')
+
+
+class ZoneProfileTests(unittest.TestCase):
+    """跑区特调进流水线: 点位留档、场地几何进日志、方向真的按跑区走。"""
+
+    ANCHORS = [(29.8237, 106.4302, '1'), (29.8245, 106.4315, '2'),
+               (29.8231, 106.4318, '3'), (29.8223, 106.4305, '4')]
+
+    def test_live_points_are_reported_to_the_sink(self):
+        slot = FakeSlot()
+        slot.client = FakeClient({})
+        seen = []
+        flow = make_flow(slot, policy={'dist_lo': 2.9, 'dist_hi': 3.1},
+                         zone_tuning={'direction': 'cw', 'anchor_m': 15, 'lane_m': 6},
+                         zone_sink=lambda *args: seen.append(args))
+        out, code = flow.run(submit=False)
+        self.assertEqual(code, 0)
+        self.assertTrue(seen, '点位与跑区清单要交给调用方留档')
+        zone_id, zone_name, points, zone_list = seen[0]
+        self.assertEqual(zone_id, '1874')
+        self.assertEqual(len(points), 4)
+        self.assertEqual(points[0]['id'], '1')
+        self.assertIsInstance(zone_list, list)
+        self.assertTrue(any('场地' in line or '长轴' in line for line in flow.lines),
+                        '这次跑的是哪块场地、什么朝向, 日志里要看得见')
+
+    def test_sink_failure_never_blocks_the_run(self):
+        slot = FakeSlot()
+        slot.client = FakeClient({})
+
+        def broken(*_args):
+            raise OSError('disk full')
+
+        flow = make_flow(slot, policy={'dist_lo': 2.9, 'dist_hi': 3.1},
+                         zone_tuning={}, zone_sink=broken)
+        _out, code = flow.run(submit=False)
+        self.assertEqual(code, 0, '留档失败不该拦住跑步')
+
+    def test_ring_track_follows_the_zone_direction(self):
+        from lptiyu import tracks
+
+        def winding(track):
+            clat = sum(p['a'] for p in track) / len(track)
+            clng = sum(p['o'] for p in track) / len(track)
+            total, prev = 0.0, None
+            for point in track:
+                angle = math.atan2(point['a'] - clat,
+                                   (point['o'] - clng) * math.cos(math.radians(clat)))
+                if prev is not None:
+                    total += (angle - prev + math.pi) % (2 * math.pi) - math.pi
+                prev = angle
+            return total
+
+        ccw = tracks.ring_track(self.ANCHORS, 2000, random.Random(7),
+                                profile={'direction': 'ccw', 'lane_m': 5})
+        cw = tracks.ring_track(self.ANCHORS, 2000, random.Random(7),
+                               profile={'direction': 'cw', 'lane_m': 5})
+        self.assertGreater(winding(ccw[0]), 0, 'ccw 跑区必须逆时针')
+        self.assertLess(winding(cw[0]), 0, 'cw 跑区必须顺时针')
+        self.assertEqual(sorted(ccw[1]), sorted(cw[1]), '两个方向都要经过全部打卡点')
+
+    def test_zone_lane_keeps_the_field_clear_of_the_anchors(self):
+        from lptiyu import tracks
+
+        track, crossings, _used, _dist = tracks.ring_track(
+            self.ANCHORS, 1600, random.Random(3),
+            profile={'direction': 'ccw', 'lane_m': 9})
+        self.assertEqual(sorted(crossings), ['1', '2', '3', '4'])
+        for lat, lng, _pid in self.ANCHORS:
+            nearest = min(tracks.haversine_m(p['a'], p['o'], lat, lng) for p in track)
+            self.assertLess(nearest, 20.0, '再大的车道也要靠到打卡点')
+
+
+class TemplateScaleTests(unittest.TestCase):
+    """模板迁移的各向异性缩放: 场地长宽比不同时不能只用一把尺子。"""
+
+    def test_scales_differ_when_the_target_is_squarer(self):
+        from lptiyu.tracks import TemplateShift, geo_of
+
+        lat0, lng0 = 29.82, 106.43
+
+        def box(width_m, height_m):
+            return [geo_of(-width_m / 2, -height_m / 2, lat0, lng0),
+                    geo_of(width_m / 2, -height_m / 2, lat0, lng0),
+                    geo_of(width_m / 2, height_m / 2, lat0, lng0),
+                    geo_of(-width_m / 2, height_m / 2, lat0, lng0)]
+
+        shift = TemplateShift(anchors=[], template=[{'a': lat0, 'o': lng0,
+                                                     's': 2.6, 'c': '0.05'}])
+        pairs = list(zip(box(100, 50), box(100, 100)))
+        sx, sy = shift._axis_scales(pairs, 0.0, 1.0, (lat0, lng0), (lat0, lng0))
+        self.assertGreater(abs(sx - sy), 0.2, '长宽比不同就该两个方向分别缩放')
+        self.assertLessEqual(max(sx, sy), 1.6 + 1e-6, '缩放比要有上限, 免得把场地拉变形')
+
+    def test_generate_reports_both_scales(self):
+        slot = FakeSlot()
+        slot.client = FakeClient({})
+        flow = make_flow(slot, policy={'dist_lo': 2.9, 'dist_hi': 3.1})
+        flow.zone_profile = {'direction': 'ccw', 'lane_m': 4.0, 'anchor_m': 18.0}
+        # 用现成的迷你模板走一遍真实模板路径
+        with tempfile.TemporaryDirectory() as tmp:
+            flow.template_path = make_template(Path(tmp))
+            out, code = flow.run(submit=False)
+        self.assertEqual(code, 0)
+        scale_xy = out['meta'].get('scale_xy')
+        self.assertIsInstance(scale_xy, tuple)
+        self.assertEqual(len(scale_xy), 2, '两个方向的缩放都要报出来')
 
 
 class PaceTextTests(unittest.TestCase):

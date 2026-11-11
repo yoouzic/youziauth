@@ -9,6 +9,7 @@ import ctypes
 import os
 import subprocess
 import tempfile
+import time
 from ctypes import wintypes
 from pathlib import Path
 from typing import Protocol
@@ -110,6 +111,15 @@ def atomic_write_bytes(path: Path, value: bytes) -> None:
             file.write(value)
             file.flush()
             os.fsync(file.fileno())
+        # A reader can briefly block replacement on Windows.
+        for delay in (0.05, 0.1, 0.2):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError as exc:
+                if getattr(exc, "winerror", None) not in (5, 32):
+                    raise
+                time.sleep(delay)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)

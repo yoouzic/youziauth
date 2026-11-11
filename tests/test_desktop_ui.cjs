@@ -72,9 +72,13 @@ function harness(source='windows',extras={}){
   // 老快照没有 lptiyu 层（lptiyu:false 就是那种机器）；有则给一份完整默认区块。
   if(extras.lptiyu!==false)data.lptiyu={state:'idle',message:'尚未开始今天的跑步',busy:false,available:true,
     settings:{enabled:false,run_time:'06:30',zone_id:'',zone_name:'',dist_lo:2.03,dist_hi:2.35,
-              pace_target:0,anchor_max_m:20,max_per_day:1,time_lo:'06:00',time_hi:'23:00',api_proxy:'',lab_dir:''},
+              pace_lo:0,pace_hi:0,pace_target:0,anchor_max_m:20,max_per_day:1,time_lo:'06:00',time_hi:'23:00',
+              api_proxy:'',lab_dir:'',auto_renew:true,renew_lead_min:45,renew_interval_min:180},
     schedule:'自动跑步：关闭',identity:{name:'演示同学',student_num:'2026000000'},
     has_token:false,token_age_hours:null,zone:{id:'',name:''},today_done:0,today_max:1,last:null,
+    pace_range:{lo:0,hi:0},
+    renewal:{auto:true,state:'',message:'',next_due:'',last_success:'',failures:0,
+             interval_min:180,lead_min:45},
     ...(extras.lptiyu||{})};
   // 老快照没有账号层；accounts:false 就是那种机器，别的 extras 只覆盖清单里的字段。
   if(extras.accounts!==false)data.accounts={...accountsFixture(),...(extras.accounts||{})};
@@ -2076,6 +2080,7 @@ test('a snapshot without the lptiyu layer still renders every page',async()=>{
   await h.refresh();
   assert.equal(h.el('lp-badge').textContent,'看看今天的安排','老快照没有乐跑区块时按「尚未开始」呈现');
   assert.equal(h.el('lp-summary').textContent,'');
+  assert.match(h.el('lp-renew-line').textContent,/等待状态同步/,'没有续期台账就不要替它编节奏');
 });
 
 test('lptiyu states read as their own words on the overview card and the page',async()=>{
@@ -2098,18 +2103,109 @@ test('lptiyu waiting for credentials explains the one thing to do',async()=>{
 
 test('lptiyu settings sync from the snapshot and save through the bridge',async()=>{
   const h=await lptiyuPage({settings:{enabled:true,run_time:'06:30',dist_lo:2.9,dist_hi:3.1,
-    pace_target:240,anchor_max_m:20,max_per_day:1,time_lo:'06:00',time_hi:'23:00'}});
+    pace_lo:245,pace_hi:280,anchor_max_m:20,max_per_day:1,time_lo:'06:00',time_hi:'23:00',
+    auto_renew:true,renew_lead_min:45,renew_interval_min:180},pace_range:{lo:245,hi:280}});
   assert.equal(h.el('lp-enabled').checked,true);
+  assert.equal(h.el('lp-auto-renew').checked,true,'自动续期开关跟着快照走');
   assert.equal(String(h.el('lp-dist-lo').value),'2.9');
-  assert.equal(String(h.el('lp-pace').value),'240');
-  assert.equal(h.el('lp-pace-hint').textContent,"4'00\"",'配速输入框的旁注要换成分钟秒');
+  assert.equal(h.el('lp-pace-lo').value,"4'05\"",'配速按分钟加秒回填');
+  assert.equal(h.el('lp-pace-hi').value,"4'40\"");
+  assert.equal(h.el('lp-pace-hint').textContent,"4'05\"–4'40\"",'旁注要写出区间');
+  assert.equal(h.el('lp-pace-detail').textContent,"4'05\"–4'40\"",'任务卡里的目标配速也跟着走');
   assert.equal(h.el('lp-auto-summary').textContent,'06:30 自动');
   h.el('lp-dist-hi').value='3.2';
   await h.el('lptiyu-form').fire('submit');
   await new Promise(resolve=>setTimeout(resolve,0));
   assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1))),{action:'lptiyu_save',payload:{enabled:true,run_time:'06:30',
-    dist_lo:2.9,dist_hi:3.2,pace_target:240,anchor_max_m:20}},
+    dist_lo:2.9,dist_hi:3.2,pace_lo:245,pace_hi:280,anchor_max_m:20,auto_renew:true,
+    zone_id:'',zone_name:'',zone_direction:'auto',zone_anchor_m:0,zone_lane_m:0}},
     '合法修改按表单内容发往后台');
+});
+
+test('lptiyu zones pick a field and save its own tuning',async()=>{
+  const settings={enabled:true,run_time:'06:30',zone_id:'1873',zone_name:'第二运动场',
+    dist_lo:2.03,dist_hi:2.35,pace_lo:0,pace_hi:0,anchor_max_m:20,max_per_day:1,
+    time_lo:'06:00',time_hi:'23:00',auto_renew:true,renew_lead_min:45,renew_interval_min:180,
+    api_proxy:'',lab_dir:''};
+  const h=await lptiyuPage({settings,
+    zones:[{id:'1873',name:'第二运动场',default:false,points:4},
+           {id:'1874',name:'第一运动场',default:true,points:4},
+           {id:'1876',name:'南区操场',default:false,points:0}],
+    zone:{id:'1873',name:'第二运动场',
+          tuning:{direction:'cw',lane_m:5,anchor_m:12,start_deg:0},
+          summary:{text:'长轴东西 · 96m×64m · 顺时针 · 跑道 5.0m · 贴点 12m'}}});
+  assert.equal(h.el('lp-zone').options.length,4,'当前跑区 + 目录里的三个');
+  assert.equal(h.el('lp-zone').value,'1873');
+  assert.equal(h.el('lp-zone-hint').textContent,
+    '长轴东西 · 96m×64m · 顺时针 · 跑道 5.0m · 贴点 12m','这块场地的朝向要写在选跑区旁边');
+  assert.equal(h.el('lp-zone-direction').value,'cw','特调跟着跑区回填');
+  assert.equal(String(h.el('lp-zone-anchor').value),'12');
+  assert.equal(String(h.el('lp-zone-lane').value),'5');
+  assert.match(h.el('lp-zone').options[3].textContent,/未同步/,'没点位的跑区要标出来');
+  h.el('lp-zone').value='1874';
+  h.el('lp-zone').fire('change');
+  assert.equal(h.el('lp-zone-direction').value,'auto','换场地就把特调清回自动, 别把 A 的调参写到 B 上');
+  assert.equal(String(h.el('lp-zone-anchor').value),'');
+  await h.el('lptiyu-form').fire('submit');
+  await new Promise(resolve=>setTimeout(resolve,0));
+  const saved=h.calls.at(-1);
+  assert.equal(saved.action,'lptiyu_save');
+  assert.equal(saved.payload.zone_id,'1874');
+  assert.equal(saved.payload.zone_name,'第一运动场');
+  h.el('lp-zones').listeners.click();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(h.calls.at(-1).action,'lptiyu_zones','同步跑区按钮要真的叫后台去抓点位');
+});
+
+test('lptiyu pace accepts minutes and seconds, and refuses nonsense',async()=>{
+  const h=await lptiyuPage({settings:{enabled:true,run_time:'06:30',dist_lo:2.03,dist_hi:2.35,
+    pace_lo:0,pace_hi:0,anchor_max_m:20,max_per_day:1,time_lo:'06:00',time_hi:'23:00',
+    auto_renew:true,renew_lead_min:45,renew_interval_min:180},pace_range:{lo:0,hi:0}});
+  assert.equal(h.el('lp-pace-lo').value,'','区间为空时输入框留空, 占位符说自动');
+  assert.equal(h.el('lp-pace-hint').textContent,'自动');
+  h.el('lp-pace-lo').value="4'10\"";
+  h.el('lp-pace-hi').value='5:00';
+  h.el('lp-pace-hi').fire('input');
+  assert.equal(h.el('lp-pace-hint').textContent,"4'10\"–5'00\"",'边输边算, 两种写法都认');
+  await h.el('lptiyu-form').fire('submit');
+  await new Promise(resolve=>setTimeout(resolve,0));
+  const saved=h.calls.at(-1);
+  assert.equal(saved.action,'lptiyu_save');
+  assert.equal(saved.payload.pace_lo,250);
+  assert.equal(saved.payload.pace_hi,300);
+  const bad=await lptiyuPage({});
+  bad.el('lp-pace-lo').value='4分';
+  await bad.el('lptiyu-form').fire('submit');
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(bad.calls.filter(call=>call.action==='lptiyu_save').length,0,
+    '看不懂的写法不发往后台');
+  const inverted=await lptiyuPage({});
+  inverted.el('lp-pace-lo').value="5'00\"";
+  inverted.el('lp-pace-hi').value="4'30\"";
+  await inverted.el('lptiyu-form').fire('submit');
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(inverted.calls.filter(call=>call.action==='lptiyu_save').length,0,
+    '下限比上限慢时不发往后台');
+});
+
+test('lptiyu auto renew reads as its own line under the credential card',async()=>{
+  const h=await lptiyuPage({has_token:true,renewal:{auto:true,state:'ok',message:'凭证可用',
+    next_due:'2026-11-11T14:30:00',last_success:'2026-11-11T11:30:00',failures:0,
+    interval_min:180,lead_min:45}});
+  assert.equal(h.el('lp-renew-line').textContent,
+    '自动续期：每 3 小时确认一次，下次 14:30','续期行要写清节奏与下次时间');
+  const off=await lptiyuPage({has_token:true,
+    settings:{enabled:true,run_time:'06:30',zone_id:'',zone_name:'',dist_lo:2.03,dist_hi:2.35,
+              pace_target:0,anchor_max_m:20,max_per_day:1,time_lo:'06:00',time_hi:'23:00',
+              api_proxy:'',lab_dir:'',auto_renew:false,renew_lead_min:45,renew_interval_min:180},
+    renewal:{auto:false,state:'',message:'',next_due:'',interval_min:180,lead_min:45}});
+  assert.match(off.el('lp-renew-line').textContent,/自动续期已关闭/);
+  assert.equal(off.el('lp-auto-renew').checked,false);
+  const waiting=await lptiyuPage({has_token:false,renewal:{auto:true,state:'need_user',
+    message:'凭证已失效：在小程序里打开一次跑步首页',next_due:'2026-11-11T12:10:00',
+    failures:1,interval_min:180,lead_min:45}});
+  assert.match(waiting.el('lp-renew-line').textContent,/打开一次跑步首页/,'待办要出现在续期行里');
+  assert.equal(waiting.el('lp-token-badge').textContent,'待同步');
 });
 
 test('an inverted distance range is refused before reaching the bridge',async()=>{

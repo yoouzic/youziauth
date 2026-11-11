@@ -1262,12 +1262,33 @@ class LptiyuBridgeTests(unittest.TestCase):
     def test_lptiyu_save_roundtrips_settings(self):
         result = self.bridge.dispatch('lptiyu_save', {
             'enabled': True, 'run_time': '06:30', 'dist_lo': 2.9, 'dist_hi': 3.1,
-            'pace_target': 240, 'anchor_max_m': 20, 'max_per_day': 1,
+            'pace_lo': 245, 'pace_hi': 280, 'anchor_max_m': 20, 'max_per_day': 1,
             'time_lo': '06:00', 'time_hi': '23:00'})
         self.assertTrue(result['ok'])
         settings = self.store.settings()
         self.assertTrue(settings.enabled)
-        self.assertEqual(settings.pace_target, 240)
+        self.assertEqual(settings.pace_range(), (245, 280))
+
+    def test_saving_a_range_clears_the_legacy_single_pace(self):
+        from lptiyu_store import Settings as LptiyuSettings
+
+        self.store.save_settings(LptiyuSettings(enabled=True, pace_target=240))
+        result = self.bridge.dispatch('lptiyu_save', {
+            'enabled': True, 'run_time': '06:30', 'pace_lo': 245, 'pace_hi': 280})
+        self.assertTrue(result['ok'])
+        settings = self.store.settings()
+        self.assertEqual(settings.pace_range(), (245, 280))
+        self.assertEqual(settings.pace_target, 0, '区间一旦存在, 旧单点字段就该让位')
+
+    def test_snapshot_answers_the_effective_pace_range(self):
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertEqual(state['pace_range'], {'lo': 0, 'hi': 0}, '默认交给模板')
+        from lptiyu_store import Settings as LptiyuSettings
+
+        self.store.save_settings(LptiyuSettings(enabled=True, pace_target=240))
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertEqual(state['pace_range'], {'lo': 240, 'hi': 240},
+                         '旧版单点配速在快照里也要读成一个区间')
 
     def test_lptiyu_save_rejects_inverted_range_with_the_specific_reason(self):
         result = self.bridge.dispatch('lptiyu_save', {
@@ -1283,13 +1304,99 @@ class LptiyuBridgeTests(unittest.TestCase):
         # sync 在后台线程写状态文件, 等它收尾再进入临时目录清理, 否则清理会撞上写入
         self.controller._wait_for_work()
 
+    def test_snapshot_carries_the_renewal_ledger_without_the_token(self):
+        self.store.record_renewal('ok', '凭证可用',
+                                  next_due='2026-11-11T10:00:00')
+        state = self.bridge.snapshot()['lptiyu']
+        renewal = state['renewal']
+        self.assertTrue(renewal['auto'], '自动续期默认开')
+        self.assertEqual(renewal['state'], 'ok')
+        self.assertEqual(renewal['next_due'], '2026-11-11T10:00:00')
+        self.assertEqual(renewal['interval_min'], 180)
+        self.assertEqual(renewal['lead_min'], 45)
+        self.assertTrue(state['settings']['auto_renew'])
+        self.assertNotIn('LP-SECRET-TOKEN', str(renewal))
+
+    def test_lptiyu_renew_starts_the_controller(self):
+        result = self.bridge.dispatch('lptiyu_renew')
+        self.assertTrue(result['ok'])
+        self.assertIn('续期', result['message'])
+        self.controller._wait_for_work()
+
+    def test_lptiyu_save_keeps_the_fields_the_form_does_not_show(self):
+        from lptiyu_store import Settings as LptiyuSettings
+
+        self.store.save_settings(LptiyuSettings(
+            enabled=True, run_time='06:30', zone_id='1873', zone_name='第二运动场',
+            max_per_day=2, renew_interval_min=240, lab_dir='D:/lab'))
+        result = self.bridge.dispatch('lptiyu_save', {
+            'enabled': True, 'run_time': '07:00', 'dist_lo': 2.0, 'dist_hi': 2.4,
+            'pace_target': 0, 'anchor_max_m': 20, 'auto_renew': False})
+        self.assertTrue(result['ok'])
+        settings = self.store.settings()
+        self.assertEqual(settings.run_time, '07:00')
+        self.assertFalse(settings.auto_renew)
+        self.assertEqual(settings.zone_id, '1873', '界面不露出的字段不该被保存重置')
+        self.assertEqual(settings.max_per_day, 2)
+        self.assertEqual(settings.renew_interval_min, 240)
+        self.assertEqual(settings.lab_dir, 'D:/lab')
+
+    def test_lptiyu_save_roundtrips_the_auto_renew_switch(self):
+        result = self.bridge.dispatch('lptiyu_save', {
+            'enabled': True, 'run_time': '06:30', 'dist_lo': 2.03, 'dist_hi': 2.35,
+            'pace_target': 0, 'anchor_max_m': 20, 'max_per_day': 1,
+            'time_lo': '06:00', 'time_hi': '23:00', 'auto_renew': False})
+        self.assertTrue(result['ok'])
+        self.assertFalse(self.store.settings().auto_renew)
+
+    def test_snapshot_lists_zones_and_the_selected_field(self):
+        from lptiyu_store import Settings as LptiyuSettings
+
+        self.store.save_zone_list([{'id': '1873', 'name': '第二运动场', 'is_default': 0},
+                                   {'id': '1874', 'name': '第一运动场', 'is_default': 1}])
+        self.store.save_zone_points('1874', '第一运动场', [
+            {'id': '1', 'lat': 29.8237, 'lng': 106.4302},
+            {'id': '2', 'lat': 29.8245, 'lng': 106.4315},
+            {'id': '3', 'lat': 29.8231, 'lng': 106.4318}])
+        self.store.save_settings(LptiyuSettings(
+            enabled=True, run_time='06:30', zone_id='1874', zone_name='第一运动场'))
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertEqual([zone['id'] for zone in state['zones']], ['1874', '1873'],
+                         '默认跑区排前面')
+        self.assertEqual(state['zone']['id'], '1874')
+        self.assertEqual(state['zone']['name'], '第一运动场')
+        self.assertIn('贴点', state['zone']['summary']['text'])
+        self.assertEqual(state['zone']['tuning']['direction'], 'auto')
+        self.assertNotIn('29.82', str(state['zone']['summary']), '几何摘要不该带坐标')
+
+    def test_saving_a_zone_keeps_its_own_tuning(self):
+        result = self.bridge.dispatch('lptiyu_save', {
+            'enabled': True, 'run_time': '06:30', 'zone_id': '1874',
+            'zone_name': '第一运动场', 'zone_direction': 'cw',
+            'zone_anchor_m': 12, 'zone_lane_m': 5})
+        self.assertTrue(result['ok'])
+        self.assertEqual(self.store.settings().zone_id, '1874')
+        self.assertEqual(self.store.zone_tuning('1874')['direction'], 'cw')
+        self.assertEqual(self.store.zone_tuning('1874')['anchor_m'], 12.0)
+
+    def test_lptiyu_zones_starts_the_controller(self):
+        with patch.object(type(self.controller), '_sync_zones',
+                          lambda controller: controller._set_latest('zones', '已同步')):
+            result = self.bridge.dispatch('lptiyu_zones')
+        self.assertTrue(result['ok'])
+        self.assertIn('跑区', result['message'])
+        self.controller._wait_for_work()
+
     def test_preview_bridge_has_a_self_consistent_lptiyu_block(self):
         preview = PreviewBridge()
         state = preview.snapshot()['lptiyu']
         self.assertTrue(state['available'])
         self.assertIn('settings', state)
+        self.assertTrue(state['renewal']['auto'])
         self.assertTrue(preview.dispatch('lptiyu_run')['ok'])
         self.assertEqual(preview.snapshot()['lptiyu']['state'], 'signed')
+        self.assertTrue(preview.dispatch('lptiyu_renew')['ok'])
+        self.assertEqual(preview.snapshot()['lptiyu']['renewal']['state'], 'ok')
 
 
 if __name__ == '__main__':

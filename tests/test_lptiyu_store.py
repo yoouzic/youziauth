@@ -24,6 +24,29 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Settings(pace_target=60).validate()
 
+    def test_pace_range_rejects_inverted_bounds(self):
+        with self.assertRaises(ValueError):
+            Settings(pace_lo=300, pace_hi=250).validate()
+
+    def test_pace_range_rejects_implausible_speed(self):
+        with self.assertRaises(ValueError):
+            Settings(pace_lo=60, pace_hi=90).validate()
+
+    def test_pace_range_needs_both_bounds(self):
+        with self.assertRaises(ValueError):
+            Settings(pace_lo=245, pace_hi=0).validate()
+
+    def test_pace_range_treats_the_legacy_single_value_as_a_point(self):
+        self.assertEqual(Settings().pace_range(), (0, 0))
+        self.assertEqual(Settings(pace_target=240).pace_range(), (240, 240))
+        self.assertEqual(Settings(pace_lo=245, pace_hi=280).pace_range(), (245, 280))
+
+    def test_pace_range_survives_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.save_settings(Settings(pace_lo=245, pace_hi=280))
+            self.assertEqual(store.settings().pace_range(), (245, 280))
+
     def test_settings_survive_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp))
@@ -173,6 +196,50 @@ class LabSyncTests(unittest.TestCase):
             self.assertNotIn('token', changes)
             self.assertFalse(store.has_token())
 
+    def test_renewal_can_adopt_a_consumed_token_that_is_still_alive(self):
+        # 研究库把「提交完」记成 consumed, 但实测 token 只由下一次 loginByCode 轮换才死;
+        # 续期路径允许采纳它, 由真门探活裁决, 否则每次都要把用户赶去重开小程序。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lab = self._lab(root, consumed=True)
+            store = Store(root / 'store')
+            store.save_settings(Settings(lab_dir=str(lab)))
+            changes, _ = store.sync_from_lab(include_consumed=True)
+            self.assertIn('token', changes)
+            self.assertEqual(store.token(), 'LABTOKEN')
+            self.assertEqual(store.token_record()['source'], 'lab-consumed')
+
+    def test_sync_picks_the_member_matching_the_local_identity(self):
+        # 研究库是多成员白名单, active 只是「上次在用的那个」; 按 active 取会把
+        # 别人的号装进来。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lab = root / 'lab'
+            (lab / 'data').mkdir(parents=True, exist_ok=True)
+            (lab / 'lpctl.py').write_text('# lab stub\n', encoding='utf-8')
+            config = {
+                'schema': 'lptiyu-lab/1', 'active': 'OTHER',
+                'members': {
+                    'OTHER': {'uid': 111, 'school_id': 837, 'student_num': 'OTHER',
+                              'name': '别人', 'alias': '别人', 'enabled': True,
+                              'auth': {'token': 'OTHERTOKEN',
+                                       'issued_at': '2026-11-11T09:00:00'}},
+                    '222025321102104': {
+                        'uid': 17987537, 'school_id': 837,
+                        'student_num': '222025321102104', 'card_id': '222025321102104',
+                        'name': '陈同学', 'alias': '陈同学', 'enabled': True,
+                        'auth': {'token': 'MYTOKEN', 'issued_at': '2026-11-11T01:07:18'}},
+                },
+            }
+            (lab / 'config.json').write_text(json.dumps(config, ensure_ascii=False),
+                                             encoding='utf-8')
+            store = Store(root / 'store')
+            store.save_identity({'student_num': '222025321102104', 'uid': '17987537'})
+            store.save_settings(Settings(lab_dir=str(lab)))
+            changes, _ = store.sync_from_lab()
+            self.assertIn('token', changes)
+            self.assertEqual(store.token(), 'MYTOKEN')
+
     def test_sync_without_lab_reports_clearly(self):
         # 封闭性: 桌面已知文件夹的自动发现可能命中本机真实研究库, 必须钉死为空,
         # 否则这台装着研究库的机器上, 「没有 lab」的路径永远测不到。
@@ -183,6 +250,105 @@ class LabSyncTests(unittest.TestCase):
                 changes, message = store.sync_from_lab()
                 self.assertEqual(changes, [])
                 self.assertIn('未找到', message)
+
+
+class ZoneCatalogTests(unittest.TestCase):
+    """跑区目录: 清单、点位、每块场地的特调都各自落盘。"""
+
+    POINTS = [{'id': '1', 'lat': 29.8237, 'lng': 106.4302},
+              {'id': '2', 'lat': 29.8245, 'lng': 106.4315},
+              {'id': '3', 'lat': 29.8231, 'lng': 106.4318}]
+
+    def test_zone_list_merges_names_and_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.save_zone_list([{'id': '1873', 'name': '第二运动场', 'is_default': 0}])
+            store.save_zone_list([{'id': '1873', 'name': '第二运动场（新）', 'is_default': 1},
+                                  {'id': '1874', 'name': '第一运动场', 'is_default': 0}])
+            catalog = store.zones()
+            self.assertEqual(set(catalog), {'1873', '1874'})
+            self.assertEqual(catalog['1873']['name'], '第二运动场（新）')
+            self.assertEqual(catalog['1873']['is_default'], 1)
+
+    def test_points_and_tuning_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.save_zone_points('1873', '第二运动场', self.POINTS,
+                                   tuning={'direction': 'cw', 'lane_m': 5})
+            entry = store.zones()['1873']
+            self.assertEqual(len(entry['points']), 3)
+            self.assertEqual(entry['tuning']['direction'], 'cw')
+            self.assertEqual(store.zone_tuning('1873')['lane_m'], 5.0)
+            summary = store.zone_summary('1873')
+            self.assertEqual(summary['zone_id'], '1873')
+            self.assertIn('贴点', summary['text'])
+            self.assertNotIn('29.82', summary['text'], '摘要不该带坐标')
+
+    def test_tuning_is_normalized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.save_zone_tuning('1873', {'direction': 'sideways', 'lane_m': -1})
+            self.assertEqual(store.zone_tuning('1873'),
+                             {'direction': 'auto', 'lane_m': 0.0,
+                              'anchor_m': 0.0, 'start_deg': 0.0})
+
+    def test_unknown_or_too_few_points_has_no_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            self.assertIsNone(store.zone_summary('nope'))
+            store.save_zone_points('1873', 'x', self.POINTS[:2])
+            self.assertIsNone(store.zone_summary('1873'))
+
+    def test_corrupt_catalog_degrades_to_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.root.mkdir(parents=True, exist_ok=True)
+            (store.root / 'zones.json').write_text('{broken', encoding='utf-8')
+            self.assertEqual(store.zones(), {})
+
+
+class RenewalLedgerTests(unittest.TestCase):
+    """续期台账: 只记时间与结果, 不含凭证; 坏文件不拖垮乐跑区块。"""
+
+    def test_success_sets_next_due_and_clears_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.record_renewal('error', '链路故障', next_due='2026-11-11T09:00:00')
+            self.assertEqual(store.renewal()['failures'], 1)
+            store.record_renewal('renewed', '已自动续期', next_due='2026-11-11T12:00:00',
+                                 detail='grab')
+            record = store.renewal()
+            self.assertEqual(record['state'], 'renewed')
+            self.assertEqual(record['failures'], 0)
+            self.assertEqual(record['next_due'], '2026-11-11T12:00:00')
+            self.assertTrue(record['last_success'])
+            self.assertIn('renewed', store.history())
+            self.assertNotIn('token', json.dumps(record).lower())
+
+    def test_events_are_capped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            for index in range(30):
+                store.record_renewal('error', f'第 {index} 次失败')
+            events = store.renewal()['events']
+            self.assertEqual(len(events), 20)
+            self.assertIn('第 29 次失败', json.dumps(events, ensure_ascii=False))
+
+    def test_corrupt_ledger_degrades_to_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.root.mkdir(parents=True, exist_ok=True)
+            (store.root / 'renewal.json').write_text('{broken', encoding='utf-8')
+            self.assertEqual(store.renewal(), {})
+
+    def test_record_renewal_never_touches_the_task_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.record('signed', '今日跑步已完成')
+            store.record_renewal('ok', '凭证可用')
+            self.assertEqual(store.status()['state'], 'signed',
+                             '续期是维护动作, 不该顶掉今日跑步的状态')
+            self.assertIn('[ok] 凭证可用', store.history())
 
 
 if __name__ == '__main__':

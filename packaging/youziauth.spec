@@ -36,8 +36,8 @@ gui_analysis = Analysis(
                    # 乐跑模块：desktop_bridge 首次访问控制器时才 import lptiyu_panel，
                    # 协议核心整包都是延迟导入，必须显式声明才会进包。
                    "lptiyu", "lptiyu.spec", "lptiyu.cipher", "lptiyu.tls", "lptiyu.wire",
-                   "lptiyu.client", "lptiyu.tracks", "lptiyu.upfile", "lptiyu.flow",
-                   "lptiyu_store", "lptiyu_panel"],
+                   "lptiyu.client", "lptiyu.tracks", "lptiyu.zones", "lptiyu.upfile", "lptiyu.flow",
+                   "lptiyu_store", "lptiyu_panel", "lptiyu_renew"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -120,33 +120,58 @@ def dorm_settings(payload):
                     payload.get('location_source', 'windows')).validate()
 
 
-def lptiyu_settings(payload):
+def lptiyu_settings(payload, previous=None):
+    """把界面提交的字段收成 Settings；**没提到的字段沿用上一份**。
+
+    界面只露出开关/时间/距离/配速/精度。跑区、每日次数、有效时段、研究库目录、
+    续期节奏这些只在配置里出现的字段，不能因为按一次「保存设置」就被重置回默认 ——
+    否则用户手调的续期间隔会在下一次点开关时静默消失。
+    """
     from lptiyu_store import Settings as LptiyuSettings  # noqa: PLC0415
 
-    def _float(value, default):
+    base = previous if isinstance(previous, LptiyuSettings) else LptiyuSettings()
+
+    def _float(key, default):
         try:
-            return float(value)
-        except (TypeError, ValueError):
+            return float(payload.get(key, getattr(base, key)))
+        except (AttributeError, TypeError, ValueError):
             return default
 
-    def _int(value, default):
+    def _int(key, default):
         try:
-            return int(value)
-        except (TypeError, ValueError):
+            return int(payload.get(key, getattr(base, key)))
+        except (AttributeError, TypeError, ValueError):
             return default
 
+    def _text(key, fallback=''):
+        value = payload.get(key, getattr(base, key, fallback))
+        text = '' if value is None else str(value).strip()
+        return text or fallback
+
+    def _flag(key):
+        return bool(payload.get(key, getattr(base, key, False)))
+
+    # 表单一旦带上区间, 旧版单点配速就让位: 免得两个字段互相打架。
+    has_range = 'pace_lo' in payload or 'pace_hi' in payload
     return LptiyuSettings(
-        enabled=bool(payload.get('enabled', False)),
-        run_time=str(payload.get('run_time', '')).strip() or '06:30',
-        zone_id=str(payload.get('zone_id', '')).strip(),
-        zone_name=str(payload.get('zone_name', '')).strip(),
-        dist_lo=_float(payload.get('dist_lo'), 2.03),
-        dist_hi=_float(payload.get('dist_hi'), 2.35),
-        pace_target=_int(payload.get('pace_target'), 0),
-        anchor_max_m=_float(payload.get('anchor_max_m'), 20.0),
-        max_per_day=_int(payload.get('max_per_day'), 1),
-        time_lo=str(payload.get('time_lo', '')).strip() or '06:00',
-        time_hi=str(payload.get('time_hi', '')).strip() or '23:00',
+        enabled=_flag('enabled'),
+        run_time=_text('run_time', '06:30'),
+        zone_id=_text('zone_id'),
+        zone_name=_text('zone_name'),
+        dist_lo=_float('dist_lo', 2.03),
+        dist_hi=_float('dist_hi', 2.35),
+        pace_lo=_int('pace_lo', 0),
+        pace_hi=_int('pace_hi', 0),
+        pace_target=0 if has_range else _int('pace_target', base.pace_target or 0),
+        anchor_max_m=_float('anchor_max_m', 20.0),
+        max_per_day=_int('max_per_day', 1),
+        time_lo=_text('time_lo', '06:00'),
+        time_hi=_text('time_hi', '23:00'),
+        api_proxy=_text('api_proxy'),
+        lab_dir=_text('lab_dir'),
+        auto_renew=_flag('auto_renew'),
+        renew_lead_min=_int('renew_lead_min', 45),
+        renew_interval_min=_int('renew_interval_min', 180),
     ).validate()
 
 
@@ -361,7 +386,11 @@ class DesktopBridge(LocationProbe):
                  'available': False, 'settings': None, 'schedule': '',
                  'identity': {}, 'has_token': False, 'token_age_hours': None,
                  'zone': {'id': '', 'name': ''}, 'today_done': 0, 'today_max': 1,
-                 'last': None}
+                 'last': None,
+                 'pace_range': {'lo': 0, 'hi': 0},
+                 'renewal': {'auto': False, 'state': '', 'message': '',
+                             'next_due': '', 'last_success': '',
+                             'failures': 0, 'interval_min': 0, 'lead_min': 0}}
         controller = self._lptiyu
         if controller is None:
             empty['message'] = '乐跑功能在本机暂不可用'
@@ -396,6 +425,21 @@ class DesktopBridge(LocationProbe):
             if signed.get('date'):
                 last = {'date': signed.get('date'), 'distance': signed.get('distance', ''),
                         'pace': signed.get('pace', ''), 'zone': signed.get('zone', '')}
+            renewal = store.renewal()
+            try:
+                failures = int(renewal.get('failures') or 0)
+            except (TypeError, ValueError):
+                failures = 0
+            zones = []
+            for zone_id, entry in (store.zones() or {}).items():
+                if not isinstance(entry, dict):
+                    continue
+                zones.append({'id': str(zone_id),
+                              'name': str(entry.get('name') or ''),
+                              'default': bool(entry.get('is_default')),
+                              'points': len(entry.get('points') or [])})
+            zones.sort(key=lambda zone: (not zone['default'], zone['name'] or zone['id']))
+            selected = str(settings.zone_id or '')
             return {
                 'state': state, 'message': message, 'busy': bool(controller.busy),
                 'available': True,
@@ -409,6 +453,25 @@ class DesktopBridge(LocationProbe):
                 'today_done': int(daily.get('run', 0)),
                 'today_max': settings.max_per_day,
                 'last': last,
+                # 配速区间是后端算好的(含旧版单点配速的迁移), 界面不再自己拼。
+                'pace_range': dict(zip(('lo', 'hi'), settings.pace_range())),
+                # 跑区: 目录给下拉框, 选中跑区的几何摘要给「特调」这行字。
+                'zones': zones,
+                'zone': {'id': selected,
+                         'name': str(settings.zone_name or ''),
+                         'tuning': store.zone_tuning(selected) if selected else
+                                   {'direction': 'auto', 'lane_m': 0.0,
+                                    'anchor_m': 0.0, 'start_deg': 0.0},
+                         'summary': store.zone_summary(selected) if selected else None},
+                # 续期台账: 只回答「何时试过/下次何时/结果」, 依旧不含凭证。
+                'renewal': {'auto': bool(settings.auto_renew),
+                            'state': str(renewal.get('state') or ''),
+                            'message': str(renewal.get('message') or ''),
+                            'next_due': str(renewal.get('next_due') or ''),
+                            'last_success': str(renewal.get('last_success') or ''),
+                            'failures': failures,
+                            'interval_min': int(settings.renew_interval_min),
+                            'lead_min': int(settings.renew_lead_min)},
             }
         except Exception:  # noqa: BLE001 —— 乐跑区块读不动时只降级这一块
             empty['message'] = '乐跑设置暂时无法读取'
@@ -736,7 +799,8 @@ class DesktopBridge(LocationProbe):
             if not self._dorm.start(action.removeprefix('dorm_')):
                 raise RuntimeError('打卡操作正在进行，请等待完成或取消当前操作。')
             return '操作已开始，请查看任务状态'
-        if action in ('lptiyu_run', 'lptiyu_dry', 'lptiyu_sync'):
+        if action in ('lptiyu_run', 'lptiyu_dry', 'lptiyu_sync', 'lptiyu_renew',
+                      'lptiyu_zones'):
             controller = self._lptiyu
             if controller is None:
                 raise RuntimeError('乐跑功能在本机暂不可用')
@@ -744,6 +808,10 @@ class DesktopBridge(LocationProbe):
                 raise RuntimeError('乐跑操作正在进行，请等待完成或取消当前操作。')
             if action == 'lptiyu_sync':
                 return '正在同步凭证，请稍候'
+            if action == 'lptiyu_renew':
+                return '正在确认并续期凭证，请稍候'
+            if action == 'lptiyu_zones':
+                return '正在读取每个跑区的打卡点，请稍候'
             return '操作已开始，请查看任务状态'
         if action == 'lptiyu_cancel':
             controller = self._lptiyu
@@ -758,11 +826,21 @@ class DesktopBridge(LocationProbe):
             if controller.busy:
                 raise RuntimeError('请等待当前跑步操作完成后再保存设置。')
             try:
-                settings = lptiyu_settings(payload)
+                previous = controller.store.settings()
+            except Exception:  # noqa: BLE001 —— 设置坏了按默认起步, 由 validate 兜底
+                previous = None
+            try:
+                settings = lptiyu_settings(payload, previous=previous)
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from None
             controller.store.save_settings(settings)
-            return '自动跑步设置已保存'
+            if settings.zone_id and any(key in payload for key in
+                                        ('zone_direction', 'zone_anchor_m', 'zone_lane_m')):
+                controller.store.save_zone_tuning(settings.zone_id, {
+                    'direction': payload.get('zone_direction', 'auto'),
+                    'anchor_m': payload.get('zone_anchor_m', 0),
+                    'lane_m': payload.get('zone_lane_m', 0)})
+            return '跑步、跑区与续期设置已保存'
         if action == 'dorm_cancel':
             # 多账号：每个账号都有自己的控制器在跑，「取消当前操作」必须能取消所有账号里
             # 正在进行的那一个，否则用户看着 A 的页面就取消不了 B 的操作。
@@ -1172,7 +1250,19 @@ class PreviewBridge(LocationProbe):
                        'has_token':True, 'token_age_hours':3.2,
                        'zone':{'id':'', 'name':''}, 'today_done':0, 'today_max':1,
                        'last':{'date':dt.date.today().isoformat(), 'distance':'2.31km',
-                               'pace':"4'05\"", 'zone':'第一运动场'}},
+                               'pace':"4'05\"", 'zone':'第一运动场'},
+                       'pace_range':{'lo':0, 'hi':0},
+                       'zones':[{'id':'1873', 'name':'演示·第二运动场', 'default':False, 'points':4},
+                                {'id':'1874', 'name':'演示·第一运动场', 'default':True, 'points':4},
+                                {'id':'1876', 'name':'演示·南区操场', 'default':False, 'points':0}],
+                       'zone':{'id':'', 'name':'',
+                               'tuning':{'direction':'auto','lane_m':0.0,'anchor_m':0.0,'start_deg':0.0},
+                               'summary':None},
+                       'renewal':{'auto':True, 'state':'ok', 'message':'凭证可用',
+                                  'next_due':(dt.datetime.now()+dt.timedelta(hours=3))
+                                             .isoformat(timespec='seconds'),
+                                  'last_success':dt.datetime.now().isoformat(timespec='seconds'),
+                                  'failures':0, 'interval_min':180, 'lead_min':45}},
             'accounts': {'error':'', 'max':MAX_ACCOUNTS, 'active':'demo1', 'busy':False,
                          'items':[{'id':'demo1', 'name':'演示账号一', 'active':True,
                                    'has_idm_credentials':True, 'idm_username':'2026000000',
@@ -1383,8 +1473,22 @@ class PreviewBridge(LocationProbe):
                 d['schedule'] = '自动打卡：关闭'
             elif action == 'lptiyu_save':
                 lp = self._data['lptiyu']
-                lp['settings'] = dataclasses.asdict(lptiyu_settings(payload))
+                previous = lptiyu_settings(lp['settings'])
+                lp['settings'] = dataclasses.asdict(lptiyu_settings(payload, previous=previous))
                 lp['schedule'] = '自动跑步：' + ('开启（演示）' if lp['settings']['enabled'] else '关闭')
+                lp['renewal']['auto'] = bool(lp['settings']['auto_renew'])
+                lp['renewal']['interval_min'] = int(lp['settings']['renew_interval_min'])
+                lp['renewal']['lead_min'] = int(lp['settings']['renew_lead_min'])
+                lo, hi = lptiyu_settings(lp['settings']).pace_range()
+                lp['pace_range'] = {'lo': lo, 'hi': hi}
+                selected = str(lp['settings'].get('zone_id') or '')
+                zone = next((item for item in lp['zones'] if item['id'] == selected), None)
+                lp['zone'] = {'id': selected, 'name': zone['name'] if zone else '',
+                              'tuning': {'direction': str(payload.get('zone_direction') or 'auto'),
+                                         'lane_m': float(payload.get('zone_lane_m') or 0.0),
+                                         'anchor_m': float(payload.get('zone_anchor_m') or 0.0),
+                                         'start_deg': 0.0},
+                              'summary': None}
             elif action == 'lptiyu_run':
                 lp = self._data['lptiyu']
                 lp.update(state='signed', message="今日跑步已完成 · 2.98km · 配速 4'02\"/km（演示）",
@@ -1397,6 +1501,24 @@ class PreviewBridge(LocationProbe):
                 lp.update(state='checked', message='全链验证通过，未提交（演示）', busy=False)
             elif action == 'lptiyu_sync':
                 self._data['lptiyu'].update(has_token=True, message='已同步研究库的最新凭证（演示）')
+            elif action == 'lptiyu_zones':
+                lp = self._data['lptiyu']
+                for index, zone in enumerate(lp['zones']):
+                    if not zone['points']:
+                        lp['zones'][index] = dict(zone, points=4)
+                lp.update(state='zones', message='已同步 3 个跑区的点位（演示）')
+                self._data['logs']['lptiyu'] += (
+                    f'{dt.datetime.now().isoformat(timespec="seconds")} [zones] 已同步跑区点位（演示）\n')
+            elif action == 'lptiyu_renew':
+                lp = self._data['lptiyu']
+                lp.update(has_token=True, message='已确认凭证可用（演示）')
+                lp['renewal'].update(state='ok', message='凭证可用', failures=0,
+                                     last_success=dt.datetime.now().isoformat(timespec='seconds'),
+                                     next_due=(dt.datetime.now()+dt.timedelta(
+                                         minutes=lp['renewal'].get('interval_min') or 180))
+                                     .isoformat(timespec='seconds'))
+                self._data['logs']['lptiyu'] += (
+                    f'{dt.datetime.now().isoformat(timespec="seconds")} [ok] 凭证可用（演示）\n')
             elif action in ('lptiyu_cancel',):
                 self._data['lptiyu'].update(busy=False, state='idle', message='已取消当前操作（演示）')
             elif action in ('account_add', 'account_switch', 'account_rename', 'account_delete'):

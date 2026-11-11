@@ -118,6 +118,10 @@ def _anchor_ring(anchors):
     return sorted(anchors, key=angle), clat, clng
 
 
+def _clamp(value, lo, hi):
+    return max(lo, min(hi, value))
+
+
 def _circular_mean(angles):
     s = sum(math.sin(a) for a in angles)
     c = sum(math.cos(a) for a in angles)
@@ -140,22 +144,50 @@ class TemplateShift:
     """把真人模板迁移到当前跑区: 相位对齐 + 相似变换 + 距离缩放 + 噪声。"""
 
     def __init__(self, anchors, distance_km=None, seed=None, pace_factor=None,
-                 template=None, template_path=""):
+                 template=None, template_path="", profile=None):
         self.rnd = random.Random(seed)
         self.anchors = _norm_anchors(anchors)
         self.distance_km = distance_km
         self.pace_factor = (pace_factor if pace_factor is not None
                             else self.rnd.uniform(0.82, 1.18))
+        self.profile = dict(profile or {})     # 跑区特调(lptiyu.zones.profile)
         self.tpl = template if template is not None else load_template(template_path)
 
-    def _map(self, scale, rot, src_c, dst_c):
+    def _map(self, sx, sy, rot, src_c, dst_c):
         cos_r, sin_r = math.cos(rot), math.sin(rot)
         out = []
         for p in self.tpl:
             x, y = enu_of(p["a"], p["o"], *src_c)
-            out.append(geo_of(scale * (x * cos_r - y * sin_r),
-                              scale * (x * sin_r + y * cos_r), *dst_c))
+            out.append(geo_of(sx * (x * cos_r - y * sin_r),
+                              sy * (x * sin_r + y * cos_r), *dst_c))
         return out
+
+    def _axis_scales(self, pairs, rot, scale, src_c, dst_c):
+        """各向异性缩放: 两块场地的长宽比不同时, 只用一个 scale 会把场地拉歪。
+
+        旋转对齐之后分别量源环/目标环在 x/y 上的跨度, 得到两个方向的缩放;
+        比值离整体尺度太远(点位太少或本身就是异形场地)就退回各向同性。
+        """
+        cos_r, sin_r = math.cos(rot), math.sin(rot)
+        src_x, src_y, dst_x, dst_y = [], [], [], []
+        for (sa, so), (da, do_) in pairs:
+            x, y = enu_of(sa, so, *src_c)
+            src_x.append(x * cos_r - y * sin_r)
+            src_y.append(x * sin_r + y * cos_r)
+            dx, dy = enu_of(da, do_, *dst_c)
+            dst_x.append(dx)
+            dst_y.append(dy)
+
+        def span(values):
+            return max(values) - min(values)
+
+        ex, ey = span(src_x), span(src_y)
+        gx, gy = span(dst_x), span(dst_y)
+        fx = gx / ex if ex > 20 and gx > 20 else scale
+        fy = gy / ey if ey > 20 and gy > 20 else scale
+        fx = _clamp(fx, scale / 1.6, scale * 1.6)
+        fy = _clamp(fy, scale / 1.6, scale * 1.6)
+        return fx, fy
 
     def generate(self, return_meta=False):
         rnd = self.rnd
@@ -187,10 +219,14 @@ class TemplateShift:
                 rots.append(math.atan2(dy, dx) - math.atan2(sy, sx))
             scale = sum(scales) / len(scales)
             rot = _circular_mean(rots)
+            sx_scale, sy_scale = self._axis_scales(
+                pairs, rot, scale, (src_clat, src_clng), (dst_clat, dst_clng))
         else:
             scale, rot = 1.0, 0.0
+            sx_scale = sy_scale = scale
 
-        coords = self._map(scale, rot, (src_clat, src_clng), (dst_clat, dst_clng))
+        coords = self._map(sx_scale, sy_scale, rot,
+                           (src_clat, src_clng), (dst_clat, dst_clng))
 
         if self.distance_km:
             cur = path_len_m(coords)
@@ -220,6 +256,7 @@ class TemplateShift:
         meta = {
             "center": (round(dst_clat, 6), round(dst_clng, 6)),
             "scale": round(scale, 4),
+            "scale_xy": (round(sx_scale, 4), round(sy_scale, 4)),
             "rot_deg": round(math.degrees(rot), 1),
             "pace_factor": round(self.pace_factor, 3),
             "path_m": round(path_len_m([(p["a"], p["o"]) for p in track])),
@@ -231,41 +268,50 @@ class TemplateShift:
 
 
 # ================================================================ ring 引擎
-def ring_track(anchors, target_m, rnd=None):
-    """锚点环多圈轨迹。anchors: [(lat,lng,pid)]; 返回 (track, crossings, used_s, dist_km)。"""
+def ring_track(anchors, target_m, rnd=None, profile=None):
+    """锚点环多圈轨迹。anchors: [(lat,lng,pid)]; profile: lptiyu_zones.profile()。
+
+    跑区特调在这里落地: 路线顺着点位环的环向、从场地长轴一侧起步, 并按该跑区
+    的车道宽度外扩 —— 换一块朝向不同的场地, 轨迹跟着转, 而不是每次随机起步。
+    """
+    from . import zones as zone_geom      # 延迟导入: zones 复用本模块的几何原语
+
     rnd = rnd or random.Random()
-    order = list(anchors)
-    if rnd.random() < 0.5:
-        order = order[::-1]
-    k = rnd.randrange(len(order))
-    order = order[k:] + order[:k]
+    prof = dict(profile or {})
+    pts3 = []
+    for index, a in enumerate(anchors):
+        if isinstance(a, dict):
+            lng = a["longitude"] if "longitude" in a else a["longtitude"]
+            pts3.append((float(a["latitude"]), float(lng), str(a.get("point_id", index))))
+        else:
+            pts3.append((float(a[0]), float(a[1]),
+                         str(a[2]) if len(a) > 2 else str(index)))
+    plain = [(p[0], p[1]) for p in pts3]
+    geom = zone_geom.analyze(plain)
+    direction = prof.get("direction") or geom["winding"]
+    lane = float(prof.get("lane_m") or 0.0)
+    start_deg = prof.get("start_deg")
 
-    def midpoint(a, b, wobble):
-        m = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
-        d = haversine_m(a[0], a[1], b[0], b[1])
-        lat_o = math.copysign(wobble * d / 111000.0 * rnd.uniform(0.5, 1.0),
-                              rnd.random() - 0.5)
-        lng_o = math.copysign(wobble * d / (111000.0 * math.cos(math.radians(m[0])))
-                              * rnd.uniform(0.5, 1.0), rnd.random() - 0.5)
-        return (m[0] + lat_o, m[1] + lng_o)
+    route = []
+    for _lap in range(200):
+        lap = zone_geom.route_points(plain, lane_m=lane + rnd.uniform(-0.6, 0.6),
+                                     direction=direction, start_deg=start_deg, rnd=rnd)
+        if len(lap) < 2:
+            break
+        if route:
+            route.pop()                    # 接圈处不留重复点
+        route.extend(lap)
+        if path_len_m(route) >= target_m * 1.15:
+            break
+    if len(route) < 2:                     # 退化: 两点场地就往返跑
+        route = plain + plain[::-1]
 
-    perim = sum(haversine_m(order[i][0], order[i][1],
-                            order[(i + 1) % len(order)][0],
-                            order[(i + 1) % len(order)][1])
-                for i in range(len(order)))
-    route, lap = [], 0
-    while perim * (lap + 1) < target_m * 1.15:
-        ox, oy = rnd.uniform(-6e-5, 6e-5), rnd.uniform(-6e-5, 6e-5)
-        seq = [(p[0] + ox, p[1] + oy) for p in order]
-        for i in range(len(seq)):
-            a, b = seq[i], seq[(i + 1) % len(seq)]
-            route.append(a)
-            route.append(midpoint(a, b, 0.16))
-        lap += 1
-    route.append(route[0])
+    clat = sum(p[0] for p in route) / len(route)
+    clng = sum(p[1] for p in route) / len(route)
+    xy = [enu_of(p[0], p[1], clat, clng) for p in route]
     cum = [0.0]
-    for a, b in zip(route, route[1:]):
-        cum.append(cum[-1] + haversine_m(a[0], a[1], b[0], b[1]))
+    for a, b in zip(xy, xy[1:]):
+        cum.append(cum[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
 
     def at(s):
         s = min(max(s, 0.0), cum[-1] - 0.01)
@@ -279,8 +325,8 @@ def ring_track(anchors, target_m, rnd=None):
         i = max(lo - 1, 0)
         seg = cum[i + 1] - cum[i] or 1.0
         t = (s - cum[i]) / seg
-        return (route[i][0] + (route[i + 1][0] - route[i][0]) * t,
-                route[i][1] + (route[i + 1][1] - route[i][1]) * t)
+        return (xy[i][0] + (xy[i + 1][0] - xy[i][0]) * t,
+                xy[i][1] + (xy[i + 1][1] - xy[i][1]) * t)
 
     base_v = rnd.uniform(3.45, 3.95)
     period = rnd.uniform(150, 230)
@@ -296,24 +342,25 @@ def ring_track(anchors, target_m, rnd=None):
             v *= 0.55 + 0.45 * (t / 30)
         if target_m - s < 100:         # 收尾减速
             v *= max(0.18, (target_m - s) / 100)
-        la, lo_ = at(s)
-        for cp in anchors:             # 打卡点减速(真人停走形态)
+        mx, my = at(s)
+        la, lo_ = geo_of(mx, my, clat, clng)
+        for cp in pts3:                # 打卡点减速(真人停走形态)
             if haversine_m(la, lo_, cp[0], cp[1]) < spec.BJ_SLOWDOWN_M - 4 \
                     and rnd.random() < 0.45:
                 v *= rnd.uniform(0.35, 0.6)
                 break
         v = max(0.02, min(v, 6.2))
-        jl = jl * 0.86 + rnd.gauss(0, 1.6) / 111000.0
-        jn = jn * 0.86 + rnd.gauss(0, 1.9) / 111000.0 / math.cos(math.radians(la))
+        jl = jl * 0.86 + rnd.gauss(0, 1.6)          # 米
+        jn = jn * 0.86 + rnd.gauss(0, 1.9)
         if rnd.random() < 0.008:
-            jl += rnd.uniform(-0.00012, 0.00012)
-            jn += rnd.uniform(-0.00012, 0.00012)
-        lat, lng = la + jl, lo_ + jn
+            jl += rnd.uniform(-13.0, 13.0)
+            jn += rnd.uniform(-13.0, 13.0)
+        lat, lng = geo_of(mx + jl, my + jn, clat, clng)
 
         pt = {"a": quantize_geo(lat), "o": quantize_geo(lng)}
         if i > 0 and rnd.random() > 0.004:
             pt["s"] = round(max(0.02, v + rnd.gauss(0, 0.15)), 2)
-        dmin = min(haversine_m(pt["a"], pt["o"], cp[0], cp[1]) for cp in anchors)
+        dmin = min(haversine_m(pt["a"], pt["o"], cp[0], cp[1]) for cp in pts3)
         b = None
         if dmin < spec.BJ_SLOWDOWN_M:
             b = 2 if rnd.random() < 0.75 else (1 if rnd.random() < 0.4 else None)
@@ -327,14 +374,14 @@ def ring_track(anchors, target_m, rnd=None):
         pt["c"] = f"{min(c, 0.60):.2f}"
         track.append(pt)
 
-        for cp in anchors:
+        for cp in pts3:
             if cp[2] not in crossings \
                     and haversine_m(pt["a"], pt["o"], cp[0], cp[1]) <= spec.BJ_SLOWDOWN_M:
                 crossings[cp[2]] = (i, s)
         s += v * (spec.SAMPLE_DT + rnd.uniform(-0.02, 0.02))
         t += spec.SAMPLE_DT
         i += 1
-        if s >= target_m and all(cp[2] in crossings for cp in anchors):
+        if s >= target_m and all(cp[2] in crossings for cp in pts3):
             break
         if i > 460:
             break
@@ -393,7 +440,8 @@ def log_data_template(track, anchors, start_time, end_time, rnd=None):
     return entries
 
 
-def log_data_ring(anchors, track, crossings, start_ts):
+def log_data_ring(anchors, track, crossings, start_ts, scale=1.0):
+    """ring log_data。scale 缩放时间轴(配速区间把引擎速度整体拉快/拉慢时用)。"""
     rows = []
     cum = [0.0]
     for a, b in zip(track, track[1:]):
@@ -411,7 +459,7 @@ def log_data_ring(anchors, track, crossings, start_ts):
         rows.append({
             "latitude": p["a"], "longitude": p["o"],
             "distance": "0.0" if dkm == 0 else dkm,
-            "point_id": str(pid), "time": int(start_ts + idx * spec.SAMPLE_DT),
+            "point_id": str(pid), "time": int(start_ts + idx * spec.SAMPLE_DT * scale),
             "longtitude": p["o"],
         })
     return rows

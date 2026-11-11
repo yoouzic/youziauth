@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from windows_credentials import (
     CredentialMigrationError,
@@ -53,6 +54,43 @@ class CredentialStoreTests(unittest.TestCase):
             store.clear_password()
 
             self.assertFalse(store.credential_path.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows readers can block replacement")
+    def test_save_retries_until_a_reader_releases_the_previous_credential(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            protector = DpapiProtector(machine_scope=False)
+            store = CredentialStore(root, protector)
+            store.save_password("fixture-before")
+            replace_file = os.replace
+
+            with store.credential_path.open("rb") as reader:
+                def replace_after_reader_releases(source, destination):
+                    try:
+                        replace_file(source, destination)
+                    except PermissionError:
+                        self.assertEqual(store.load_password(), "fixture-before")
+                        reader.close()
+                        raise
+
+                with patch("windows_credentials.os.replace", side_effect=replace_after_reader_releases) as replace:
+                    store.save_password("fixture-after")
+
+            self.assertEqual(replace.call_count, 2)
+            self.assertEqual(CredentialStore(root, protector).load_password(), "fixture-after")
+
+    @unittest.skipUnless(os.name == "nt", "Windows readers can block replacement")
+    def test_save_preserves_previous_credential_when_reader_keeps_file_open(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = CredentialStore(root, ReversibleProtector())
+            store.save_password("fixture-before")
+
+            with store.credential_path.open("rb"), self.assertRaises(PermissionError):
+                store.save_password("fixture-after")
+
+            self.assertEqual(store.load_password(), "fixture-before")
+            self.assertEqual(list(root.iterdir()), [store.credential_path])
 
     def test_migration_clears_plaintext_only_after_verification(self):
         with tempfile.TemporaryDirectory() as temporary:

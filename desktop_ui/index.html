@@ -118,15 +118,18 @@
 
       <section class="page" id="lptiyu" aria-labelledby="lptiyu-title" hidden>
         <div class="page-heading"><div><div class="eyebrow">清晨的操场，从容出发</div><h1 id="lptiyu-title">乐跑</h1><p class="muted">在有效时段完成一次课外跑，成绩自动核对。</p></div><span class="section-mark"><i class="bi bi-stopwatch" aria-hidden="true"></i></span></div>
-        <article class="paper-card task-card"><div class="card-label"><span><i class="bi bi-stopwatch" aria-hidden="true"></i> 今日跑步</span><span class="badge" id="lp-task-badge">待安排</span></div><h2 id="lp-headline-page">看看今天的安排</h2><p class="muted" id="lp-message">开启自动跑步后，每天在设定时间自动完成。</p><div class="task-details" id="lp-details" hidden><div><span>跑区</span><strong id="lp-zone">以学校配置为准</strong></div><div><span>目标距离</span><strong id="lp-distance">2.03–2.35 km</strong></div><div><span>目标配速</span><strong id="lp-pace">自动</strong></div><div><span>最近成绩</span><strong id="lp-last">—</strong></div></div><div class="task-actions"><button class="primary" id="lp-submit">开始今天的跑步 <i class="bi bi-arrow-right" aria-hidden="true"></i></button><button class="secondary" data-action="lptiyu_dry">先验证一次</button><button class="text-button" data-action="lptiyu_cancel" id="lp-cancel">取消当前操作</button></div></article>
+        <article class="paper-card task-card"><div class="card-label"><span><i class="bi bi-stopwatch" aria-hidden="true"></i> 今日跑步</span><span class="badge" id="lp-task-badge">待安排</span></div><h2 id="lp-headline-page">看看今天的安排</h2><p class="muted" id="lp-message">开启自动跑步后，每天在设定时间自动完成。</p><div class="task-details" id="lp-details" hidden><div><span>跑区</span><strong id="lp-zone">以学校配置为准</strong></div><div><span>目标距离</span><strong id="lp-distance">2.03–2.35 km</strong></div><div><span>目标配速</span><strong id="lp-pace-detail">自动</strong></div><div><span>最近成绩</span><strong id="lp-last">—</strong></div></div><div class="task-actions"><button class="primary" id="lp-submit">开始今天的跑步 <i class="bi bi-arrow-right" aria-hidden="true"></i></button><button class="secondary" data-action="lptiyu_dry">先验证一次</button><button class="text-button" data-action="lptiyu_cancel" id="lp-cancel">取消当前操作</button></div></article>
         <div class="detail-grid">
           <form class="paper-card form-card" id="lptiyu-form">
             <div class="card-label"><h3>自动跑步</h3><input id="lp-enabled" type="checkbox" role="switch" aria-label="启用自动跑步"></div>
             <p class="muted small">每天在设定时间自动完成一次课外跑，保存后生效。</p>
             <div class="time-fields"><div><label for="lp-run-time">开始时间</label><input id="lp-run-time" type="time" value="06:30" required></div></div>
+            <div class="setting-row"><div><label for="lp-zone">跑区</label><p class="field-hint" id="lp-zone-hint">以学校当前跑区为准</p></div><div class="zone-picker"><select id="lp-zone" aria-label="跑区"></select><button type="button" class="text-button" id="lp-zones" data-action="lptiyu_zones">同步跑区</button></div></div>
+            <div class="setting-row"><div><label for="lp-zone-direction">场地特调</label><p class="field-hint">每块场地朝向不同，这里覆写自动值</p></div><div class="zone-tuning"><select id="lp-zone-direction" aria-label="跑动方向"><option value="auto">方向自动</option><option value="ccw">逆时针</option><option value="cw">顺时针</option></select><input id="lp-zone-anchor" type="number" min="0" max="40" step="1" placeholder="贴点 m"><input id="lp-zone-lane" type="number" min="0" max="12" step="0.5" placeholder="跑道 m"></div></div>
             <div class="setting-row"><div><label for="lp-dist-lo">距离范围</label><p class="field-hint">单次里程，公里</p></div><div class="number-field wide"><input id="lp-dist-lo" type="number" min="0.5" max="9.9" step="0.01" value="2.03" required><span>至</span><input id="lp-dist-hi" type="number" min="1" max="10" step="0.01" value="2.35" required><span>km</span></div></div>
-            <div class="setting-row"><div><label for="lp-pace">目标配速</label><p class="field-hint">秒/公里，0 为自动</p></div><div class="number-field"><input id="lp-pace" type="number" min="0" max="700" step="1" value="0" required><span id="lp-pace-hint">自动</span></div></div>
+            <div class="setting-row"><div><label for="lp-pace-lo">目标配速</label><p class="field-hint">每公里，写成 4'05"；留空为自动</p></div><div class="pace-range"><input id="lp-pace-lo" type="text" inputmode="numeric" placeholder="自动" aria-label="配速下限"><span>至</span><input id="lp-pace-hi" type="text" inputmode="numeric" placeholder="自动" aria-label="配速上限"><span id="lp-pace-hint">自动</span></div></div>
             <div class="setting-row"><div><label for="lp-anchor">采点精度</label><p class="field-hint">经过打卡点的贴近程度</p></div><div class="number-field"><input id="lp-anchor" type="number" min="5" max="40" step="1" value="20" required><span>米</span></div></div>
+            <label class="switch-row" for="lp-auto-renew"><span>自动续期凭证<small>跑步前自动确认凭证可用，失效时自动补号</small></span><input id="lp-auto-renew" type="checkbox" role="switch"></label>
             <p class="schedule" id="lp-schedule">自动跑步：关闭</p>
             <div class="form-footer"><span class="form-state" id="lptiyu-save-state">设置已同步</span><button type="submit" class="primary">保存跑步设置</button></div>
           </form>
@@ -135,8 +138,9 @@
               <h3><i class="bi bi-person-badge" aria-hidden="true"></i> 跑步凭证</h3>
               <span class="badge" id="lp-token-badge">待同步</span>
               <p class="muted" id="lp-credential-line">正在读取凭证状态…</p>
+              <p class="field-hint" id="lp-renew-line">正在读取续期状态…</p>
               <p class="field-hint" id="lp-identity-line"></p>
-              <div class="stack-actions"><button class="primary" data-action="lptiyu_sync">同步凭证</button></div>
+              <div class="stack-actions"><button class="secondary" data-action="lptiyu_renew">立即续期</button><button class="primary" data-action="lptiyu_sync">同步凭证</button></div>
             </article>
           </aside>
         </div>
