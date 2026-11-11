@@ -367,6 +367,30 @@ class ZoneCatalogTests(unittest.TestCase):
             self.assertEqual(store.zones(), {})
 
 
+class CaptureLedgerTests(unittest.TestCase):
+    def test_attempts_are_counted_per_day_and_trimmed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            at = dt.datetime(2026, 11, 11, 19, 0)
+            store.record_capture_attempt(at)
+            store.record_capture_attempt(at)
+            state = store.capture_state()
+            self.assertEqual(state['attempts']['2026-11-11'], 2)
+            self.assertEqual(state['last_attempt'], '2026-11-11T19:00:00')
+            for day in range(1, 12):
+                store.record_capture_attempt(dt.datetime(2026, 10, day, 9, 0))
+            self.assertLessEqual(len(store.capture_state()['attempts']), 7,
+                                 '只留最近一周, 这个文件不需要历史')
+
+    def test_a_corrupt_ledger_reads_as_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            (store.root / 'capture.json').write_text('{not json', encoding='utf-8')
+            self.assertEqual(store.capture_state()['attempts'], {})
+            store.record_capture_attempt(dt.datetime(2026, 11, 11, 9, 0))
+            self.assertEqual(store.capture_state()['attempts']['2026-11-11'], 1)
+
+
 class RenewalLedgerTests(unittest.TestCase):
     """续期台账: 只记时间与结果, 不含凭证; 坏文件不拖垮乐跑区块。"""
 

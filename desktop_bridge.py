@@ -27,7 +27,7 @@ from dorm_location import (PICK_SOURCE, distance_metres, gcj02_to_wgs84, map_pic
 # 「演示预览不得创建真实控制器」，并且它仍是本模块对外的控制器符号。
 from dorm_panel import DormController  # noqa: F401
 
-OFFICIAL_SPORTS_MINI_PROGRAM_URI = 'weixin://launchapplet/?app_id=wxb2043232183dac7f'
+# 乐跑小程序的 weixin:// 地址统一由 lptiyu_panel 提供（采集时会自动唤起它）。
 
 
 # The picker draws a real map, so tiles come from a third party. OpenStreetMap stays first because
@@ -810,10 +810,9 @@ class DesktopBridge(LocationProbe):
                 raise RuntimeError('打卡操作正在进行，请等待完成或取消当前操作。')
             return '操作已开始，请查看任务状态'
         if action == 'lptiyu_open_official':
-            try:
-                os.startfile(OFFICIAL_SPORTS_MINI_PROGRAM_URI)
-            except (OSError, AttributeError):
-                raise RuntimeError('无法打开小程序，请在微信搜索「数体智慧体育」。') from None
+            from lptiyu_panel import OFFICIAL_MINI_PROGRAM_URI, open_mini_program
+            if not open_mini_program(OFFICIAL_MINI_PROGRAM_URI):
+                raise RuntimeError('无法打开小程序，请在微信搜索「数体智慧体育」。')
             return '已请求微信打开小程序。若未弹出，请在微信搜索「数体智慧体育」。'
         if action == 'lptiyu_capture':
             controller = self._lptiyu
@@ -821,7 +820,7 @@ class DesktopBridge(LocationProbe):
                 raise RuntimeError('乐跑功能在本机暂不可用')
             if not controller.start('capture'):
                 raise RuntimeError('乐跑操作正在进行，请等待完成或取消当前操作。')
-            return '开始采集：在微信里打开「数体智慧体育」并进入跑步首页'
+            return '正在打开小程序并等待凭证…'
         if action == 'lptiyu_capture_stop':
             controller = self._lptiyu
             if controller is None:

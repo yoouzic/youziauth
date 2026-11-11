@@ -243,6 +243,30 @@ class Store:
         self._write('status.json', status)
 
     # ------------------------------------------------------------- 续期台账
+    def capture_state(self):
+        """自动采集的次数与最近一次尝试(按天记账, 免得一天到晚抢着开小程序)。"""
+        try:
+            data = json.loads((self.root / 'capture.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        attempts = data.get('attempts')
+        return {'last_attempt': str(data.get('last_attempt') or ''),
+                'attempts': dict(attempts) if isinstance(attempts, dict) else {}}
+
+    def record_capture_attempt(self, at):
+        state = self.capture_state()
+        day = at.date().isoformat()
+        attempts = state['attempts']
+        attempts[day] = int(attempts.get(day, 0)) + 1
+        # 只留最近 7 天, 这个文件只服务于「今天还能不能再来一次」
+        for key in sorted(attempts)[:-7]:
+            attempts.pop(key, None)
+        self._write('capture.json', {
+            'last_attempt': at.isoformat(timespec='seconds'),
+            'attempts': attempts})
+
     def renewal(self):
         """最近一次续期的结果与下次到期时间。
 

@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import lptiyu_panel
 from lptiyu_panel import LptiyuController, LptiyuError, TokenSlot, MAX_DAILY_AUTO_ATTEMPTS
 from lptiyu.client import ApiError
 from lptiyu_renew import CredentialRenewer, RenewOutcome
@@ -69,7 +70,7 @@ class PanelTestCase(unittest.TestCase):
         self.addCleanup(probe.stop); self.addCleanup(grab.stop); self.addCleanup(lab.stop)
 
     def make_controller(self, code=0, settings=None, clock=None, renewer=None,
-                        capture=None):
+                        capture=None, open_applet=None):
         if settings is not None:
             self.store.save_settings(settings)
         if renewer is not None:
@@ -82,7 +83,7 @@ class PanelTestCase(unittest.TestCase):
 
         controller = LptiyuController(store=self.store, clock=clock or CLOCK,
                                       flow_factory=factory, renewer=self.renewer,
-                                      capture=capture)
+                                      capture=capture, open_applet=open_applet)
         self.addCleanup(controller.close)
         return controller
 
@@ -392,6 +393,10 @@ class FakeCapture:
         self.final = final or {}
         self.started = 0
         self.stops = []
+        self.logs = []
+
+    def log(self, message):
+        self.logs.append(message)
         self.state = "idle"
         self.message = ""
 
@@ -421,10 +426,86 @@ class FakeCapture:
                 "fingerprint": self.ca.fingerprint()}
 
 
+class AutoCaptureTests(PanelTestCase):
+    CRED = {"token": "SELF-HEALED", "uid": 17980002, "student_num": "2025003",
+            "school_id": "837", "card_id": "2025003",
+            "issued_at": "2026-11-11T19:00:00", "source": "capture"}
+
+    def test_auto_capture_needs_the_certificate(self):
+        controller = self.make_controller(capture=FakeCapture(installed=False))
+        self.assertFalse(controller.capture_ready())
+        self.assertFalse(controller.auto_capture())
+
+    def test_auto_capture_runs_without_being_asked(self):
+        capture = FakeCapture(cred=self.CRED, installed=True)
+        controller = self.make_controller(capture=capture, open_applet=lambda: True)
+        self.assertTrue(controller.auto_capture())
+        controller._wait_for_work()
+        self.assertEqual(capture.started, 1)
+        self.assertEqual(controller.store.token(), "SELF-HEALED")
+        today = CLOCK().date().isoformat()
+        self.assertEqual(controller.store.capture_state()['attempts'][today], 1)
+
+    def test_auto_capture_respects_its_cooldown(self):
+        capture = FakeCapture(cred=self.CRED, installed=True)
+        controller = self.make_controller(capture=capture, open_applet=lambda: True)
+        self.assertTrue(controller.auto_capture())
+        controller._wait_for_work()
+        self.assertFalse(controller.auto_capture(), '20 分钟内不该反复弹小程序')
+
+    def test_auto_capture_stops_at_the_daily_cap(self):
+        controller = self.make_controller(capture=FakeCapture(installed=True))
+        today = CLOCK().date().isoformat()
+        for _ in range(3):
+            controller.store.record_capture_attempt(CLOCK())
+        self.assertEqual(controller.store.capture_state()['attempts'][today], 3)
+        self.assertFalse(controller._auto_capture_due())
+
+    def test_a_missing_token_asks_for_a_silent_capture(self):
+        controller = self.make_controller(capture=FakeCapture(installed=True))
+        controller.store.clear_token()
+        with self.assertRaises(LptiyuError) as caught:
+            controller._execute(submit=False)
+        self.assertEqual(caught.exception.state, 'need_token')
+        self.assertIn('自动采集', caught.exception.message)
+        self.assertTrue(controller._capture_requested)
+
+    def test_poll_picks_the_request_up_by_itself(self):
+        capture = FakeCapture(cred=self.CRED, installed=True)
+        controller = self.make_controller(capture=capture, open_applet=lambda: True)
+        controller._capture_requested = True
+        controller.poll()
+        controller._wait_for_work()
+        self.assertEqual(capture.started, 1, '下一拍就该把采集接过来')
+
+
+class MiniProgramTests(unittest.TestCase):
+    def test_launcher_reports_whether_it_started(self):
+        with patch.object(lptiyu_panel.os, 'startfile') as started:
+            self.assertTrue(lptiyu_panel.open_mini_program('weixin://x'))
+            started.assert_called_once_with('weixin://x')
+        with patch.object(lptiyu_panel.os, 'startfile', side_effect=OSError('no handler')):
+            self.assertFalse(lptiyu_panel.open_mini_program('weixin://x'))
+
+
 class CaptureFlowTests(PanelTestCase):
     CRED = {"token": "CAPTURED-1", "uid": 17980001, "student_num": "2025001",
             "school_id": "837", "card_id": "2025001",
             "issued_at": "2026-11-11T18:00:00", "source": "capture"}
+
+    def test_capture_opens_the_mini_program_for_the_user(self):
+        opened = []
+        controller = self.make_controller(
+            capture=FakeCapture(cred=self.CRED),
+            open_applet=lambda: opened.append(1) or True)
+        controller._capture_flow()
+        self.assertEqual(len(opened), 1, '点一次采集就该替用户把小程序拉起来')
+
+    def test_capture_still_waits_when_wechat_cannot_be_launched(self):
+        controller = self.make_controller(
+            capture=FakeCapture(cred=self.CRED), open_applet=lambda: False)
+        result = controller._capture_flow()
+        self.assertEqual(result['state'], 'synced', '唤不起微信也要继续等, 不能直接失败')
 
     def test_capture_saves_the_token_and_the_captured_identity(self):
         controller = self.make_controller(capture=FakeCapture(cred=self.CRED))

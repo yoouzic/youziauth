@@ -6,6 +6,7 @@
   * 系统代理用 HKCU 下的临时键, 绝不碰用户的真实代理设置;
   * CONNECT 隧道用本地 echo 服务验证。
 """
+import datetime as dt
 import json
 import socket
 import subprocess
@@ -40,6 +41,16 @@ class SniffTests(unittest.TestCase):
         self.assertEqual(identity["student_num"], "222025321102104")
         self.assertNotIn("sign", identity)
 
+    def test_a_request_envelope_carries_the_live_token(self):
+        # 打开跑步首页就会发 getSchoolInfo, 信封里就是当前 token —— 采集不必等登录。
+        body = sealed_body({"uid": 17987537, "token": "LIVE-TOKEN",
+                            "student_num": "222025321102104"})
+        cred = cap.credential_from_request(body)
+        self.assertEqual(cred["token"], "LIVE-TOKEN")
+        self.assertEqual(cred["uid"], 17987537)
+        self.assertNotIn("token", cap.identity_from_request(body),
+                         'identity.json 不该存 token')
+
     def test_identity_ignores_garbage(self):
         self.assertIsNone(cap.identity_from_request(b"data=not-base64"))
         self.assertIsNone(cap.identity_from_request(b"nickname=x"))
@@ -69,6 +80,60 @@ class SniffTests(unittest.TestCase):
 
 
 class CertificateTests(unittest.TestCase):
+    def test_certificates_carry_the_extensions_chromium_requires(self):
+        # 缺 AKI/SKI 时 Chromium(微信小程序渲染层)会直接 CERTIFICATE_VERIFY_FAILED,
+        # 表现是「小程序里一切正常, 采集端什么都没看到」。
+        from cryptography import x509
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = cap.CertificateAuthority(Path(tmp))
+            ca.ensure()
+            root_cert = x509.load_pem_x509_certificate(ca.cert_path.read_bytes())
+            self.assertTrue(root_cert.extensions.get_extension_for_class(
+                x509.SubjectKeyIdentifier))
+            self.assertTrue(root_cert.extensions.get_extension_for_class(
+                x509.AuthorityKeyIdentifier))
+            cert_path, _key = ca.leaf("api2.lptiyu.com")
+            leaf = x509.load_pem_x509_certificate(cert_path.read_bytes())
+            aki = leaf.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
+            ski = root_cert.extensions.get_extension_for_class(
+                x509.SubjectKeyIdentifier).value
+            self.assertEqual(aki.key_identifier, ski.digest,
+                             'AKI 必须对得上签发者的 SKI')
+            self.assertTrue(leaf.extensions.get_extension_for_class(
+                x509.ExtendedKeyUsage))
+
+    def test_a_legacy_ca_without_ski_is_replaced(self):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "old ca")])
+            now = dt.datetime.now(dt.timezone.utc)
+            old = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+                   .public_key(key.public_key())
+                   .serial_number(x509.random_serial_number())
+                   .not_valid_before(now - dt.timedelta(days=1))
+                   .not_valid_after(now + dt.timedelta(days=365))
+                   .add_extension(x509.BasicConstraints(ca=True, path_length=0),
+                                  critical=True)
+                   .sign(key, hashes.SHA256()))
+            (root / "ca.key").write_bytes(key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption()))
+            (root / "ca.pem").write_bytes(old.public_bytes(serialization.Encoding.PEM))
+            (root / "ca.der").write_bytes(old.public_bytes(serialization.Encoding.DER))
+            ca = cap.CertificateAuthority(root)
+            before = ca.fingerprint()
+            ca.ensure()
+            self.assertNotEqual(ca.fingerprint(), before, '没有 SKI 的旧 CA 要换掉')
+            self.assertTrue((root / "superseded_ca.txt").is_file())
+            x509.load_pem_x509_certificate(ca.cert_path.read_bytes()).extensions \
+                .get_extension_for_class(x509.SubjectKeyIdentifier)
+
     def test_ca_and_leaf_are_generated_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             ca = cap.CertificateAuthority(Path(tmp))
@@ -305,6 +370,28 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(cred["source"], "capture")
         self.assertEqual(session.status()["state"], "captured")
         self.assertEqual(proxy.restored, 1)
+
+    def test_a_request_alone_is_enough_to_capture(self):
+        session, proxy, _ca = self.session()
+        session.start()
+        session.on_request("api2.lptiyu.com", "/v3/api.php/WpLogin/getSchoolInfo",
+                           sealed_body({"uid": 7, "token": "FROM-REQUEST",
+                                        "student_num": "2025002"}))
+        cred = session.poll()
+        self.assertEqual(cred["token"], "FROM-REQUEST")
+        self.assertEqual(cred["student_num"], "2025002")
+        self.assertEqual(proxy.restored, 1)
+
+    def test_the_session_writes_a_capture_log(self):
+        session, _proxy, _ca = self.session()
+        session.start()
+        session.on_request("api2.lptiyu.com", "/v3/api.php/WpLogin/getSchoolInfo",
+                           sealed_body({"uid": 7, "token": "T"}))
+        session.poll()
+        log = (session.root / "capture.log").read_text(encoding="utf-8")
+        self.assertIn("采集开始", log)
+        self.assertIn("凭证已捕获", log)
+        self.assertIn("采集结束", log)
 
     def test_timeout_stops_and_restores(self):
         session, proxy, _ca = self.session(timeout=0)

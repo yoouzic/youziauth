@@ -63,11 +63,12 @@ def _form_value(body: bytes, key: str):
         return ""
 
 
-def identity_from_request(body: bytes):
-    """请求体 `data=<base64>` 解出来的身份字段。
+def credential_from_request(body: bytes):
+    """请求体 `data=<base64>` 解出来的凭证与身份。
 
-    小程序每次调用都带着 uid/token/学号; 登录那一刻 token 还是旧的, 但身份是
-    新的 —— 用它把 identity.json 填对, 后面的真门探活才有 uid 可用。
+    小程序每次调用都带着**当前 token** 加 uid/学号 —— 打开跑步首页就会发
+    `getSchoolInfo` / `beforeRunV260`, 里面就有 token。所以采集不必等一次
+    重新登录(登录只在 wx 会话失效时才发生), 看到第一个请求就能收工。
     """
     sealed = _form_value(body, "data")
     if not sealed:
@@ -79,11 +80,21 @@ def identity_from_request(body: bytes):
     if not isinstance(plain, dict):
         return None
     out = {}
+    token = plain.get("token")
+    if isinstance(token, str) and token.strip():
+        out["token"] = token.strip()
     for key in ("uid", "school_id", "student_num", "card_id", "term_id"):
         value = plain.get(key)
         if value not in (None, "", 0):
             out[key] = value
     return out or None
+
+
+def identity_from_request(body: bytes):
+    """只要身份字段(给 identity.json 用), 不看 token。"""
+    cred = credential_from_request(body) or {}
+    cred.pop("token", None)
+    return cred or None
 
 
 def credentials_from_login(body: bytes):
@@ -134,7 +145,18 @@ class CertificateAuthority:
     def ensure(self):
         with self._lock:
             if self.key_path.is_file() and self.cert_path.is_file():
-                return self.cert_path
+                from cryptography import x509 as _x509
+                old = _x509.load_pem_x509_certificate(self.cert_path.read_bytes())
+                try:
+                    old.extensions.get_extension_for_class(_x509.SubjectKeyIdentifier)
+                    return self.cert_path
+                except _x509.ExtensionNotFound:
+                    # 1.9.5 之前的 CA 没有 SKI: 叶子证书的 AKI 无处分, Chromium/微信
+                    # 会直接判链不完整 —— 换一把带 SKI 的 CA, 界面会要求重新安装。
+                    superseded = self.fingerprint()
+                    if superseded:
+                        (self.root / "superseded_ca.txt").write_text(
+                            superseded + "\n", encoding="utf-8")
             try:
                 from cryptography import x509
                 from cryptography.hazmat.primitives import hashes, serialization
@@ -162,6 +184,10 @@ class CertificateAuthority:
                         content_commitment=False, key_encipherment=False,
                         data_encipherment=False, key_agreement=False,
                         encipher_only=False, decipher_only=False), critical=True)
+                    .add_extension(x509.SubjectKeyIdentifier.from_public_key(
+                        key.public_key()), critical=False)
+                    .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                        key.public_key()), critical=False)
                     .sign(key, hashes.SHA256()))
             self.key_path.write_bytes(key.private_bytes(
                 serialization.Encoding.PEM,
@@ -169,10 +195,18 @@ class CertificateAuthority:
                 serialization.NoEncryption()))
             self.cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
             self.der_path.write_bytes(cert.public_bytes(serialization.Encoding.DER))
+            self._leaf_cache.clear()
             return self.cert_path
 
+    LEAF_VERSION = "2"
+
     def leaf(self, host: str):
-        """给某个域名签一张站点证书, 返回 (cert_path, key_path)。同域名缓存。"""
+        """给某个域名签一张站点证书, 返回 (cert_path, key_path)。同域名缓存。
+
+        必需扩展一个都不能少: Chromium(微信小程序的渲染层)要求叶子证书带 AKI,
+        且要与签发者的 SKI 对得上; 缺了就是 CERTIFICATE_VERIFY_FAILED,
+        表现是「小程序里一切正常, 我们这边什么都没看到」。
+        """
         with self._lock:
             cached = self._leaf_cache.get(host)
             if cached and Path(cached[0]).is_file():
@@ -198,9 +232,27 @@ class CertificateAuthority:
                                critical=False)
                 .add_extension(x509.BasicConstraints(ca=False, path_length=None),
                                critical=True)
+                .add_extension(x509.KeyUsage(
+                    digital_signature=True, key_encipherment=True, key_cert_sign=False,
+                    crl_sign=False, content_commitment=False, data_encipherment=False,
+                    key_agreement=False, encipher_only=False, decipher_only=False),
+                    critical=True)
+                .add_extension(x509.ExtendedKeyUsage(
+                    [x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+                .add_extension(x509.SubjectKeyIdentifier.from_public_key(
+                    key.public_key()), critical=False)
+                .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                    ca_cert.public_key()), critical=False)
                 .sign(ca_key, hashes.SHA256()))
         leaf_dir = self.root / "leaf"
         leaf_dir.mkdir(exist_ok=True)
+        marker = leaf_dir / f".v{self.LEAF_VERSION}"
+        if not marker.is_file():
+            for stale in leaf_dir.glob("*.pem"):
+                stale.unlink(missing_ok=True)
+            for stale in leaf_dir.glob("*.key"):
+                stale.unlink(missing_ok=True)
+            marker.write_text(self.LEAF_VERSION, encoding="utf-8")
         cert_path = leaf_dir / f"{host}.pem"
         key_path = leaf_dir / f"{host}.key"
         cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
@@ -442,6 +494,7 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
             if not host_in_scope(host):
                 self._tunnel(host, port)
                 return
+            self.server.log(f"CONNECT {host}:{port}")
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             cert_path, key_path = self.server.ca.leaf(host)
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -454,7 +507,8 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
                     tls.close()
                 except OSError:
                     pass
-        except (OSError, ssl.SSLError, ValueError):
+        except (OSError, ssl.SSLError, ValueError) as exc:
+            self.server.log(f"ERR {type(exc).__name__}: {exc}")
             return
         finally:
             try:
@@ -498,6 +552,7 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
             if request is None:
                 return
             rest = b""
+            self.server.log(f"REQ {request['method']} {request['path']}")
             self._sniff_request(request, host)
             status, headers, body = self._forward(host, port, request)
             if status is None:
@@ -562,6 +617,12 @@ class _ProxyServer(socketserver.ThreadingTCPServer):
         self.sink = sink
         super().__init__(("127.0.0.1", port), _ProxyHandler)
 
+    def log(self, message):
+        try:
+            self.sink.log(message)
+        except Exception:                  # noqa: BLE001
+            pass
+
     def record_request(self, host, path, body):
         try:
             self.sink.on_request(host, path, body)
@@ -598,6 +659,18 @@ class CaptureSession:
         self._port = 0
         self._deadline = 0.0
         self.identity = {}
+        self.log_path = self.root / "capture.log"
+
+    def log(self, message):
+        """采集日志: 出问题时能回答「到底有没有流量、卡在哪一步」。"""
+        try:
+            stamp = self._clock().strftime("%H:%M:%S")
+            if self.log_path.is_file() and self.log_path.stat().st_size > 512 * 1024:
+                self.log_path.replace(self.root / "capture.log.1")
+            with self.log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"[{stamp}] {message}\n")
+        except OSError:
+            pass
 
     # ---------------------------------------------------------- 状态
     def status(self):
@@ -630,21 +703,28 @@ class CaptureSession:
         self._thread = threading.Thread(target=server.serve_forever,
                                         name="youziauth-lptiyu-capture", daemon=True)
         self._thread.start()
-        self._set("waiting", "等待小程序登录：在微信里打开「数体智慧体育」并进入跑步首页")
+        self.log(f"采集开始 127.0.0.1:{port}")
+        self._set("waiting", "等待小程序请求：在微信里打开「数体智慧体育」并进入跑步首页")
         return self.status()
 
     def stop(self, state=None, message=None):
         if self._server is not None:
+            server, self._server = self._server, None
             try:
-                self._server.shutdown()
-                self._server.server_close()
-            except OSError:
+                server.shutdown()
+            except Exception:              # noqa: BLE001 —— 卡住的 serve_forever 也要收尾
                 pass
-            self._server = None
+            finally:
+                try:
+                    server.server_close()  # 端口必须真的放掉, 否则下次换端口重来
+                except OSError:
+                    pass
         try:
             self.proxy.restore()
         except Exception:                  # noqa: BLE001 —— 收尾必须尽力
             pass
+        if state:
+            self.log(f"采集结束 {state} {message or ''}".strip())
         if state:
             self._set(state, message or "")
 
@@ -661,7 +741,7 @@ class CaptureSession:
             waiting = self._state == "waiting"
             expired = waiting and time.time() >= self._deadline
         if expired:
-            self.stop("timeout", "等待超时：没有看到小程序登录")
+            self.stop("timeout", "等待超时：没有看到小程序请求")
         return None
 
     def wait(self, timeout=None):
@@ -674,21 +754,28 @@ class CaptureSession:
                 if self._state not in ("waiting", "idle"):
                     return None
             time.sleep(0.2)
-        self.stop("timeout", "等待超时：没有看到小程序登录")
+        self.stop("timeout", "等待超时：没有看到小程序请求")
         return None
 
     # ---------------------------------------------------------- 流量回调
     def on_request(self, host, path, body):
-        identity = identity_from_request(body)
-        if identity and identity.get("uid"):
-            self.identity.update(identity)
-
-    def on_login(self, body):
-        cred = credentials_from_login(body)
+        cred = credential_from_request(body)
         if not cred:
             return
+        self.identity.update({k: v for k, v in cred.items() if k != "token"})
+        if cred.get("token"):
+            # 已经是「当前 token」了: 立刻收工, 不必等登录。
+            self._emit(cred)
+
+    def _emit(self, cred):
+        self.log(f"凭证已捕获 uid={cred.get('uid')}")
         merged = dict(self.identity)
         merged.update(cred)
         merged["source"] = "capture"
         merged["issued_at"] = self._clock().isoformat(timespec="seconds")
         self._tokens.put(merged)
+
+    def on_login(self, body):
+        cred = credentials_from_login(body)
+        if cred:
+            self._emit(cred)

@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 import os
 import queue
 import shutil
@@ -28,7 +29,23 @@ from lptiyu_capture import CaptureError, CaptureSession
 from lptiyu_renew import CredentialRenewer
 from lptiyu_store import Store, Settings, now, parse_time
 
+# 微信注册的 weixin:// 协议: 直接拉起乐跑小程序(与研究库一致的那个 appid)。
+OFFICIAL_MINI_PROGRAM_URI = 'weixin://launchapplet/?app_id=wxb2043232183dac7f'
+
+
+def open_mini_program(uri=OFFICIAL_MINI_PROGRAM_URI):
+    """让微信打开小程序; 返回是否真的发起了。"""
+    try:
+        os.startfile(uri)          # ShellExecute 走 weixin:// 协议
+        return True
+    except (OSError, AttributeError):
+        return False
+
+
 MAX_DAILY_AUTO_ATTEMPTS = 3
+# 没有可用凭证时的自愈节奏: 冷却 20 分钟, 一天最多自动开三次小程序。
+AUTO_CAPTURE_COOLDOWN_MIN = 20
+AUTO_CAPTURE_DAILY_CAP = 3
 GRAB_TIMEOUT_SECONDS = 540
 MAX_ZONE_SYNC = 8                # 同步跑区时最多切几次场地(服务端一般就 4 个)
 
@@ -123,7 +140,7 @@ class TokenSlot:
 
 class LptiyuController:
     def __init__(self, store=None, slot=None, clock=None, flow_factory=None,
-                 renewer=None, capture=None):
+                 renewer=None, capture=None, open_applet=None):
         self.store = store or Store()
         self.slot = slot or TokenSlot(self.store)
         self._clock = clock or now
@@ -131,6 +148,10 @@ class LptiyuController:
         # 所以在 capture_status 里做 60 秒缓存。
         self.capture = capture or CaptureSession(self.store.root / 'capture',
                                                  clock=self._clock)
+        # 采集时代为唤起小程序: 少一步「去微信里翻出它」。
+        self._open_applet = open_applet or open_mini_program
+        self._capture_requested = False      # 某次跑批发现没凭证 → 下一拍自动采集
+        self._capture_auto = False           # 这次采集是不是自动发起的
         self._cert_cache = (0.0, None)
         self._flow_factory = flow_factory   # 测试注入; 正式路径现场构造 DailyFlow
         # 续期器也允许注入: 单测里给一个假的, 就不必碰网络和子进程。
@@ -210,6 +231,7 @@ class LptiyuController:
             finally:
                 with self._gate:
                     self.busy = False
+                self._capture_auto = False     # 自动标记只属于这一次采集
 
         threading.Thread(target=work, name='youziauth-lptiyu-' + action,
                          daemon=True).start()
@@ -219,6 +241,11 @@ class LptiyuController:
         if self.closed or time.monotonic() < self._poll_at:
             return
         self._poll_at = time.monotonic() + 5
+        # 手动/定时跑步撞上「没有凭证」时, 这里把采集接过来, 不用人再点一次。
+        if self._capture_requested and not self.busy:
+            self._capture_requested = False
+            if self.auto_capture():
+                return
         try:
             settings = self.store.settings()
         except Exception:  # noqa: BLE001 —— 设置坏了不轰炸，由快照呈现
@@ -240,6 +267,8 @@ class LptiyuController:
             self.start('renew_auto')
             return
         if not run_ready:
+            return
+        if not self.store.has_token() and self.auto_capture():
             return
         self.start('run')
         try:
@@ -322,19 +351,66 @@ class LptiyuController:
         self._cert_cache = (0.0, None)
         return result
 
+    def capture_ready(self):
+        """采集能不能自己跑: 证书装好就行(证书安装是明确的用户动作, 代劳不了)。"""
+        try:
+            return bool(self.capture.cert_status().get('installed'))
+        except Exception:              # noqa: BLE001 —— certutil 不在也当没装
+            return False
+
+    def _auto_capture_due(self):
+        if not self.capture_ready():
+            return False
+        state = self.store.capture_state()
+        today = self._clock().date().isoformat()
+        if int(state['attempts'].get(today, 0)) >= AUTO_CAPTURE_DAILY_CAP:
+            return False
+        if state['last_attempt']:
+            try:
+                last = dt.datetime.fromisoformat(state['last_attempt'])
+            except ValueError:
+                last = None
+            if last and (self._clock() - last).total_seconds() < AUTO_CAPTURE_COOLDOWN_MIN * 60:
+                return False
+        return True
+
+    def auto_capture(self):
+        """静默自愈: 起代理、唤起小程序、拿凭证、还原代理, 全程不需要人参与。"""
+        if self.busy or self.closed or not self._auto_capture_due():
+            return False
+        try:
+            self.store.record_capture_attempt(self._clock())
+        except Exception:              # noqa: BLE001 —— 记账失败不该拦住采集
+            pass
+        self._capture_auto = True
+        return bool(self.start('capture'))
+
     def capture_stop(self):
         self.capture.stop('idle', '已停止采集')
         return self._set_latest('idle', '已停止采集', record=False)
 
     def _capture_flow(self):
         """等一次小程序登录, 把 token 与身份一起落盘, 然后当真门探活。"""
+        auto = self._capture_auto
         try:
             self.capture.start()
         except CaptureError as exc:
             raise LptiyuError('error', str(exc)) from exc
-        self._set_latest('capturing',
-                         '等待小程序登录：在微信里打开「数体智慧体育」并进入跑步首页',
-                         record=False)
+        launched = False
+        try:
+            launched = bool(self._open_applet())
+        except Exception:              # noqa: BLE001 —— 唤不起只是少一步, 不能中断采集
+            launched = False
+        # 注入的采集器不一定带日志接口, 记不上就算了, 不能因此中断采集。
+        log = getattr(self.capture, 'log', None)
+        if callable(log):
+            log('已请求微信打开小程序' if launched else '没能唤起微信, 等用户手动打开')
+        prefix = '正在自动采集凭证：' if auto else ''
+        self._set_latest(
+            'capturing',
+            (prefix + '已打开小程序，等待它发出第一个请求…') if launched
+            else (prefix + '请在微信里打开「数体智慧体育」并进入跑步首页'),
+            record=False)
         cred = self.capture.wait()
         if not cred:
             status = self.capture.status()
@@ -365,7 +441,8 @@ class LptiyuController:
             self.slot.mark_dead()
             raise LptiyuError('need_token', '抓到的凭证当场失效了：在小程序里重新登录后再采集')
         self.store.record_probe(True)
-        return self._set_latest('synced', '已采集凭证，并确认可用')
+        return self._set_latest('synced', '已自动采集凭证，并确认可用' if auto
+                                else '已采集凭证，并确认可用')
 
     # ------------------------------------------------------------- 跑区
     @staticmethod
@@ -571,7 +648,16 @@ class LptiyuController:
 
     def _execute(self, submit):
         settings = self.store.settings()
-        record = self._ensure_credentials()
+        try:
+            record = self._ensure_credentials()
+        except LptiyuError as exc:
+            # 没有凭证但有采集能力: 交给下一拍自己采, 不用人点「同步凭证」。
+            if exc.state == 'need_token' and self._auto_capture_due():
+                self._capture_requested = True
+                raise LptiyuError(
+                    'need_token',
+                    '本机没有可用凭证：正在自动采集，微信打开小程序后就会继续') from None
+            raise
         self._set_latest('running', '正在处理今天的跑步…' if submit else '正在验证全链路…',
                          record=False)
         client = self.slot.make_client(pace=0.8)
