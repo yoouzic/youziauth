@@ -132,7 +132,8 @@ class ProfileTests(unittest.TestCase):
 
     def test_normalize_tuning_drops_unknown_values(self):
         self.assertEqual(zones.normalize_tuning({'direction': 'sideways', 'lane_m': -2}),
-                         {'direction': 'auto', 'lane_m': 0.0, 'anchor_m': 0.0, 'start_deg': 0.0})
+                         {'direction': 'auto', 'lane_m': 0.0, 'anchor_m': 0.0, 'start_deg': 0.0,
+                          'axis_deg': 0.0})
         self.assertEqual(zones.normalize_tuning(None)['direction'], 'auto')
 
     def test_summary_speaks_in_plain_words(self):
@@ -240,6 +241,73 @@ class AxisTests(unittest.TestCase):
         delta = abs(bearing - 160.1)
         self.assertLess(min(delta, 180.0 - delta), 4.0,
                         f'环的长轴 {bearing:.1f}° 应该贴着实测的 160.1°')
+
+
+class LearnedAxisTests(unittest.TestCase):
+    """本机历史轨迹学到的朝向: 只有当用户没手填时才生效, 且要能压过 PCA。"""
+
+    def test_a_learned_axis_wins_over_pca(self):
+        geom = zones.analyze(rect(120, 60, angle_deg=111.9), zone_id='9999',
+                             axis_deg=160.1)
+        self.assertEqual(geom['long_axis_deg'], 160.1)
+        self.assertEqual(geom['axis_source'], 'learned')
+
+    def test_a_learned_axis_reaches_the_profile(self):
+        prof = zones.profile(rect(), {'axis_deg': 33.0}, zone_id='9999')
+        self.assertEqual(prof['long_axis_deg'], 33.0)
+        self.assertEqual(prof['axis_source'], 'learned')
+        self.assertEqual(zones.profile(rect(), {}, zone_id='1875')['axis_source'], 'prior',
+                         '实测先验比学到的更可信, 已知跑区仍用 prior')
+
+    def test_normalize_tuning_carries_the_axis(self):
+        self.assertEqual(zones.normalize_tuning({'axis_deg': 33.3})['axis_deg'], 33.3)
+        self.assertEqual(zones.normalize_tuning(None)['axis_deg'], 0.0)
+
+
+class StadiumPriorTests(unittest.TestCase):
+    """1875 有真人轨迹拟合出来的跑道中心线: 有它就该沿着它跑, 而不是围着打卡点绕。"""
+
+    POINTS = [(29.816855, 106.421028), (29.815678, 106.421253),
+              (29.816696, 106.421578), (29.815858, 106.420548)]
+
+    def route(self):
+        prof = zones.profile(self.POINTS, zone_id='1875')
+        return zones.route_points(self.POINTS, lane_m=prof['lane_m'],
+                                  direction=prof['direction'],
+                                  start_deg=prof['start_deg'],
+                                  rnd=random.Random(7), zone_id='1875')
+
+    def test_the_route_follows_the_fitted_track(self):
+        route = self.route()
+        clat = sum(p[0] for p in route) / len(route)
+        clng = sum(p[1] for p in route) / len(route)
+        rxy = [((p[1] - clng) * 111320 * math.cos(math.radians(clat)),
+                (p[0] - clat) * 110570) for p in route]
+        lap = sum(math.dist(rxy[i], rxy[i + 1]) for i in range(len(rxy) - 1))
+        self.assertAlmostEqual(lap, 460.0, delta=25.0, msg=f'单圈 {lap:.0f}m 应接近 460m')
+        # 在跑道自己的坐标系里量长宽: 轴 15.5° 下 ENU 包围盒会被转斜, 量不出 182x84
+        theta = math.radians(15.5)
+        us = [x * math.sin(theta) + y * math.cos(theta) for x, y in rxy]
+        vs = [x * math.cos(theta) - y * math.sin(theta) for x, y in rxy]
+        self.assertAlmostEqual(max(us) - min(us), 182.0, delta=20.0)
+        self.assertAlmostEqual(max(vs) - min(vs), 84.4, delta=15.0)
+
+    def test_every_checkpoint_sits_on_that_track(self):
+        route = self.route()
+        clat = sum(p[0] for p in self.POINTS) / len(self.POINTS)
+        clng = sum(p[1] for p in self.POINTS) / len(self.POINTS)
+        rxy = [((p[1] - clng) * 111320 * math.cos(math.radians(clat)),
+                (p[0] - clat) * 110570) for p in route]
+        for lat, lng in self.POINTS:
+            px = (lng - clng) * 111320 * math.cos(math.radians(clat))
+            py = (lat - clat) * 110570
+            nearest = min(math.hypot(x - px, y - py) for x, y in rxy)
+            self.assertLess(nearest, 25.0, f'打卡点离拟合跑道 {nearest:.1f}m, 超出判定半径')
+
+    def test_an_unknown_zone_does_not_use_the_1875_track(self):
+        route = zones.route_points(self.POINTS, lane_m=0, direction='ccw',
+                                   rnd=random.Random(7), zone_id='9999')
+        self.assertLess(len(route), 60, '别的跑区不该套用 1875 的跑道')
 
 
 class RoundedLoopTests(unittest.TestCase):

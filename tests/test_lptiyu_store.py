@@ -350,7 +350,22 @@ class ZoneCatalogTests(unittest.TestCase):
             store.save_zone_tuning('1873', {'direction': 'sideways', 'lane_m': -1})
             self.assertEqual(store.zone_tuning('1873'),
                              {'direction': 'auto', 'lane_m': 0.0,
-                              'anchor_m': 0.0, 'start_deg': 0.0})
+                              'anchor_m': 0.0, 'start_deg': 0.0,
+                              'axis_deg': 0.0})
+
+    def test_a_learned_axis_fills_in_but_never_overrides_the_user(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.save_zone_points('1873', '第二运动场', [
+                {'lat': 29.825441, 'lng': 106.428002, 'point_id': '1'},
+                {'lat': 29.825990, 'lng': 106.427020, 'point_id': '2'},
+                {'lat': 29.825930, 'lng': 106.427876, 'point_id': '3'}])
+            self.assertTrue(store.save_zone_axis('1873', 154.4, 0.42))
+            tuning = store.zone_tuning('1873')
+            self.assertEqual(tuning['axis_deg'], 154.4, '学到的朝向要能补进来')
+            store.save_zone_tuning('1873', {'axis_deg': 12.0})
+            self.assertEqual(store.zone_tuning('1873')['axis_deg'], 12.0,
+                             '用户手填的朝向优先')
 
     def test_unknown_or_too_few_points_has_no_summary(self):
         with tempfile.TemporaryDirectory() as tmp:

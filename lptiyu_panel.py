@@ -456,6 +456,38 @@ class LptiyuController:
         return self._set_latest('synced', '已自动采集凭证，并确认可用' if auto
                                 else '已采集凭证，并确认可用')
 
+    # ------------------------------------------------------------- 样本
+    def _record_sample(self, summary, settings):
+        """把本次跑区的几何与结果留档: 事后校准朝向/形状就靠这些样本。"""
+        try:
+            self.store.record_sample({
+                'at': self._clock().isoformat(timespec='seconds'),
+                'record_id': summary.get('record_id'),
+                'zone_id': str(summary.get('game_id') or settings.zone_id or ''),
+                'zone_name': summary.get('zone_name') or '',
+                'distance': summary.get('distance'),
+                'used_time': summary.get('used_time'),
+                'record_status': summary.get('record_status'),
+                'record_failed_reason': summary.get('record_failed_reason') or '',
+                'style': summary.get('style'),
+                'zone_points': summary.get('zone_points') or [],
+                'zone_axis_deg': summary.get('zone_axis_deg'),
+                'zone_axis_source': summary.get('zone_axis_source'),
+                'passed_points': summary.get('passed_points') or [],
+            })
+            self._learn_axis(str(summary.get('game_id') or settings.zone_id or ''))
+        except Exception:              # noqa: BLE001 —— 留档失败不该影响跑步结果
+            pass
+
+    def _learn_axis(self, zone_id):
+        """攒够了真实通过点就把朝向学下来: 没有实测先验的跑区靠它自我修正。"""
+        if not zone_id:
+            return
+        from lptiyu_share import track_axis, zone_passes
+        deg, share = track_axis(zone_passes(self.store.samples(), zone_id))
+        if deg:
+            self.store.save_zone_axis(zone_id, deg, share)
+
     # ------------------------------------------------------------- 跑区
     @staticmethod
     def _points_of(cfg):
@@ -691,6 +723,8 @@ class LptiyuController:
 
         flow = self._flow(settings)
         summary, code = flow.run(submit=submit, zone_override=settings.zone_id or None)
+        if submit and isinstance(summary, dict):
+            self._record_sample(summary, settings)
         if not submit:
             if code == 0:
                 return self._set_latest('checked', '全链验证通过，未提交')

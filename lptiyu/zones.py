@@ -38,6 +38,14 @@ AXIS_PRIORS = {
     '1873': 160.1, '1874': 42.3, '1875': 16.9, '1876': 152.0,
 }
 
+# 拟合出来的真跑道中心线(参数化体育场: 两段直道 + 两个半圆)。
+# 1875 是唯一有真人轨迹可拟合的场地: 226 点、残差 RMS 5.1m、单圈 460m。
+# 有这条线就沿着它跑 —— 这才是真正的「贴着跑道」, 而不是围着打卡点绕一圈。
+STADIUM_PRIORS = {
+    '1875': {'center': (29.816262, 106.421014), 'axis_deg': 15.5,
+             'half_s': 48.8, 'radius': 42.2, 'source': 'crowd_track'},
+}
+
 
 def axis_prior(zone_id):
     """已知跑区的实测长轴(度); 不认识的跑区返回 None。"""
@@ -133,7 +141,7 @@ def _axis_unframe(uv, bearing_deg):
     return [(u * ux + v * vx, u * uy + v * vy) for u, v in uv]
 
 
-def analyze(points, zone_id=None):
+def analyze(points, zone_id=None, axis_deg=None):
     """跑区几何画像。点数不足时退化为 'single'/'line', 不抛错。
 
     zone_id 已知时优先用实测长轴(AXIS_PRIORS), 否则用最小外接矩形, 最后才退回 PCA。
@@ -160,7 +168,13 @@ def analyze(points, zone_id=None):
 
     rect_deg, rect_fit, _rect_len, _rect_w = _min_rect(xy)
     prior = axis_prior(zone_id)
-    if prior is not None:
+    try:
+        learned = float(axis_deg or 0.0) % 180.0
+    except (TypeError, ValueError):
+        learned = 0.0
+    if learned:
+        axis_deg, source = learned, 'learned'
+    elif prior is not None:
         axis_deg, source = float(prior), 'prior'
     elif rect_fit >= 0.75 and n >= 3:
         axis_deg, source = rect_deg, 'rect'
@@ -527,8 +541,45 @@ def _rotate_to_start(loop, xy, start_deg):
     return body[first:] + body[:first] + [body[first]]
 
 
+def stadium_line(prior, lane_m=0.0, spacing_m=12.0, direction='ccw', start_deg=None):
+    """把拟合的体育场中心线铺成闭合点列(ENU 相对中心), 车道沿外法线偏移。"""
+    axis = float(prior['axis_deg'])
+    half_s = float(prior['half_s']) + abs(lane_m)
+    radius = float(prior['radius']) + abs(lane_m)
+    step = max(3.0, float(spacing_m or 12.0))
+    path = []
+    n_straight = max(2, int(round(2 * half_s / step)))
+    for k in range(n_straight):
+        path.append((-half_s + 2 * half_s * k / n_straight, -radius))
+    arc = max(10, int(round(math.pi * radius / step)))
+    for k in range(arc + 1):
+        ang = -math.pi / 2 + math.pi * k / arc
+        path.append((half_s + radius * math.cos(ang), radius * math.sin(ang)))
+    for k in range(n_straight):
+        path.append((half_s - 2 * half_s * k / n_straight, radius))
+    for k in range(arc + 1):
+        ang = math.pi / 2 + math.pi * k / arc
+        path.append((-half_s + radius * math.cos(ang), radius * math.sin(ang)))
+    path.append(path[0])
+    loop = _axis_unframe(path, axis)
+    if str(direction or 'ccw').lower() == 'cw':
+        loop = loop[::-1]
+    return loop
+
+
+def _checkpoints_near(line, xy, limit_m):
+    """每个打卡点到这条线的最近距离都在 limit_m 以内才敢用这条线。"""
+    worst = 0.0
+    for point in xy:
+        nearest = min(math.hypot(point[0] - q[0], point[1] - q[1]) for q in line)
+        worst = max(worst, nearest)
+        if worst > limit_m:
+            return False
+    return True
+
+
 def route_points(points, lane_m=0.0, direction='auto', start_deg=None,
-                 spacing_m=12.0, rnd=None, zone_id=None):
+                 spacing_m=12.0, rnd=None, zone_id=None, anchor_m=None):
     """把「点位环 + 车道」铺成一条可跑的路线(闭合, 首点重复)。
 
     跑道形状 = 有向包围盒上的直道 + 半圆弯: 方向由跑区实测长轴决定(见 AXIS_PRIORS),
@@ -544,6 +595,18 @@ def route_points(points, lane_m=0.0, direction='auto', start_deg=None,
     drift = rnd.uniform(-1.4, 1.4)          # 整圈的内外漂移(同一条跑道不会圈圈不同)
     clat, clng = _centroid(ring)
     xy = [enu_of(p[0], p[1], clat, clng) for p in ring]
+    # 有拟合跑道且每个打卡点都在判定半径内 → 直接沿真跑道跑
+    prior = STADIUM_PRIORS.get(str(zone_id or '').strip())
+    if prior is not None:
+        line = stadium_line(prior, lane_m=lane, spacing_m=spacing_m,
+                            direction=use_dir, start_deg=start_deg)
+        # 判定半径是服务端的 40m, 不是我们给轨迹留的自定义贴点半径 ——
+        # 真跑道离打卡点 23m 也是合法的, 不能用 20m 的门槛把它挡掉。
+        if _checkpoints_near(line, xy, max(40.0, float(anchor_m or 0.0))):
+            base = enu_of(prior['center'][0], prior['center'][1], clat, clng)
+            shifted = [(x + base[0], y + base[1]) for x, y in line]
+            shifted = _rotate_to_start(shifted, xy, start_deg)
+            return [geo_of(x, y, clat, clng) for x, y in shifted]
     # 环一律先在「逆时针」的标准朝向上铺, 再按方向整体翻转 —— 否则 cw 会被翻两次,
     # 生成出来的轨迹跑到反方向去。
     xy_ccw = [enu_of(p[0], p[1], clat, clng)
@@ -604,7 +667,7 @@ def normalize_tuning(raw):
     raw = raw if isinstance(raw, dict) else {}
     direction = str(raw.get("direction") or "auto").lower()
     out = {"direction": direction if direction in DIRECTIONS else "auto"}
-    for key in ("lane_m", "anchor_m", "start_deg"):
+    for key in ("lane_m", "anchor_m", "start_deg", "axis_deg"):
         try:
             value = float(raw.get(key) or 0.0)
         except (TypeError, ValueError):
@@ -643,7 +706,11 @@ def profile(points, tuning=None, zone_id=None):
     zone_id: 已知跑区时用实测长轴(见 AXIS_PRIORS), 不再让 PCA 猜对角线。
     """
     tuning = tuning or {}
-    geom = analyze(points, zone_id=zone_id)
+    try:
+        axis_override = float(tuning.get('axis_deg') or 0.0)
+    except (TypeError, ValueError):
+        axis_override = 0.0
+    geom = analyze(points, zone_id=zone_id, axis_deg=axis_override)
     direction = str(tuning.get('direction') or 'auto').lower()
     if direction not in DIRECTIONS:
         direction = 'auto'

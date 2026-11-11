@@ -382,6 +382,12 @@ class DailyFlow:
                     "record_failed_reason": rsn,
                     "style": kind,
                     "zone_name": rule["zone_name"],
+                    # 事后校准用的几何: 打卡点、当时用的朝向、服务端记下的实际通过点
+                    "zone_points": [{"lat": p[0], "lng": p[1]} for p in rule["pts"]],
+                    "zone_axis_deg": self.zone_profile.get("long_axis_deg"),
+                    "zone_axis_source": self.zone_profile.get("axis_source"),
+                    "used_time": used,
+                    "passed_points": (detail or {}).get("point_list"),
                 }
                 self.log("RUN_RESULT:" + json.dumps(summary, ensure_ascii=False))
                 if summary["record_id"] and str(stt) in ("0", "1") \

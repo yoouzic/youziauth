@@ -814,6 +814,26 @@ class DesktopBridge(LocationProbe):
             if not open_mini_program(OFFICIAL_MINI_PROGRAM_URI):
                 raise RuntimeError('无法打开小程序，请在微信搜索「数体智慧体育」。')
             return '已请求微信打开小程序。若未弹出，请在微信搜索「数体智慧体育」。'
+        if action == 'lptiyu_export_samples':
+            controller = self._lptiyu
+            if controller is None:
+                raise RuntimeError('乐跑功能在本机暂不可用')
+            from lptiyu_share import build_markdown
+            try:
+                version = (Path(__file__).with_name('VERSION')
+                           .read_text(encoding='utf-8').strip())
+            except OSError:
+                version = ''
+            stamp = dt.datetime.now().strftime('%Y%m%d-%H%M')
+            desktop = Path(os.path.expanduser('~')) / 'Desktop'
+            target = desktop / f'youziauth-轨迹样本-{stamp}.md'
+            try:
+                desktop.mkdir(parents=True, exist_ok=True)
+                target.write_text(build_markdown(controller.store, version=version),
+                                  encoding='utf-8')
+            except OSError as exc:
+                raise RuntimeError(f'写不了桌面文件：{exc}') from None
+            return f'已导出 {target.name}（在桌面），原样发回即可'
         if action == 'lptiyu_capture':
             controller = self._lptiyu
             if controller is None:
@@ -1551,6 +1571,8 @@ class PreviewBridge(LocationProbe):
                                             message='已同步研究库的最新凭证（演示）')
             elif action == 'lptiyu_open_official':
                 return {'ok': True, 'message': '演示：正式桌面端会请求微信打开「数体智慧体育」。'}
+            elif action == 'lptiyu_export_samples':
+                return {'ok': True, 'message': '演示：会导出 youziauth-轨迹样本.md。'}
             elif action == 'lptiyu_cert_install':
                 self._data['lptiyu']['capture'].update(cert_installed=True,
                                                        fingerprint='DEMO0000000000')

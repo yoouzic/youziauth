@@ -1481,6 +1481,21 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertTrue(result['ok'])
         self.assertEqual(self.store.settings().lab_dir, '')
 
+    def test_export_samples_writes_a_markdown_file(self):
+        self.controller.store.record_sample({'record_id': 'R1', 'zone_id': '1873',
+                                             'zone_name': '第二运动场',
+                                             'zone_points': [{'lat': 29.825441,
+                                                              'lng': 106.428002}]})
+        home = Path(self.tmp.name) / 'home'
+        with patch('desktop_bridge.os.path.expanduser', return_value=str(home)):
+            result = self.bridge.dispatch('lptiyu_export_samples')
+        self.assertTrue(result['ok'])
+        files = list((home / 'Desktop').glob('youziauth-轨迹样本-*.md'))
+        self.assertEqual(len(files), 1)
+        text = files[0].read_text(encoding='utf-8')
+        self.assertIn('1873 第二运动场', text)
+        self.assertIn('29.825441', text)
+
     def test_snapshot_has_a_capture_block(self):
         state = self.bridge.snapshot()['lptiyu']['capture']
         self.assertTrue(state['available'])

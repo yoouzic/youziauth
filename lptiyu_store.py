@@ -243,6 +243,30 @@ class Store:
         self._write('status.json', status)
 
     # ------------------------------------------------------------- 续期台账
+    MAX_SAMPLES = 200
+
+    def samples(self):
+        """留档的轨迹样本(最近优先): 跑区几何 + 本次结果, 用来事后校准朝向/形状。"""
+        try:
+            rows = json.loads((self.root / 'samples.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            rows = []
+        if not isinstance(rows, list):
+            return []
+        return [row for row in rows if isinstance(row, dict)][:self.MAX_SAMPLES]
+
+    def record_sample(self, entry):
+        """记一次样本; 同一个 record_id 只留一份。返回是否真的写进去了。"""
+        if not isinstance(entry, dict):
+            return False
+        rows = self.samples()
+        record_id = str(entry.get('record_id') or '')
+        if record_id and any(str(row.get('record_id') or '') == record_id for row in rows):
+            return False
+        rows.insert(0, entry)
+        self._write('samples.json', rows[:self.MAX_SAMPLES])
+        return True
+
     def capture_state(self):
         """自动采集的次数与最近一次尝试(按天记账, 免得一天到晚抢着开小程序)。"""
         try:
@@ -432,7 +456,27 @@ class Store:
         from lptiyu import zones as zone_geom  # noqa: PLC0415
 
         entry = self.zones().get(str(zone_id or '')) or {}
-        return zone_geom.normalize_tuning(entry.get('tuning'))
+        tuning = zone_geom.normalize_tuning(entry.get('tuning'))
+        # 用户没手填朝向时, 用本机历史轨迹学出来的那条补上
+        if not tuning.get('axis_deg'):
+            learned = entry.get('axis_learned') or {}
+            try:
+                tuning['axis_deg'] = round(float(learned.get('deg') or 0.0) % 180.0, 1)
+            except (TypeError, ValueError):
+                tuning['axis_deg'] = 0.0
+        return tuning
+
+    def save_zone_axis(self, zone_id, deg, share=0.0):
+        """把从真实通过点学到的朝向写进跑区记录(不动用户特调)。"""
+        key = str(zone_id or '')
+        catalog = self.zones()
+        entry = catalog.get(key)
+        if not key or not isinstance(entry, dict):
+            return False
+        entry['axis_learned'] = {'deg': round(float(deg) % 180.0, 1),
+                                 'share': round(float(share or 0.0), 2)}
+        self._write('zones.json', catalog)
+        return True
 
     def zone_summary(self, zone_id):
         """某跑区的几何摘要(给界面); 没有点位时返回 None。"""

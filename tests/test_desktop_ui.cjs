@@ -2202,6 +2202,15 @@ test('lptiyu capture walks from certificate to waiting',async()=>{
   assert.equal(waiting.calls.at(-1).action,'lptiyu_capture_stop');
 });
 
+test('lptiyu can export the trajectory samples',async()=>{
+  const h=await lptiyuPage({has_token:true});
+  const button=h.el('lp-export-samples');
+  assert.ok(button,'采集区里要有导出按钮');
+  button.listeners.click();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(h.calls.at(-1).action,'lptiyu_export_samples');
+});
+
 test('lptiyu pace accepts minutes and seconds, and refuses nonsense',async()=>{
   const h=await lptiyuPage({settings:{enabled:true,run_time:'06:30',dist_lo:2.03,dist_hi:2.35,
     pace_lo:0,pace_hi:0,anchor_max_m:20,max_per_day:1,time_lo:'06:00',time_hi:'23:00',
