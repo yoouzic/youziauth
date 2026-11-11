@@ -39,10 +39,6 @@ def open_mini_program(uri=OFFICIAL_MINI_PROGRAM_URI, timeout=6.0):
     ShellExecute 在没有微信的机器上可能挂着等「选择一个应用」的对话框 ——
     放到后台线程里等一小会儿就好, 采集流程不能被它卡死。
     """
-    if os.environ.get('CI'):
-        # GitHub 的 Windows runner 上没有注册 weixin://, ShellExecute 会卡在
-        # 「选择一个应用」; 构建机上也不会有人用采集, 直接当作唤不起。
-        return False
     result = {}
 
     def run():
