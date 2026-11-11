@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from lptiyu_store import Settings, Store
 
@@ -173,11 +174,15 @@ class LabSyncTests(unittest.TestCase):
             self.assertFalse(store.has_token())
 
     def test_sync_without_lab_reports_clearly(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp))
-            changes, message = store.sync_from_lab()
-            self.assertEqual(changes, [])
-            self.assertIn('未找到', message)
+        # 封闭性: 桌面已知文件夹的自动发现可能命中本机真实研究库, 必须钉死为空,
+        # 否则这台装着研究库的机器上, 「没有 lab」的路径永远测不到。
+        with patch.object(Store, '_known_desktop_dirs', lambda self: []), \
+             patch.object(Store, 'LAB_HINTS', ()):
+            with tempfile.TemporaryDirectory() as tmp:
+                store = Store(Path(tmp))
+                changes, message = store.sync_from_lab()
+                self.assertEqual(changes, [])
+                self.assertIn('未找到', message)
 
 
 if __name__ == '__main__':

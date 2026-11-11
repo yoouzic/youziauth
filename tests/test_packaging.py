@@ -26,9 +26,12 @@ class PackagingWorkflowTests(unittest.TestCase):
         # PyYAML 是 proxy_rules.py 读取 Clash Verge 配置（YAML）的依赖：它在本机
         # 只是别的包的传递依赖，不写在这里 CI 就装不到，测试会以
         # No module named yaml 失败（实测踩过）。
+        # pycryptodome 是乐跑模块（lptiyu.cipher）协议信封加密的依赖：缺失时
+        # 整个乐跑功能降级为不可用，同样必须钉住（2026-11-11 实测 4.4.0）。
         self.assertEqual(
             lines,
-            ["Pillow==12.2.0", "PyInstaller==6.16.0", "numpy==2.4.4", "PyYAML==6.0.3"],
+            ["Pillow==12.2.0", "PyInstaller==6.16.0", "numpy==2.4.4", "PyYAML==6.0.3",
+             "pycryptodome==4.4.0"],
         )
         self.assertTrue(all("==" in line for line in lines))
 
