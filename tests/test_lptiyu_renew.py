@@ -72,9 +72,10 @@ class RenewTestCase(unittest.TestCase):
         self.addCleanup(lab.stop)
 
     # ---------------------------------------------------------------- 工具
-    def renewer(self):
+    def renewer(self, can_capture=None):
         return CredentialRenewer(self.store, clock=self.clock,
-                                 probe=self.probe, grab=self.grab)
+                                 probe=self.probe, grab=self.grab,
+                                 can_capture=can_capture)
 
     def token(self, value='TOK', issued='2026-11-11T01:00:00'):
         self.store.save_token_record(value, issued_at=issued, source='test')
@@ -136,6 +137,14 @@ class RenewLadderTests(RenewTestCase):
         self.assertEqual(outcome.state, 'renewed')
         self.assertEqual(self.store.token(), 'CONSUMED-BUT-ALIVE')
         self.assertEqual(self.probe.calls, 1)
+
+    def test_with_the_builtin_capture_it_does_not_send_people_to_the_lab(self):
+        # 装好采集证书的机器上, 续期应该指「开始采集」, 而不是「去填研究库」
+        outcome = self.renewer(can_capture=lambda: True).renew()
+        self.assertEqual(outcome.state, 'need_user')
+        self.assertIn('开始采集', outcome.message)
+        self.assertNotIn('研究库', outcome.message)
+        self.assertEqual(self.grab.calls, 0, '有内置采集就不该再起研究库那条路')
 
     def test_without_a_lab_it_names_the_missing_capture_component(self):
         outcome = self.renewer().renew()

@@ -327,12 +327,21 @@ class Store:
             'events': events[-20:],
         }
         self._write('renewal.json', value)
-        if state != 'ok':
+        if state != 'ok' and not self._same_as_last_history(text):
             # 例行探活不是「发生过的事」: 台账里有记录就够了, 运行记录页只留
-            # 换号 / 需要人动手 / 链路故障这类需要人看的行。
+            # 换号 / 需要人动手 / 链路故障这类需要人看的行; 同一句话重复十几次
+            # (没有采集组件时的自动续期)也只留第一次。
             self._append_history(f'{stamp} [{state}] {text}'
                                  + (f' · {detail}' if detail else ''))
         return value
+
+    def _same_as_last_history(self, text):
+        """上一行历史是不是同一句话(去掉时间戳与状态之后比)。"""
+        try:
+            tail = self.history().strip().splitlines()[-1]
+        except (OSError, IndexError):
+            return False
+        return str(text) and str(text) in tail
 
     def history(self):
         try:

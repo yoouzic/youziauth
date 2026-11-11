@@ -208,7 +208,7 @@ class LptiyuController:
         self._flow_factory = flow_factory   # 测试注入; 正式路径现场构造 DailyFlow
         # 续期器也允许注入: 单测里给一个假的, 就不必碰网络和子进程。
         self.renewer = renewer or CredentialRenewer(
-            self.store, clock=self._clock,
+            self.store, clock=self._clock, can_capture=self.capture_ready,
             probe=self._probe_record, grab=self._grab_via_lab)
         self.events = queue.Queue()
         self.busy = False

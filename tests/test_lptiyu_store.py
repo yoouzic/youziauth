@@ -353,6 +353,17 @@ class ZoneCatalogTests(unittest.TestCase):
                               'anchor_m': 0.0, 'start_deg': 0.0,
                               'axis_deg': 0.0})
 
+    def test_the_same_need_user_line_is_written_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            for _ in range(4):
+                store.record_renewal('need_user', '点「开始采集」，微信打开小程序就能拿到凭证')
+            lines = [line for line in store.history().splitlines() if '[need_user]' in line]
+            self.assertEqual(len(lines), 1, '同一句话重复十几次只留第一行')
+            store.record_renewal('need_user', '换了一句新的提示')
+            lines = [line for line in store.history().splitlines() if '[need_user]' in line]
+            self.assertEqual(len(lines), 2)
+
     def test_a_learned_axis_fills_in_but_never_overrides_the_user(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp))

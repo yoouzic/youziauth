@@ -53,11 +53,13 @@ class CredentialRenewer:
     grab() -> (ok, reason)           起一次主动采集(用户要在小程序点一次)
     """
 
-    def __init__(self, store, clock=None, probe=None, grab=None):
+    def __init__(self, store, clock=None, probe=None, grab=None, can_capture=None):
         self.store = store
         self._clock = clock or now
         self._probe = probe or (lambda record: (None, '未配置探活'))
         self._grab = grab or (lambda: (False, '未配置采集'))
+        # 内置采集(不用研究库)能不能用: 由控制器按证书是否安装给出
+        self._can_capture = can_capture or (lambda: False)
 
     # ------------------------------------------------------------- 何时该续
     def due(self, settings=None):
@@ -141,7 +143,12 @@ class CredentialRenewer:
             self.store.record_probe(False)
 
         if not self.store.lab_dir():
-            # 没有采集组件就没人能替用户取号; 让他去点「同步凭证」只会再失败一次。
+            # 有内置采集就直接走它, 不要再往「研究库」那条路上撞 —— 那只会给用户
+            # 刷出一堆「未找到研究库目录」, 而真正该做的是点一下开始采集。
+            if self._can_capture():
+                return self._need_user(f'{reason}：点「开始采集」，'
+                                       f'微信打开小程序就能拿到凭证')
+            # 既没有研究库也不能自己采: 只能让用户想别的办法。
             return self._need_user(f'{reason}：本机没有采集组件（研究库），'
                                    f'请先在跑步设置里填写研究库目录')
         # 配额是硬的: 手动点击只越过冷却, 不越过「今天最多采集两次」—— 采集链要用户
