@@ -468,7 +468,12 @@ class DesktopBridge(LocationProbe):
                 # 跑区: 目录给下拉框, 选中跑区的几何摘要给「特调」这行字。
                 'zones': zones,
                 'zone': {'id': selected,
-                         'name': str(settings.zone_name or '') if selected else default_name,
+                         # 名称以跑区目录为准: 设置里存的名字可能来自更早的跑区,
+                         # 只有 id 对得上才敢用它, 否则界面会显示一块对不上的场地。
+                         'name': next((z['name'] for z in zones
+                                       if z['id'] == selected and z['name']), '')
+                                 or (str(settings.zone_name or '') if selected
+                                     else default_name),
                          'tuning': store.zone_tuning(selected) if selected else
                                    {'direction': 'auto', 'lane_m': 0.0,
                                     'anchor_m': 0.0, 'start_deg': 0.0},

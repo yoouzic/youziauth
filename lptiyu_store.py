@@ -150,6 +150,30 @@ class Store:
     def save_settings(self, settings):
         self._write('settings.json', dataclasses.asdict(settings.validate()))
 
+    def save_zone_selection(self, zone_id, zone_name=''):
+        """把「当前跑区」写进设置。返回是否真的变了。
+
+        服务端的当前跑区是会话态: 用户在小程序里换了场地, 我们只能从 beforeRun
+        读回来。读到了就写进设置, 状态栏才会跟着走 —— 否则界面一直显示上一次
+        选的场地, 而实际跑的是新的那块。
+        """
+        zone_id = str(zone_id or '').strip()
+        if not zone_id:
+            return False
+        try:
+            current = self.settings()
+        except (OSError, ValueError):
+            return False
+        name = str(zone_name or '').strip()
+        if current.zone_id == zone_id and (not name or current.zone_name == name):
+            return False
+        # Settings 是 frozen 的: 用 replace 造一份新的, 不要就地改。
+        updated = dataclasses.replace(
+            current, zone_id=zone_id,
+            zone_name=name or current.zone_name)
+        self.save_settings(updated)
+        return True
+
     def identity(self):
         value = self._read('identity.json', {})
         return value if isinstance(value, dict) else {}

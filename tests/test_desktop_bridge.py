@@ -1453,6 +1453,18 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertIn('跑区', result['message'])
         self.controller._wait_for_work()
 
+    def test_the_snapshot_names_the_selected_zone_from_the_catalog(self):
+        self.store.save_zone_points('1874', '第一运动场',
+                                    [{'lat': 29.8237, 'lng': 106.4302, 'point_id': '1'},
+                                     {'lat': 29.8245, 'lng': 106.4315, 'point_id': '2'},
+                                     {'lat': 29.8231, 'lng': 106.4318, 'point_id': '3'}])
+        # 设置里的名字是旧的(或者空的), 快照要按跑区目录纠正成当前这块
+        self.store.save_settings(_lptiyu_store.Settings(
+            zone_id='1874', zone_name='第二运动场'))
+        zone = self.bridge.snapshot()['lptiyu']['zone']
+        self.assertEqual(zone['id'], '1874')
+        self.assertEqual(zone['name'], '第一运动场')
+
     def test_snapshot_reports_a_missing_capture_component(self):
         with patch.object(type(self.store), 'lab_dir', lambda store: ''):
             state = self.bridge.snapshot()['lptiyu']

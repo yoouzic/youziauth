@@ -378,6 +378,20 @@ class ZoneCatalogTests(unittest.TestCase):
             self.assertEqual(store.zone_tuning('1873')['axis_deg'], 12.0,
                              '用户手填的朝向优先')
 
+    def test_the_zone_selection_follows_the_server(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.save_settings(Settings(zone_id='1873', zone_name='第二运动场'))
+            self.assertTrue(store.save_zone_selection('1874', '第一运动场'),
+                            '小程序换了跑区, 设置要跟着走')
+            current = store.settings()
+            self.assertEqual((current.zone_id, current.zone_name),
+                             ('1874', '第一运动场'))
+            self.assertFalse(store.save_zone_selection('1874', '第一运动场'),
+                             '没变就不要反复写盘')
+            self.assertEqual(store.settings().dist_lo, 2.03, '别的字段不许被顺手改掉')
+            self.assertFalse(store.save_zone_selection(''), '空 id 不写')
+
     def test_unknown_or_too_few_points_has_no_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp))

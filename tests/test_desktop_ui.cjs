@@ -2202,6 +2202,15 @@ test('lptiyu capture walks from certificate to waiting',async()=>{
   assert.equal(waiting.calls.at(-1).action,'lptiyu_capture_stop');
 });
 
+test('lptiyu can refresh the selected zone from the server',async()=>{
+  const h=await lptiyuPage({has_token:true});
+  const button=h.el('lp-zone-refresh');
+  assert.ok(button,'今日跑步卡里要有刷新跑区的入口');
+  button.listeners.click();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(h.calls.at(-1).action,'lptiyu_zones');
+});
+
 test('lptiyu can run the capture self-check',async()=>{
   const h=await lptiyuPage({has_token:true});
   const button=h.el('lp-diagnose');

@@ -631,11 +631,16 @@ class LptiyuController:
         return points
 
     def _zone_sink(self, zone_id, zone_name, points, zone_list):
-        """流水线读到真机点位后留档: 每块场地的朝向/宽窄不同, 特调各算各的。"""
+        """流水线读到真机点位后留档: 每块场地的朝向/宽窄不同, 特调各算各的。
+
+        顺带把「当前跑区」写回设置 —— 用户在小程序里换了场地时, 这里是唯一
+        读得到新跑区的地方; 不写回去, 状态栏会一直显示上一次的场地。
+        """
         try:
             if zone_list:
                 self.store.save_zone_list(zone_list)
             self.store.save_zone_points(zone_id, zone_name, points)
+            self.store.save_zone_selection(zone_id, zone_name)
         except Exception:  # noqa: BLE001 —— 留档失败不影响这一次跑步
             pass
 
@@ -659,6 +664,9 @@ class LptiyuController:
                  if isinstance(zone, dict) and str(zone.get('id') or '')]
         self.store.save_zone_list(zones)
         original = str(cfg.get('run_zone_id') or '')
+        # 服务端当前跑区 = 用户在小程序里选的那块: 先记进设置, 收尾才能还原到
+        # 正确的那块。以前还原的是设置里的旧值, 于是换了跑区后状态栏一直不同步。
+        self.store.save_zone_selection(original, str(cfg.get('run_zone_name') or ''))
         last = original
         done = set()
         if original:

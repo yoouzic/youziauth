@@ -307,9 +307,9 @@ class FakeZoneClient:
     BASE = [(29.8237, 106.4302), (29.8245, 106.4315),
             (29.8231, 106.4318), (29.8223, 106.4305)]
 
-    def __init__(self, zones):
+    def __init__(self, zones, current=None):
         self.zones = zones
-        self.current = zones[0]['id']
+        self.current = current or zones[0]['id']
         self.set_calls = []
 
     def set_zone(self, zone_id):
@@ -325,6 +325,25 @@ class FakeZoneClient:
                     {'id': index + 1, 'jingwei': f'{lat},{lng}'}
                     for index, (lat, lng) in enumerate(self.BASE)]},
                 'time_rule_arr': [{'min_distance': 2.0, 'max_distance': 10.0}]}
+
+
+class ZoneSyncAdoptsTests(PanelTestCase):
+    def test_syncing_adopts_the_zone_the_mini_program_has(self):
+        controller = self.make_controller(
+            settings=Settings(enabled=True, zone_id='1873', zone_name='第二运动场'))
+        client = FakeZoneClient(ZoneSyncTests.ZONES, current='1874')
+        with patch.object(TokenSlot, 'make_client', lambda self, pace=0: client):
+            controller._sync_zones()
+        current = controller.store.settings()
+        self.assertEqual(current.zone_id, '1874', '服务器当前跑区(1874)才是事实')
+        self.assertEqual(current.zone_name, '第一运动场')
+
+    def test_the_sink_writes_the_selection_too(self):
+        controller = self.make_controller()
+        controller._zone_sink('1875', '第四运动场',
+                              [{'lat': 29.81, 'lng': 106.42}], [])
+        self.assertEqual(controller.store.settings().zone_id, '1875')
+        self.assertEqual(controller.store.settings().zone_name, '第四运动场')
 
 
 class ZoneSyncTests(PanelTestCase):

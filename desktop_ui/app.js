@@ -779,7 +779,9 @@ function renderRunStatus(lp,s){
   if($('lp-message').textContent!==message)$('lp-message').textContent=message;
   $('lp-details').hidden=!s.run_time;
   if(s.run_time){
-    $('lp-zone').textContent=(lp.zone&&lp.zone.name)||s.zone_name||s.zone_id||'未指定';
+    // 名称以zone区块为准(它按跑区目录校正过); 只有拿不到名字才退到 id。
+    $('lp-zone').textContent=(lp.zone&&lp.zone.name)
+      ||(lp.zone&&lp.zone.id)||s.zone_name||s.zone_id||'未指定';
     $('lp-distance').textContent=`${s.dist_lo}–${s.dist_hi} km`;
     $('lp-pace-detail').textContent=paceRangeLabel(...paceWindow(lp));
     $('lp-last').textContent=lp.last
