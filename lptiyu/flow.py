@@ -134,8 +134,9 @@ class DailyFlow:
             # 用这一次真机返回的点位算场地几何: 每块场地的朝向/宽窄都不同,
             # 贴点半径、跑道与起步方位必须按场地算, 不能吃全局默认。
             from . import zones as zone_geom
-            self.zone_profile = zone_geom.profile([(p[0], p[1]) for p in pts],
-                                                  self.zone_tuning)
+            self.zone_profile = zone_geom.profile(
+                [(p[0], p[1]) for p in pts], self.zone_tuning,
+                zone_id=cfg.get("run_zone_id"))
             self.log(f"[1a] 场地 长轴={self.zone_profile.get('long_axis_deg')}° "
                      f"长宽={self.zone_profile.get('length_m')}x"
                      f"{self.zone_profile.get('width_m')}m "

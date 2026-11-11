@@ -327,7 +327,7 @@ def ring_track(anchors, target_m, rnd=None, profile=None):
             pts3.append((float(a[0]), float(a[1]),
                          str(a[2]) if len(a) > 2 else str(index)))
     plain = [(p[0], p[1]) for p in pts3]
-    geom = zone_geom.analyze(plain)
+    geom = zone_geom.analyze(plain, zone_id=prof.get("zone_id"))
     direction = prof.get("direction") or geom["winding"]
     lane = float(prof.get("lane_m") or 0.0)
     start_deg = prof.get("start_deg")
@@ -335,7 +335,8 @@ def ring_track(anchors, target_m, rnd=None, profile=None):
     route = []
     for _lap in range(200):
         lap = zone_geom.route_points(plain, lane_m=lane + rnd.uniform(-0.6, 0.6),
-                                     direction=direction, start_deg=start_deg, rnd=rnd)
+                                     direction=direction, start_deg=start_deg, rnd=rnd,
+                                     zone_id=prof.get("zone_id"))
         if len(lap) < 2:
             break
         if route:

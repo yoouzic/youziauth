@@ -122,9 +122,13 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(prof['lane_m'], 3.0)
         self.assertEqual(prof['start_deg'], 45.0)
 
-    def test_auto_direction_uses_the_winding(self):
-        self.assertEqual(zones.profile(rect(order='cw'))['direction'], 'cw')
+    def test_auto_direction_is_counter_clockwise(self):
+        # 打卡点是「点」不是「路」: 服务器下发顺序的环绕方向不代表跑向。
+        # 实测那次跑动是逆时针, 所以 auto 固定给 ccw, 顺时针只能由跑区特调覆盖。
+        self.assertEqual(zones.profile(rect(order='cw'))['direction'], 'ccw')
         self.assertEqual(zones.profile(rect(order='ccw'))['direction'], 'ccw')
+        self.assertEqual(zones.profile(rect(), {'direction': 'cw'})['direction'], 'cw')
+        self.assertEqual(zones.profile(rect(), {'direction': 'cw'})['direction_choice'], 'cw')
 
     def test_normalize_tuning_drops_unknown_values(self):
         self.assertEqual(zones.normalize_tuning({'direction': 'sideways', 'lane_m': -2}),
@@ -195,6 +199,89 @@ class TrackLoopTests(unittest.TestCase):
     def test_square_is_not_a_track(self):
         xy = [enu_of(p[0], p[1], *CENTER) for p in rect(80, 80)]
         self.assertIsNone(zones._track_loop(xy), '正方形不该被铺成带弯道的跑道环')
+
+
+class AxisTests(unittest.TestCase):
+    """跑区朝向: 已知跑区用实测长轴, 不认识的才回退到外接矩形/PCA。"""
+
+    def test_a_known_zone_uses_the_measured_axis(self):
+        # 1873 的四个打卡点摆成菱形, PCA 会给出 ~111.9°, 实测是 160.1°
+        geom = zones.analyze(rect(120, 60, angle_deg=111.9), zone_id='1873')
+        self.assertEqual(geom['long_axis_deg'], 160.1)
+        self.assertEqual(geom['axis_source'], 'prior')
+
+    def test_an_unknown_zone_falls_back_to_the_rectangle(self):
+        # rect() 的 angle_deg 是数学角(逆时针), 罗盘方位 = -angle_deg mod 180
+        geom = zones.analyze(rect(220, 140, angle_deg=-37.0), zone_id='9999')
+        self.assertEqual(geom['axis_source'], 'rect')
+        self.assertAlmostEqual(geom['long_axis_deg'], 37.0, delta=4.0)
+
+    def test_profile_carries_the_zone_and_the_axis_source(self):
+        prof = zones.profile(rect(), {'direction': 'ccw'}, zone_id='1875')
+        self.assertEqual(prof['zone_id'], '1875')
+        self.assertEqual(prof['axis_source'], 'prior')
+        self.assertEqual(prof['long_axis_deg'], 16.9)
+        self.assertEqual(prof['start_deg'], 16.9, '默认从长轴方向起步')
+
+    def test_the_route_follows_the_axis_of_a_rotated_field(self):
+        # 1873 实测 160.1°: 生成的环长轴也该在这条线上, 而不是 PCA 的对角线
+        points = rect(220, 140, angle_deg=-160.1)   # 数学角 -160.1° = 方位 160.1°
+        route = zones.route_points(points, lane_m=0, direction='ccw',
+                                   rnd=random.Random(3), zone_id='1873')
+        clat = sum(p[0] for p in route) / len(route)
+        clng = sum(p[1] for p in route) / len(route)
+        xy = [((p[1] - clng) * 111320 * math.cos(math.radians(clat)),
+               (p[0] - clat) * 110570) for p in route]
+        sxx = sum(x * x for x, _ in xy) / len(xy)
+        syy = sum(y * y for _, y in xy) / len(xy)
+        sxy = sum(x * y for x, y in xy) / len(xy)
+        angle = 0.5 * math.atan2(2 * sxy, sxx - syy)
+        bearing = (90.0 - math.degrees(angle)) % 180.0
+        delta = abs(bearing - 160.1)
+        self.assertLess(min(delta, 180.0 - delta), 4.0,
+                        f'环的长轴 {bearing:.1f}° 应该贴着实测的 160.1°')
+
+
+class RoundedLoopTests(unittest.TestCase):
+    """菱形点位(边长接近)不能走半圆弯兜底: 那样两个打卡点会漏掉。"""
+
+    def diamond(self):
+        return [(0.0, 1.0), (0.7, 0.0), (0.0, -1.0), (-0.7, 0.0)] if False else [
+            p for p in rect(120, 60, angle_deg=45.0)]
+
+    def test_every_checkpoint_stays_near_the_route(self):
+        points = self.diamond()
+        route = zones.route_points(points, lane_m=0, direction='ccw',
+                                   rnd=random.Random(5), zone_id='9999')
+        clat = sum(p[0] for p in points) / len(points)
+        clng = sum(p[1] for p in points) / len(points)
+        rxy = [((p[1] - clng) * 111320 * math.cos(math.radians(clat)),
+                (p[0] - clat) * 110570) for p in route]
+        for point in points:
+            px = (point[1] - clng) * 111320 * math.cos(math.radians(clat))
+            py = (point[0] - clat) * 110570
+            nearest = min(math.hypot(x - px, y - py) for x, y in rxy)
+            self.assertLess(nearest, 12.0, f'打卡点离环 {nearest:.1f}m, 太远')
+
+    def test_the_loop_has_no_sharp_corners(self):
+        route = zones.route_points(rect(200, 120, angle_deg=20.0), lane_m=0,
+                                   direction='ccw', rnd=random.Random(2),
+                                   zone_id='9999')
+        clat = sum(p[0] for p in route) / len(route)
+        clng = sum(p[1] for p in route) / len(route)
+        xy = [((p[1] - clng) * 111320 * math.cos(math.radians(clat)),
+               (p[0] - clat) * 110570) for p in route]
+        worst = 0.0
+        for a, b, c in zip(xy, xy[1:], xy[2:]):
+            v1 = (b[0] - a[0], b[1] - a[1])
+            v2 = (c[0] - b[0], c[1] - b[1])
+            l1 = math.hypot(*v1)
+            l2 = math.hypot(*v2)
+            if l1 < 0.3 or l2 < 0.3:
+                continue
+            cosang = max(-1.0, min(1.0, (v1[0] * v2[0] + v1[1] * v2[1]) / (l1 * l2)))
+            worst = max(worst, math.degrees(math.acos(cosang)))
+        self.assertLess(worst, 35.0, f'最大转角 {worst:.1f}°, 还是折线')
 
 
 class RouteTests(unittest.TestCase):
