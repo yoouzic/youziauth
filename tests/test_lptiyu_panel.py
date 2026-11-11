@@ -83,7 +83,8 @@ class PanelTestCase(unittest.TestCase):
 
         controller = LptiyuController(store=self.store, clock=clock or CLOCK,
                                       flow_factory=factory, renewer=self.renewer,
-                                      capture=capture, open_applet=open_applet)
+                                      capture=capture,
+                                      open_applet=open_applet or (lambda: True))
         self.addCleanup(controller.close)
         return controller
 

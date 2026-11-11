@@ -33,13 +33,29 @@ from lptiyu_store import Store, Settings, now, parse_time
 OFFICIAL_MINI_PROGRAM_URI = 'weixin://launchapplet/?app_id=wxb2043232183dac7f'
 
 
-def open_mini_program(uri=OFFICIAL_MINI_PROGRAM_URI):
-    """让微信打开小程序; 返回是否真的发起了。"""
-    try:
-        os.startfile(uri)          # ShellExecute 走 weixin:// 协议
-        return True
-    except (OSError, AttributeError):
+def open_mini_program(uri=OFFICIAL_MINI_PROGRAM_URI, timeout=6.0):
+    """让微信打开小程序; 返回是否真的发起了。
+
+    ShellExecute 在没有微信的机器上可能挂着等「选择一个应用」的对话框 ——
+    放到后台线程里等一小会儿就好, 采集流程不能被它卡死。
+    """
+    if os.environ.get('CI'):
+        # GitHub 的 Windows runner 上没有注册 weixin://, ShellExecute 会卡在
+        # 「选择一个应用」; 构建机上也不会有人用采集, 直接当作唤不起。
         return False
+    result = {}
+
+    def run():
+        try:
+            os.startfile(uri)      # ShellExecute 走 weixin:// 协议
+            result['ok'] = True
+        except (OSError, AttributeError):
+            result['ok'] = False
+
+    worker = threading.Thread(target=run, name='youziauth-open-applet', daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return bool(result.get('ok'))
 
 
 MAX_DAILY_AUTO_ATTEMPTS = 3
