@@ -813,8 +813,8 @@ function captureText(cap){
   const state=cap.state||'idle';
   if(state==='waiting'){
     const left=Math.ceil(Number(cap.remaining_s)||0);
-    return left?`正在等待小程序登录（还剩 ${Math.max(1,Math.round(left/60))} 分钟）`
-      :'正在等待小程序登录';
+    return left?`正在等待小程序请求（还剩 ${Math.max(1,Math.round(left/60))} 分钟）`
+      :'正在等待小程序请求';
   }
   if(state==='captured')return '已抓到凭证';
   if(state==='timeout')return '等待超时：再点一次「开始采集」';

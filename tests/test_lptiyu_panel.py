@@ -408,7 +408,9 @@ class FakeCapture:
         self.started += 1
         self.state, self.message = "waiting", "等待小程序登录"
 
-    def wait(self, timeout=None):
+    def wait(self, timeout=None, on_tick=None):
+        if on_tick is not None:
+            on_tick()
         self.state = self.final.get("state", "captured" if self.cred else "timeout")
         self.message = self.final.get("message", "等待超时")
         return self.cred
@@ -479,6 +481,12 @@ class AutoCaptureTests(PanelTestCase):
         controller._wait_for_work()
         self.assertEqual(capture.started, 1, '下一拍就该把采集接过来')
 
+
+class MiniProgramTests(unittest.TestCase):
+    def test_a_missing_wechat_is_explained(self):
+        with patch.object(lptiyu_panel, 'wechat_installed', lambda: False):
+            self.assertFalse(lptiyu_panel.open_mini_program('weixin://x'))
+        self.assertIn('没有找到微信', lptiyu_panel.LAST_LAUNCH_REASON)
 
 class MiniProgramTests(unittest.TestCase):
     def test_launcher_reports_whether_it_started(self):

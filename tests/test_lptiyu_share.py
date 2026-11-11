@@ -64,6 +64,21 @@ class ReportTests(unittest.TestCase):
         text = build_markdown(store)
         self.assertIn('未在打卡点打卡', text)
 
+    def test_the_capture_log_rides_along(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'capture').mkdir()
+            (root / 'capture' / 'capture.log').write_text(
+                '[21:00:01] 采集开始 127.0.0.1:5100\n[21:00:09] CONNECT api2.lptiyu.com:443\n',
+                encoding='utf-8')
+            store = FakeStore([a_sample()])
+            store.root = root
+            text = build_markdown(store)
+            self.assertIn('采集诊断', text)
+            self.assertIn('CONNECT api2.lptiyu.com:443', text)
+
     def test_an_empty_store_says_what_to_do(self):
         text = build_markdown(FakeStore([]))
         self.assertIn('还没有跑区数据', text)

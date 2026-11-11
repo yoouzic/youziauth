@@ -400,6 +400,22 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(session.status()["state"], "timeout")
         self.assertEqual(proxy.restored, 1)
 
+    def test_a_stolen_proxy_is_pointed_back_at_us(self):
+        session, proxy, _ca = self.session()
+        proxy.read = lambda: (1, "127.0.0.1:7890", "")     # Clash 抢回去了
+        proxy.pointed = 0
+        session.start()
+        self.assertTrue(session.ensure_proxy(), '被抢走就要抢回来')
+        self.assertEqual(proxy.pointed, 18888)
+        session.stop("idle", "")
+
+    def test_wait_reports_progress_on_every_tick(self):
+        session, _proxy, _ca = self.session(timeout=3.0)
+        session.start()
+        ticks = []
+        session.wait(timeout=1.4, on_tick=lambda: ticks.append(1))
+        self.assertGreaterEqual(len(ticks), 1, '等的时候要能回钩, 采集流程靠它做体检')
+
     def test_stale_proxy_backup_is_restored_before_starting(self):
         session, proxy, _ca = self.session()
         proxy.backup = True

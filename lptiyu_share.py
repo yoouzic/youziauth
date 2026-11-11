@@ -138,6 +138,19 @@ def sample_line(sample):
     }
 
 
+def capture_log_tail(store, lines=40):
+    """采集日志的最后几行: 「没流量 / 握手失败 / 没登录」一看就知道是哪种。"""
+    root = getattr(store, "root", None)
+    if root is None:
+        return []
+    path = root / "capture" / "capture.log"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return [line for line in text.splitlines() if line.strip()][-lines:]
+
+
 def build_markdown(store, version="", now=None):
     """整份报告。store 需要 samples() / zones() / settings()。"""
     now = now or dt.datetime.now()
@@ -217,6 +230,15 @@ def build_markdown(store, version="", now=None):
                 lines.append(f"{lat:.6f}, {lng:.6f}")
             lines.append("```")
             lines.append("")
+
+    tail = capture_log_tail(store)
+    if tail:
+        lines.append("## 采集诊断（本机最近一次采集）")
+        lines.append("")
+        lines.append("```")
+        lines.extend(tail)
+        lines.append("```")
+        lines.append("")
 
     lines.append("## 想让我优先看什么")
     lines.append("")

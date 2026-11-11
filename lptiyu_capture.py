@@ -494,6 +494,7 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
             if not host_in_scope(host):
                 self._tunnel(host, port)
                 return
+            self.server.record_connect()
             self.server.log(f"CONNECT {host}:{port}")
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             cert_path, key_path = self.server.ca.leaf(host)
@@ -623,8 +624,15 @@ class _ProxyServer(socketserver.ThreadingTCPServer):
         except Exception:                  # noqa: BLE001
             pass
 
+    def record_connect(self):
+        try:
+            self.sink.connects += 1
+        except Exception:                  # noqa: BLE001
+            pass
+
     def record_request(self, host, path, body):
         try:
+            self.sink.requests += 1
             self.sink.on_request(host, path, body)
         except Exception:                  # noqa: BLE001 —— 解析失败不影响转发
             pass
@@ -659,6 +667,8 @@ class CaptureSession:
         self._port = 0
         self._deadline = 0.0
         self.identity = {}
+        self.connects = 0
+        self.requests = 0
         self.log_path = self.root / "capture.log"
 
     def log(self, message):
@@ -741,11 +751,29 @@ class CaptureSession:
             waiting = self._state == "waiting"
             expired = waiting and time.time() >= self._deadline
         if expired:
-            self.stop("timeout", "等待超时：没有看到小程序请求")
+            self.stop("timeout", f"等待超时：没有看到小程序请求（微信连接 {self.connects} 次）")
         return None
 
-    def wait(self, timeout=None):
+    def ensure_proxy(self):
+        """系统代理被别的软件(Clash/公司代理)抢回去时重新指回来。返回是否动过。"""
+        if not self._port:
+            return False
+        try:
+            enable, server, _override = self.proxy.read()
+        except Exception:                  # noqa: BLE001
+            return False
+        if int(enable) == 1 and str(server).strip() == f"127.0.0.1:{self._port}":
+            return False
+        try:
+            self.proxy.point_at(self._port)
+        except Exception:                  # noqa: BLE001
+            return False
+        self.log(f"系统代理被改回去了(现在是 {server}), 已重新指到 127.0.0.1:{self._port}")
+        return True
+
+    def wait(self, timeout=None, on_tick=None):
         deadline = time.time() + (timeout if timeout is not None else self.timeout_s)
+        last_tick = 0.0
         while time.time() < deadline:
             cred = self.poll()
             if cred:
@@ -753,8 +781,14 @@ class CaptureSession:
             with self._lock:
                 if self._state not in ("waiting", "idle"):
                     return None
+            if on_tick is not None and time.time() - last_tick >= 1.0:
+                last_tick = time.time()
+                try:
+                    on_tick()
+                except Exception:          # noqa: BLE001 —— 诊断不能打断采集
+                    pass
             time.sleep(0.2)
-        self.stop("timeout", "等待超时：没有看到小程序请求")
+        self.stop("timeout", f"等待超时：没有看到小程序请求（微信连接 {self.connects} 次）")
         return None
 
     # ---------------------------------------------------------- 流量回调

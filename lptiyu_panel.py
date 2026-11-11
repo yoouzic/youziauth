@@ -33,24 +33,64 @@ from lptiyu_store import Store, Settings, now, parse_time
 OFFICIAL_MINI_PROGRAM_URI = 'weixin://launchapplet/?app_id=wxb2043232183dac7f'
 
 
-def open_mini_program(uri=OFFICIAL_MINI_PROGRAM_URI, timeout=6.0):
-    """让微信打开小程序; 返回是否真的发起了。
+# 唤起失败时留给界面/日志的一句话(测试也会读它)。
+LAST_LAUNCH_REASON = ''
 
-    ShellExecute 在没有微信的机器上可能挂着等「选择一个应用」的对话框 ——
-    放到后台线程里等一小会儿就好, 采集流程不能被它卡死。
+WECHAT_EXES = (
+    r'C:\Program Files\Tencent\Weixin\Weixin.exe',          # 微信 4.x
+    r'C:\Program Files (x86)\Tencent\WeChat\WeChat.exe',    # 微信 3.x
+    r'C:\Program Files\Tencent\WeChat\WeChat.exe',
+)
+
+
+def wechat_protocol_registered():
+    """`weixin://` 有没有被注册 —— 没有就是没装微信/装的是精简版。"""
+    import winreg
+    for root in (winreg.HKEY_CLASSES_ROOT, winreg.HKEY_CURRENT_USER):
+        try:
+            winreg.OpenKey(root, r'Software\Classes\weixin').Close()
+            return True
+        except OSError:
+            continue
+    try:
+        winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r'weixin').Close()
+        return True
+    except OSError:
+        return False
+
+
+def wechat_installed():
+    return wechat_protocol_registered() or any(os.path.isfile(p) for p in WECHAT_EXES)
+
+
+def open_mini_program(uri=OFFICIAL_MINI_PROGRAM_URI, timeout=6.0):
+    """让微信打开小程序; 返回是否真的发起了, 并把原因写进 LAST_LAUNCH_REASON。
+
+    换过账号/换过电脑最常见的失败: 装的是精简版/微软商店版微信, `weixin://`
+    没注册; 或者根本没装。这两种情况 ShellExecute 只会弹一句「选择一个应用」,
+    或者干脆失败 —— 采集流程要能继续等, 而不是卡死。
     """
+    global LAST_LAUNCH_REASON
+    LAST_LAUNCH_REASON = ''
+    if not wechat_installed():
+        LAST_LAUNCH_REASON = '本机没有找到微信（weixin:// 未注册，也没有常见安装路径）'
+        return False
     result = {}
 
     def run():
         try:
             os.startfile(uri)      # ShellExecute 走 weixin:// 协议
             result['ok'] = True
-        except (OSError, AttributeError):
+        except (OSError, AttributeError) as exc:
             result['ok'] = False
+            result['error'] = str(exc)
 
     worker = threading.Thread(target=run, name='youziauth-open-applet', daemon=True)
     worker.start()
     worker.join(timeout)
+    if not result.get('ok'):
+        LAST_LAUNCH_REASON = (result.get('error')
+                              or '微信没有响应 weixin:// （可能被安全软件拦了）')
     return bool(result.get('ok'))
 
 
@@ -413,6 +453,7 @@ class LptiyuController:
             launched = bool(self._open_applet())
         except Exception:              # noqa: BLE001 —— 唤不起只是少一步, 不能中断采集
             launched = False
+        reason = LAST_LAUNCH_REASON
         # 注入的采集器不一定带日志接口, 记不上就算了, 不能因此中断采集。
         log = getattr(self.capture, 'log', None)
         if callable(log):
@@ -421,9 +462,28 @@ class LptiyuController:
         self._set_latest(
             'capturing',
             (prefix + '已打开小程序，等待它发出第一个请求…') if launched
-            else (prefix + '请在微信里打开「数体智慧体育」并进入跑步首页'),
+            else (prefix + (reason or '请在微信里打开「数体智慧体育」并进入跑步首页')),
             record=False)
-        cred = self.capture.wait()
+        started_at = time.monotonic()
+        hint_at = started_at + 25
+        last_check = started_at
+
+        def tick():
+            """每秒一次: 代理被抢走就抢回来; 25 秒还没流量就给一句诊断。"""
+            nonlocal hint_at, last_check
+            stamp = time.monotonic()
+            if stamp - last_check >= 10:
+                last_check = stamp
+                self.capture.ensure_proxy()
+            if hint_at and stamp >= hint_at and not getattr(self.capture, 'connects', 0):
+                hint_at = 0
+                self.capture.log('25 秒内没有任何连接: 微信可能没走系统代理, 或被别的代理软件接管')
+                self._set_latest(
+                    'capturing',
+                    '还没看到流量：确认微信用的是系统代理（微信设置里不要单独设代理），'
+                    '并真正打开小程序页', record=False)
+
+        cred = self.capture.wait(on_tick=tick)
         if not cred:
             status = self.capture.status()
             if status.get('state') == 'idle':
