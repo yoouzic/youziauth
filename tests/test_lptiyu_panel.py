@@ -490,10 +490,13 @@ class MiniProgramTests(unittest.TestCase):
 
 class MiniProgramTests(unittest.TestCase):
     def test_launcher_reports_whether_it_started(self):
-        with patch.object(lptiyu_panel.os, 'startfile') as started:
+        # 先假装微信装着: 构建机上没有 weixin://, 探针会直接返回 False
+        with patch.object(lptiyu_panel, 'wechat_installed', lambda: True), \
+                patch.object(lptiyu_panel.os, 'startfile') as started:
             self.assertTrue(lptiyu_panel.open_mini_program('weixin://x'))
             started.assert_called_once_with('weixin://x')
-        with patch.object(lptiyu_panel.os, 'startfile', side_effect=OSError('no handler')):
+        with patch.object(lptiyu_panel, 'wechat_installed', lambda: True), \
+                patch.object(lptiyu_panel.os, 'startfile', side_effect=OSError('no handler')):
             self.assertFalse(lptiyu_panel.open_mini_program('weixin://x'))
 
 

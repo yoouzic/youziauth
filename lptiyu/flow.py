@@ -16,6 +16,7 @@
   * 模板缺失自动落到 ring 引擎, 不再是致命错误。
 """
 import json
+import math
 import random
 import threading
 import time
@@ -189,6 +190,15 @@ class DailyFlow:
             raise ApiError(3, "当日额度已满, 不提交")
         return done
 
+    @staticmethod
+    def _clamp_pace(dist_km, ideal, pace_lo, pace_hi):
+        """把用时收进配速区间: 直接四舍五入会让 used/dist 掉出边界 0.1s/km。"""
+        used = max(60, int(round(ideal)))
+        if dist_km and pace_lo and pace_hi:
+            used = max(int(math.ceil(dist_km * pace_lo)),
+                       min(int(math.floor(dist_km * pace_hi)), used))
+        return used
+
     def _gen_track(self, rule, style):
         """返回 (track, kind, used_s, dist_km, meta)。重试保证覆盖+窗口。
 
@@ -222,7 +232,8 @@ class DailyFlow:
                     if covered and rule["min_d"] <= dist_km <= rule["max_d"]:
                         if pace_lo:
                             pace = self.rnd.uniform(pace_lo, pace_hi)
-                            used = max(60, int(round(dist_km * pace)))
+                            used = self._clamp_pace(dist_km, dist_km * pace,
+                                                    pace_lo, pace_hi)
                         else:
                             used = TRK.used_seconds(track)
                             if not (self.policy["pace_min"] <= used / dist_km
@@ -247,7 +258,9 @@ class DailyFlow:
                 scale = 1.0
                 if pace_lo:
                     # ring 的速度曲线是引擎自己的; 把时间轴整体缩放, 让实配速落进区间。
-                    want = max(60, int(round(dist_km * self.rnd.uniform(pace_lo, pace_hi))))
+                    want = self._clamp_pace(dist_km,
+                                            dist_km * self.rnd.uniform(pace_lo, pace_hi),
+                                            pace_lo, pace_hi)
                     scale = want / max(used, 1)
                     used = want
                     self.log(f"[4] ring 时间轴缩放 x{scale:.3f} → "

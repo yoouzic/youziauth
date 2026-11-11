@@ -111,7 +111,9 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertIsInstance(state['dorm']['has_session'], bool)
 
     def test_official_sports_link_uses_only_the_verified_wechat_uri(self):
-        with patch('desktop_bridge.os.startfile', create=True) as launch:
+        # 构建机上没有 weixin:// 协议, 先把「微信在不在」的探针钉成 True
+        with patch('lptiyu_panel.wechat_installed', lambda: True), \
+                patch('desktop_bridge.os.startfile', create=True) as launch:
             result = self.bridge.dispatch('lptiyu_open_official', {'uri': 'https://example.invalid/'})
         self.assertTrue(result['ok'])
         launch.assert_called_once_with('weixin://launchapplet/?app_id=wxb2043232183dac7f')
