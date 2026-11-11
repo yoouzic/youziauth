@@ -11,3 +11,6 @@ PyYAML==6.0.3
 # 乐跑(lptiyu)模块的协议信封加密：AES-128-CBC + PKCS7。
 # lptiyu.cipher 直接依赖；缺失时乐跑功能整体降级为不可用。
 pycryptodome==4.4.0
+# 乐跑凭证采集(lptiyu_capture)要在本机签发 CA 与站点证书: 只依赖 cryptography 的
+# x509 构造器, 不引入 pyOpenSSL。缺了它「开始采集」会直接报错。
+cryptography==50.0.2

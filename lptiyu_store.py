@@ -475,6 +475,26 @@ class Store:
                     return str(candidate)
         return ''
 
+    def lab_status(self):
+        """采集组件的状态: 配了没有、找没找到、为什么没找到。
+
+        凭证只能由小程序 loginByCode 产生, 而这一步的采集链在「研究库」里 ——
+        类里不带它, 所以「没有研究库」必须是一个能被界面解释清楚的状态, 而不是
+        让用户去点一个必然失败的「同步凭证」。
+        """
+        try:
+            settings = self.settings()
+        except Exception:  # noqa: BLE001 —— 设置坏了由快照降级
+            return {'configured': '', 'found': '', 'ok': False, 'reason': 'settings'}
+        configured = str(settings.lab_dir or '').strip()
+        found = self.lab_dir()
+        if found:
+            return {'configured': configured, 'found': found, 'ok': True, 'reason': ''}
+        if configured:
+            return {'configured': configured, 'found': '', 'ok': False,
+                    'reason': 'missing_lpctl'}
+        return {'configured': '', 'found': '', 'ok': False, 'reason': 'not_configured'}
+
     # ------------------------------------------------------------- 研究库同步
     @staticmethod
     def _lab_member(config, identity):

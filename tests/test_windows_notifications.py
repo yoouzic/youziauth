@@ -5,6 +5,7 @@ from agent_ipc import RuntimeSnapshot
 from windows_notifications import (
     NotificationTracker,
     build_failure_toast,
+    build_lptiyu_toast,
     build_result_toast,
     build_powershell_command,
     should_show_failure,
@@ -30,6 +31,12 @@ class NotificationXmlTests(unittest.TestCase):
         self.assertIn("错误 &lt;tag&gt; &amp;", xml)
         self.assertNotIn("<tag>", xml)
         self.assertLess(len(xml), 2000)
+
+    def test_lptiyu_toast_carries_its_own_title(self):
+        xml = build_lptiyu_toast("还没有可用的跑步凭证")
+        self.assertIn("乐跑", xml)
+        self.assertIn("还没有可用的跑步凭证", xml)
+        self.assertNotIn("寝室打卡", xml, "乐跑的通知不该顶着寝室打卡的标题")
 
     def test_success_result_has_no_action_buttons(self):
         xml = build_result_toast(True, "认证成功")

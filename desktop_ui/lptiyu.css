@@ -215,3 +215,6 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* 研究库目录: 采集链不在安装包里时, 这是用户唯一能自己填的那一格。 */
+.lp-field-wide{grid-column:1/-1}

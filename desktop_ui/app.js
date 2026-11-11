@@ -594,7 +594,7 @@ $('lptiyu-form').addEventListener('submit',async event=>{
   const payload={enabled:$('lp-enabled').checked,run_time:$('lp-run-time').value,
     dist_lo:Number($('lp-dist-lo').value),dist_hi:Number($('lp-dist-hi').value),
     pace_lo:paceLo,pace_hi:paceHi,anchor_max_m:Number($('lp-anchor').value),
-    auto_renew:$('lp-auto-renew').checked};
+    auto_renew:$('lp-auto-renew').checked,lab_dir:$('lp-lab').value.trim()};
   if(payload.dist_lo>=payload.dist_hi){notify('距离下限要小于上限，暂不支持倒序范围。',true);return;}
   const revision=revisions.lptiyu;
   if(await act('lptiyu_save',payload)){
@@ -775,7 +775,24 @@ function renderRunSettings(lp,s){
   $('lp-anchor').value=s.anchor_max_m??20;
   $('lp-pace-hint').textContent=paceRangeLabel(paceLo,paceHi);
   $('lp-auto-renew').checked=s.auto_renew!==false;
+  const lab=lp.lab||{};
+  $('lp-lab').value=lab.configured||'';
+  $('lp-lab-hint').textContent=lab.ok?'已找到研究库，可以自动采集凭证'
+    :(lab.reason==='missing_lpctl'?'这个目录里没有 lpctl.py，检查路径是否正确'
+      :'未找到研究库：没有它无法采集新凭证');
   $('lp-schedule').textContent=lp.schedule||'自动跑步：关闭';
+}
+function captureText(cap){
+  const state=cap.state||'idle';
+  if(state==='waiting'){
+    const left=Math.ceil(Number(cap.remaining_s)||0);
+    return left?`正在等待小程序登录（还剩 ${Math.max(1,Math.round(left/60))} 分钟）`
+      :'正在等待小程序登录';
+  }
+  if(state==='captured')return '已抓到凭证';
+  if(state==='timeout')return '等待超时：再点一次「开始采集」';
+  if(state==='error')return cap.message||'采集失败';
+  return cap.message||'未开始采集';
 }
 function renderRunCredential(lp){
   badge('lp-token-badge',lp.has_token?'凭证就绪':'待同步',lp.has_token?'success':'warning');
@@ -787,9 +804,21 @@ function renderRunCredential(lp){
   const age=lp.token_age_hours;
   const ageText=age==null?'凭证已就绪':age<1/60?'刚刚同步'
     :`${age<1?Math.max(1,Math.round(age*60))+' 分钟前':age.toFixed(1)+' 小时前'}同步`;
-  $('lp-credential-line').textContent=lp.has_token?ageText:'尚未同步凭证。';
+  $('lp-credential-line').textContent=lp.has_token?ageText
+    :((lp.lab&&lp.lab.ok===false)
+      ?'本机没有采集组件（研究库），无法自动取凭证：先在「跑步设置」里填写研究库目录。'
+      :'尚未同步凭证。');
   $('lp-identity-line').textContent=lp.identity?.name?`当前成员：${lp.identity.name}`:'';
   document.querySelectorAll('[data-action="lptiyu_sync"],[data-action="lptiyu_renew"]').forEach(b=>b.disabled=pending||lp.busy);
+  const cap=lp.capture||{};
+  $('lp-cert-line').textContent=cap.cert_installed
+    ?`采集证书：已安装（${cap.fingerprint||'—'}）`
+    :'采集证书：未安装，先装一次才能采集';
+  $('lp-capture-line').textContent=captureText(cap);
+  $('lp-cert-install').disabled=pending||cap.cert_installed;
+  $('lp-cert-remove').disabled=pending||!cap.cert_installed;
+  $('lp-capture-start').disabled=pending||lp.busy||!cap.cert_installed;
+  $('lp-capture-stop').disabled=pending||cap.state!=='waiting';
 }
 function renderLptiyu(){
   const lp=state.lptiyu||{state:'idle',message:'',busy:false,has_token:false};

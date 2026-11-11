@@ -1435,6 +1435,59 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertIn('跑区', result['message'])
         self.controller._wait_for_work()
 
+    def test_snapshot_reports_a_missing_capture_component(self):
+        with patch.object(type(self.store), 'lab_dir', lambda store: ''):
+            state = self.bridge.snapshot()['lptiyu']
+        self.assertFalse(state['lab']['ok'])
+        self.assertEqual(state['lab']['reason'], 'not_configured')
+
+    def test_saving_a_lab_path_requires_lpctl(self):
+        bad = self.bridge.dispatch('lptiyu_save', {
+            'enabled': True, 'run_time': '06:30', 'lab_dir': str(Path(self.tmp.name))})
+        self.assertFalse(bad['ok'])
+        self.assertIn('lpctl.py', bad['message'])
+
+        lab = Path(self.tmp.name) / 'lab'
+        lab.mkdir()
+        (lab / 'lpctl.py').write_text('# stub\n', encoding='utf-8')
+        good = self.bridge.dispatch('lptiyu_save', {
+            'enabled': True, 'run_time': '06:30', 'lab_dir': str(lab)})
+        self.assertTrue(good['ok'])
+        self.assertEqual(self.store.settings().lab_dir, str(lab))
+        with patch.object(type(self.store), 'lab_dir', lambda store: str(lab)):
+            state = self.bridge.snapshot()['lptiyu']
+        self.assertTrue(state['lab']['ok'])
+        self.assertEqual(state['lab']['found'], str(lab))
+
+    def test_clearing_the_lab_path_falls_back_to_discovery(self):
+        result = self.bridge.dispatch('lptiyu_save', {
+            'enabled': True, 'run_time': '06:30', 'lab_dir': ''})
+        self.assertTrue(result['ok'])
+        self.assertEqual(self.store.settings().lab_dir, '')
+
+    def test_snapshot_has_a_capture_block(self):
+        state = self.bridge.snapshot()['lptiyu']['capture']
+        self.assertTrue(state['available'])
+        self.assertIn('cert_installed', state)
+        self.assertIn('state', state)
+
+    def test_capture_actions_reach_the_controller(self):
+        with patch.object(type(self.controller), '_capture_flow',
+                          lambda ctl: ctl._set_latest('synced', '已采集凭证')):
+            self.assertTrue(self.bridge.dispatch('lptiyu_capture')['ok'])
+        self.controller._wait_for_work()
+        self.assertTrue(self.bridge.dispatch('lptiyu_capture_stop')['ok'])
+        self.assertEqual(self.controller.latest['state'], 'idle')
+
+    def test_certificate_actions_report_their_detail(self):
+        ca = self.controller.capture.ca
+        with patch.object(type(ca), 'installed', lambda self: True), \
+             patch.object(type(ca), 'install',
+                          lambda self: {'ok': True, 'detail': '证书已装入当前用户'}):
+            result = self.bridge.dispatch('lptiyu_cert_install')
+        self.assertTrue(result['ok'])
+        self.assertIn('证书', result['message'])
+
     def test_preview_bridge_has_a_self_consistent_lptiyu_block(self):
         preview = PreviewBridge()
         state = preview.snapshot()['lptiyu']
@@ -1445,6 +1498,11 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertEqual(preview.snapshot()['lptiyu']['state'], 'signed')
         self.assertTrue(preview.dispatch('lptiyu_renew')['ok'])
         self.assertEqual(preview.snapshot()['lptiyu']['renewal']['state'], 'ok')
+        self.assertTrue(preview.dispatch('lptiyu_cert_install')['ok'])
+        self.assertTrue(preview.snapshot()['lptiyu']['capture']['cert_installed'])
+        self.assertTrue(preview.dispatch('lptiyu_capture')['ok'])
+        self.assertEqual(preview.snapshot()['lptiyu']['capture']['state'], 'waiting')
+        self.assertTrue(preview.dispatch('lptiyu_capture_stop')['ok'])
 
 
 if __name__ == '__main__':

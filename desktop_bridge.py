@@ -390,6 +390,9 @@ class DesktopBridge(LocationProbe):
                  'zone': {'id': '', 'name': ''}, 'today_done': 0, 'today_max': 1,
                  'last': None,
                  'pace_range': {'lo': 0, 'hi': 0},
+                 'capture': {'state': 'idle', 'message': '', 'remaining_s': 0,
+                             'cert_installed': False, 'fingerprint': '',
+                             'available': False},
                  'renewal': {'auto': False, 'state': '', 'message': '',
                              'next_due': '', 'last_success': '',
                              'failures': 0, 'interval_min': 0, 'lead_min': 0}}
@@ -432,6 +435,7 @@ class DesktopBridge(LocationProbe):
                 failures = int(renewal.get('failures') or 0)
             except (TypeError, ValueError):
                 failures = 0
+            lab = store.lab_status()
             zones = []
             for zone_id, entry in (store.zones() or {}).items():
                 if not isinstance(entry, dict):
@@ -457,6 +461,10 @@ class DesktopBridge(LocationProbe):
                 'last': last,
                 # 配速区间是后端算好的(含旧版单点配速的迁移), 界面不再自己拼。
                 'pace_range': dict(zip(('lo', 'hi'), settings.pace_range())),
+                # 采集组件(研究库): 没有它, 凭证只能靠已有的一份, 界面要把这件事说清楚。
+                'lab': lab,
+                # 本机采集: 没有研究库的机器靠它自己拿 token。
+                'capture': controller.capture_status(),
                 # 跑区: 目录给下拉框, 选中跑区的几何摘要给「特调」这行字。
                 'zones': zones,
                 'zone': {'id': selected,
@@ -807,6 +815,30 @@ class DesktopBridge(LocationProbe):
             except (OSError, AttributeError):
                 raise RuntimeError('无法打开小程序，请在微信搜索「数体智慧体育」。') from None
             return '已请求微信打开小程序。若未弹出，请在微信搜索「数体智慧体育」。'
+        if action == 'lptiyu_capture':
+            controller = self._lptiyu
+            if controller is None:
+                raise RuntimeError('乐跑功能在本机暂不可用')
+            if not controller.start('capture'):
+                raise RuntimeError('乐跑操作正在进行，请等待完成或取消当前操作。')
+            return '开始采集：在微信里打开「数体智慧体育」并进入跑步首页'
+        if action == 'lptiyu_capture_stop':
+            controller = self._lptiyu
+            if controller is None:
+                raise RuntimeError('乐跑功能在本机暂不可用')
+            controller.capture_stop()
+            return '已停止采集，系统代理已还原'
+        if action in ('lptiyu_cert_install', 'lptiyu_cert_remove'):
+            controller = self._lptiyu
+            if controller is None:
+                raise RuntimeError('乐跑功能在本机暂不可用')
+            try:
+                result = (controller.capture_cert_install()
+                          if action == 'lptiyu_cert_install'
+                          else controller.capture_cert_remove())
+            except Exception as exc:  # noqa: BLE001 —— 文案已经写好了, 原样带给界面
+                raise RuntimeError(str(getattr(exc, 'message', exc))) from None
+            return str(result.get('detail') or '完成')
         if action in ('lptiyu_run', 'lptiyu_dry', 'lptiyu_sync', 'lptiyu_renew',
                       'lptiyu_zones'):
             controller = self._lptiyu
@@ -841,6 +873,11 @@ class DesktopBridge(LocationProbe):
                 settings = lptiyu_settings(payload, previous=previous)
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from None
+            if 'lab_dir' in payload and str(payload.get('lab_dir') or '').strip():
+                lab_path = Path(str(payload['lab_dir']).strip())
+                if not (lab_path / 'lpctl.py').is_file():
+                    raise RuntimeError(
+                        f'这个目录里没有 lpctl.py，不是研究库：{lab_path}')
             controller.store.save_settings(settings)
             if settings.zone_id and any(key in payload for key in
                                         ('zone_direction', 'zone_anchor_m', 'zone_lane_m')):
@@ -1156,8 +1193,8 @@ class DesktopBridge(LocationProbe):
             if result.get('state') in ('signed', 'uncertain', 'need_token', 'error', 'quota') \
                     and notice != self._lptiyu_notice:
                 self._lptiyu_notice = notice
-                windows_notifications.show_toast(windows_notifications.build_dorm_toast(
-                    f"乐跑：{result.get('message', '')}"))
+                windows_notifications.show_toast(windows_notifications.build_lptiyu_toast(
+                    result.get('message', '')))
 
     def _agent_check_interval(self):
         """判定快照是否过期用的检测间隔；设置读不动时用默认 60 秒（更严格的一侧）。"""
@@ -1260,6 +1297,9 @@ class PreviewBridge(LocationProbe):
                        'last':{'date':dt.date.today().isoformat(), 'distance':'2.31km',
                                'pace':"4'05\"", 'zone':'第一运动场'},
                        'pace_range':{'lo':0, 'hi':0},
+                       'capture':{'state':'idle', 'message':'', 'remaining_s':0,
+                                  'cert_installed':False, 'fingerprint':'',
+                                  'available':True},
                        'zones':[{'id':'1873', 'name':'演示·第二运动场', 'default':False, 'points':4},
                                 {'id':'1874', 'name':'演示·第一运动场', 'default':True, 'points':4},
                                 {'id':'1876', 'name':'演示·南区操场', 'default':False, 'points':0}],
@@ -1512,6 +1552,25 @@ class PreviewBridge(LocationProbe):
                                             message='已同步研究库的最新凭证（演示）')
             elif action == 'lptiyu_open_official':
                 return {'ok': True, 'message': '演示：正式桌面端会请求微信打开「数体智慧体育」。'}
+            elif action == 'lptiyu_cert_install':
+                self._data['lptiyu']['capture'].update(cert_installed=True,
+                                                       fingerprint='DEMO0000000000')
+                return {'ok': True, 'message': '演示：证书会装进当前用户的受信任根。'}
+            elif action == 'lptiyu_cert_remove':
+                self._data['lptiyu']['capture'].update(cert_installed=False,
+                                                       fingerprint='')
+                return {'ok': True, 'message': '演示：证书已卸载。'}
+            elif action == 'lptiyu_capture':
+                lp = self._data['lptiyu']
+                lp['capture'].update(state='waiting', remaining_s=300,
+                                     message='等待小程序登录（演示）')
+                lp.update(state='capturing', message='等待小程序登录（演示）')
+                return {'ok': True, 'message': '开始采集（演示）'}
+            elif action == 'lptiyu_capture_stop':
+                lp = self._data['lptiyu']
+                lp['capture'].update(state='idle', remaining_s=0, message='已停止采集')
+                lp.update(state='idle', message='已停止采集（演示）')
+                return {'ok': True, 'message': '已停止采集（演示）'}
             elif action == 'lptiyu_zones':
                 lp = self._data['lptiyu']
                 for index, zone in enumerate(lp['zones']):

@@ -91,6 +91,11 @@ def build_dorm_toast(detail: str) -> str:
     return _build_toast("寝室打卡", detail)
 
 
+def build_lptiyu_toast(detail: str) -> str:
+    """乐跑自己的标题: 之前借寝室打卡的 builder, 通知抬头会写错模块。"""
+    return _build_toast("乐跑", detail)
+
+
 def should_show_failure(snapshot: RuntimeSnapshot, last_incident_id: str) -> bool:
     return bool(
         snapshot.state == "auth_failed"

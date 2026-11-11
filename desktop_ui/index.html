@@ -165,6 +165,18 @@
               <button class="secondary" data-action="lptiyu_renew">立即续期</button>
               <button class="primary" data-action="lptiyu_sync">同步凭证</button>
             </div>
+            <details class="lp-help" id="lp-capture">
+              <summary>没有研究库？用本机采集</summary>
+              <p class="field-hint" id="lp-cert-line">正在读取采集证书…</p>
+              <p class="field-hint" id="lp-capture-line"></p>
+              <div class="lp-actions">
+                <button type="button" class="text-button" id="lp-cert-install" data-action="lptiyu_cert_install">安装采集证书</button>
+                <button type="button" class="text-button" id="lp-cert-remove" data-action="lptiyu_cert_remove">卸载证书</button>
+                <button type="button" class="secondary" id="lp-capture-start" data-action="lptiyu_capture">开始采集</button>
+                <button type="button" class="text-button" id="lp-capture-stop" data-action="lptiyu_capture_stop">停止采集</button>
+              </div>
+              <p class="field-hint">采集会把系统代理临时指到本机，只解密 lptiyu 域；拿到凭证立刻还原。</p>
+            </details>
           </article>
         </div>
 
@@ -219,6 +231,11 @@
                 <output class="field-hint" id="lp-pace-hint" for="lp-pace-lo lp-pace-hi" aria-live="off">自动</output>
               </div>
             </fieldset>
+            <div class="lp-field lp-field-wide">
+              <label for="lp-lab">研究库目录</label>
+              <input id="lp-lab" type="text" spellcheck="false" placeholder="留空自动查找">
+              <p class="field-hint" id="lp-lab-hint">采集凭证用的研究库，留空自动查找</p>
+            </div>
           </div>
           <label class="switch-row" for="lp-auto-renew"><span>自动续期凭证</span><input id="lp-auto-renew" type="checkbox" role="switch"></label>
           <p class="schedule" id="lp-schedule">自动跑步：关闭</p>

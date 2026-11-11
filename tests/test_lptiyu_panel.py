@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from lptiyu_panel import LptiyuController, LptiyuError, TokenSlot, MAX_DAILY_AUTO_ATTEMPTS
 from lptiyu.client import ApiError
-from lptiyu_renew import RenewOutcome
+from lptiyu_renew import CredentialRenewer, RenewOutcome
 from lptiyu_store import Settings, Store
 
 CLOCK = lambda: dt.datetime(2026, 11, 11, 7, 0)  # noqa: E731 —— 有效时段内、run_time 之后
@@ -68,7 +68,8 @@ class PanelTestCase(unittest.TestCase):
         probe.start(); grab.start(); lab.start()
         self.addCleanup(probe.stop); self.addCleanup(grab.stop); self.addCleanup(lab.stop)
 
-    def make_controller(self, code=0, settings=None, clock=None, renewer=None):
+    def make_controller(self, code=0, settings=None, clock=None, renewer=None,
+                        capture=None):
         if settings is not None:
             self.store.save_settings(settings)
         if renewer is not None:
@@ -80,7 +81,8 @@ class PanelTestCase(unittest.TestCase):
             return flow
 
         controller = LptiyuController(store=self.store, clock=clock or CLOCK,
-                                      flow_factory=factory, renewer=self.renewer)
+                                      flow_factory=factory, renewer=self.renewer,
+                                      capture=capture)
         self.addCleanup(controller.close)
         return controller
 
@@ -156,9 +158,15 @@ class GateTests(PanelTestCase):
     def test_missing_token_reports_need_token_without_lab(self):
         controller = self.make_controller()
         controller.store.clear_token()
+        # 这条要看真续期器的文案: 假续期器只会回放预设结果。
+        controller.renewer = CredentialRenewer(
+            controller.store, clock=CLOCK,
+            probe=controller._probe_record, grab=controller._grab_via_lab)
         with self.assertRaises(LptiyuError) as caught:
             controller._execute(submit=False)
         self.assertEqual(caught.exception.state, 'need_token')
+        self.assertIn('研究库', caught.exception.message,
+                      '没有采集组件时要直说, 不能让人去点必然失败的「同步凭证」')
 
 
 class PollTests(PanelTestCase):
@@ -352,6 +360,134 @@ class ZoneSyncTests(PanelTestCase):
         controller = self.make_controller()
         with patch.object(Store, 'save_zone_points', side_effect=OSError('disk')):
             controller._zone_sink('1874', 'x', [{'id': '1', 'lat': 1.0, 'lng': 2.0}], [])
+
+
+class FakeCaptureCA:
+    def __init__(self, installed=False):
+        self.installed_flag = installed
+        self.install_calls = 0
+        self.remove_calls = 0
+
+    def installed(self):
+        return self.installed_flag
+
+    def fingerprint(self):
+        return "ABCDEF" * 6 + "ABCD"
+
+    def install(self):
+        self.install_calls += 1
+        self.installed_flag = True
+        return {"ok": True, "detail": "证书已装入当前用户"}
+
+    def remove(self):
+        self.remove_calls += 1
+        self.installed_flag = False
+        return {"ok": True, "detail": "证书已从当前用户卸载"}
+
+
+class FakeCapture:
+    def __init__(self, cred=None, installed=True, final=None):
+        self.cred = cred
+        self.ca = FakeCaptureCA(installed)
+        self.final = final or {}
+        self.started = 0
+        self.stops = []
+        self.state = "idle"
+        self.message = ""
+
+    def start(self):
+        from lptiyu_capture import CaptureError
+        if not self.ca.installed():
+            raise CaptureError("还没有安装采集证书：先点「安装采集证书」，再开始采集")
+        self.started += 1
+        self.state, self.message = "waiting", "等待小程序登录"
+
+    def wait(self, timeout=None):
+        self.state = self.final.get("state", "captured" if self.cred else "timeout")
+        self.message = self.final.get("message", "等待超时")
+        return self.cred
+
+    def stop(self, state=None, message=None):
+        self.stops.append((state, message))
+        self.state = state or "idle"
+        self.message = message or ""
+
+    def status(self):
+        return {"state": self.state, "message": self.message,
+                "port": 18888, "remaining_s": 42}
+
+    def cert_status(self):
+        return {"installed": self.ca.installed(),
+                "fingerprint": self.ca.fingerprint()}
+
+
+class CaptureFlowTests(PanelTestCase):
+    CRED = {"token": "CAPTURED-1", "uid": 17980001, "student_num": "2025001",
+            "school_id": "837", "card_id": "2025001",
+            "issued_at": "2026-11-11T18:00:00", "source": "capture"}
+
+    def test_capture_saves_the_token_and_the_captured_identity(self):
+        controller = self.make_controller(capture=FakeCapture(cred=self.CRED))
+        result = controller._capture_flow()
+        self.assertEqual(result["state"], "synced")
+        self.assertEqual(controller.store.token(), "CAPTURED-1")
+        identity = controller.store.identity()
+        self.assertEqual(identity["uid"], "17980001")
+        self.assertEqual(identity["student_num"], "2025001")
+        self.assertEqual(controller.store.token_record()["source"], "capture")
+
+    def test_capture_timeout_asks_for_another_try(self):
+        controller = self.make_controller(capture=FakeCapture(
+            cred=None, final={"state": "timeout", "message": "等待超时：没有看到小程序登录"}))
+        with self.assertRaises(LptiyuError) as caught:
+            controller._capture_flow()
+        self.assertEqual(caught.exception.state, "need_token")
+        self.assertIn("超时", caught.exception.message)
+
+    def test_stopping_the_capture_returns_to_idle(self):
+        controller = self.make_controller(capture=FakeCapture(
+            cred=None, final={"state": "idle", "message": "已停止采集"}))
+        self.assertEqual(controller._capture_flow()["state"], "idle")
+
+    def test_capture_refuses_without_the_certificate(self):
+        controller = self.make_controller(capture=FakeCapture(installed=False))
+        with self.assertRaises(LptiyuError) as caught:
+            controller._capture_flow()
+        self.assertIn("证书", caught.exception.message)
+
+    def test_failed_probe_marks_the_token_dead(self):
+        controller = self.make_controller(capture=FakeCapture(cred=self.CRED))
+        with patch.object(LptiyuController, "_probe_alive", lambda self, client: False):
+            with self.assertRaises(LptiyuError) as caught:
+                controller._capture_flow()
+        self.assertEqual(caught.exception.state, "need_token")
+        self.assertFalse(controller.store.has_token())
+
+    def test_cert_actions_go_through_the_cached_status(self):
+        capture = FakeCapture(installed=False)
+        controller = self.make_controller(capture=capture)
+        self.assertFalse(controller.capture_status()["cert_installed"])
+        controller.capture_cert_install()
+        self.assertEqual(capture.ca.install_calls, 1)
+        self.assertTrue(controller.capture_status()["cert_installed"])
+        controller.capture_cert_remove()
+        self.assertEqual(capture.ca.remove_calls, 1)
+        self.assertFalse(controller.capture_status()["cert_installed"])
+
+    def test_capture_status_carries_progress_for_the_ui(self):
+        controller = self.make_controller(capture=FakeCapture(cred=self.CRED))
+        controller.capture.start()
+        status = controller.capture_status()
+        self.assertEqual(status["state"], "waiting")
+        self.assertEqual(status["remaining_s"], 42)
+        self.assertTrue(status["available"])
+
+    def test_closing_stops_an_active_capture(self):
+        capture = FakeCapture(cred=self.CRED)
+        controller = self.make_controller(capture=capture)
+        controller.capture.start()
+        controller.close()
+        self.assertTrue(capture.stops, "退出时必须把采集停掉, 否则代理留在用户身上")
 
 
 class FlowPolicyTests(PanelTestCase):

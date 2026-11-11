@@ -141,7 +141,9 @@ class CredentialRenewer:
             self.store.record_probe(False)
 
         if not self.store.lab_dir():
-            return self._need_user(f'{reason}：在小程序里打开一次跑步首页，然后点「同步凭证」')
+            # 没有采集组件就没人能替用户取号; 让他去点「同步凭证」只会再失败一次。
+            return self._need_user(f'{reason}：本机没有采集组件（研究库），'
+                                   f'请先在跑步设置里填写研究库目录')
         # 配额是硬的: 手动点击只越过冷却, 不越过「今天最多采集两次」—— 采集链要用户
         # 真去开一次小程序, 点了没反应再点十次也只会更乱。
         if self._budget_spent('grab', MAX_DAILY_GRABS):

@@ -2122,7 +2122,8 @@ test('lptiyu settings sync from the snapshot and save through the bridge',async(
   await h.el('lptiyu-form').fire('submit');
   await new Promise(resolve=>setTimeout(resolve,0));
   assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1))),{action:'lptiyu_save',payload:{enabled:true,run_time:'06:30',
-    dist_lo:2.9,dist_hi:3.2,pace_lo:245,pace_hi:280,anchor_max_m:20,auto_renew:true}},
+    dist_lo:2.9,dist_hi:3.2,pace_lo:245,pace_hi:280,anchor_max_m:20,auto_renew:true,
+    lab_dir:''}},
     '合法修改按表单内容发往后台');
 });
 
@@ -2162,6 +2163,43 @@ test('lptiyu credential line reports the local sync age',async()=>{
   assert.equal(unknown.el('lp-credential-line').textContent,'凭证已就绪');
   const none=await lptiyuPage({has_token:false});
   assert.equal(none.el('lp-credential-line').textContent,'尚未同步凭证。');
+});
+
+test('lptiyu says when the capture component is missing and saves its path',async()=>{
+  const h=await lptiyuPage({has_token:false,
+    lab:{configured:'',found:'',ok:false,reason:'not_configured'}});
+  assert.match(h.el('lp-credential-line').textContent,/没有采集组件/,
+    '没有研究库时不能让人去点必然失败的同步');
+  assert.match(h.el('lp-lab-hint').textContent,/未找到研究库/);
+  h.el('lp-lab').value='D:\\lptiyu-lab';
+  await h.el('lptiyu-form').fire('submit');
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(h.calls.at(-1).payload.lab_dir,'D:\\lptiyu-lab','填了研究库目录要发给后台');
+  const ready=await lptiyuPage({has_token:true,
+    lab:{configured:'D:/lptiyu-lab',found:'D:/lptiyu-lab',ok:true,reason:''}});
+  assert.match(ready.el('lp-lab-hint').textContent,/已找到研究库/);
+  assert.equal(ready.el('lp-lab').value,'D:/lptiyu-lab');
+});
+
+test('lptiyu capture walks from certificate to waiting',async()=>{
+  const off=await lptiyuPage({has_token:false,
+    capture:{state:'idle',message:'',remaining_s:0,cert_installed:false,fingerprint:'',available:true}});
+  assert.match(off.el('lp-cert-line').textContent,/未安装/);
+  assert.equal(off.el('lp-capture-start').disabled,true,'没装证书不能开始采集');
+  assert.equal(off.el('lp-cert-install').disabled,false);
+  off.el('lp-cert-install').listeners.click();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(off.calls.at(-1).action,'lptiyu_cert_install');
+
+  const waiting=await lptiyuPage({has_token:false,
+    capture:{state:'waiting',message:'',remaining_s:125,cert_installed:true,
+             fingerprint:'ABCDEF012345',available:true}});
+  assert.match(waiting.el('lp-capture-line').textContent,/还剩 2 分钟/,'等待时要说还剩多久');
+  assert.equal(waiting.el('lp-capture-stop').disabled,false);
+  assert.equal(waiting.el('lp-capture-start').disabled,false);
+  waiting.el('lp-capture-stop').listeners.click();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(waiting.calls.at(-1).action,'lptiyu_capture_stop');
 });
 
 test('lptiyu pace accepts minutes and seconds, and refuses nonsense',async()=>{

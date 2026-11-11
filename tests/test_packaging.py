@@ -31,7 +31,7 @@ class PackagingWorkflowTests(unittest.TestCase):
         self.assertEqual(
             lines,
             ["Pillow==12.2.0", "PyInstaller==6.16.0", "numpy==2.4.4", "PyYAML==6.0.3",
-             "pycryptodome==4.4.0"],
+             "pycryptodome==4.4.0", "cryptography==50.0.2"],
         )
         self.assertTrue(all("==" in line for line in lines))
 

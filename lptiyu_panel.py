@@ -24,6 +24,7 @@ import time
 
 from lptiyu import flow as lptiyu_flow
 from lptiyu.client import ApiClient, ApiError
+from lptiyu_capture import CaptureError, CaptureSession
 from lptiyu_renew import CredentialRenewer
 from lptiyu_store import Store, Settings, now, parse_time
 
@@ -122,10 +123,15 @@ class TokenSlot:
 
 class LptiyuController:
     def __init__(self, store=None, slot=None, clock=None, flow_factory=None,
-                 renewer=None):
+                 renewer=None, capture=None):
         self.store = store or Store()
         self.slot = slot or TokenSlot(self.store)
         self._clock = clock or now
+        # 采集链: 没有研究库的机器靠它自己拿 token。证书检查很慢(certutil),
+        # 所以在 capture_status 里做 60 秒缓存。
+        self.capture = capture or CaptureSession(self.store.root / 'capture',
+                                                 clock=self._clock)
+        self._cert_cache = (0.0, None)
         self._flow_factory = flow_factory   # 测试注入; 正式路径现场构造 DailyFlow
         # 续期器也允许注入: 单测里给一个假的, 就不必碰网络和子进程。
         self.renewer = renewer or CredentialRenewer(
@@ -166,7 +172,8 @@ class LptiyuController:
 
     # ------------------------------------------------------------- 入口
     def start(self, action):
-        if action not in ('run', 'dry', 'sync', 'renew', 'renew_auto', 'zones'):
+        if action not in ('run', 'dry', 'sync', 'renew', 'renew_auto', 'zones',
+                          'capture'):
             return False
         with self._gate:
             if self.closed or self.busy:
@@ -180,6 +187,8 @@ class LptiyuController:
                     result = self._sync()
                 elif action == 'zones':
                     result = self._sync_zones()
+                elif action == 'capture':
+                    result = self._capture_flow()
                 elif action == 'renew':
                     result = self._renew()
                 elif action == 'renew_auto':
@@ -258,6 +267,10 @@ class LptiyuController:
         with self._gate:
             self.closed = True
             self.cancel_work()
+        try:
+            self.capture.stop('idle', '')
+        except Exception:  # noqa: BLE001 —— 退出流程不该被采集卡住
+            pass
 
     # ------------------------------------------------------------- 步骤
     def _sync(self):
@@ -268,6 +281,89 @@ class LptiyuController:
         if changes or message == '本机凭证已是最新':
             self.store.record_sync(message)
         return self._set_latest(state, message)
+
+    # ------------------------------------------------------------- 采集
+    def capture_status(self):
+        """采集与证书的状态(给快照)。证书检查走缓存, 不让 1.5 秒一拍去 spawn certutil。"""
+        try:
+            status = self.capture.status()
+        except Exception:  # noqa: BLE001
+            status = {'state': 'idle', 'message': '', 'port': 0, 'remaining_s': 0}
+        now_ts = time.monotonic()
+        at, cached = self._cert_cache
+        if cached is None or now_ts - at > 60:
+            try:
+                cached = self.capture.cert_status()
+            except Exception:  # noqa: BLE001
+                cached = {'installed': False, 'fingerprint': ''}
+            self._cert_cache = (now_ts, cached)
+        return {'state': status.get('state', 'idle'),
+                'message': status.get('message', ''),
+                'remaining_s': int(status.get('remaining_s') or 0),
+                'cert_installed': bool(cached.get('installed')),
+                'fingerprint': str(cached.get('fingerprint') or '')[:16],
+                'available': True}
+
+    def capture_cert_install(self):
+        try:
+            result = self.capture.ca.install()
+        except CaptureError as exc:
+            raise LptiyuError('error', str(exc)) from exc
+        self._cert_cache = (0.0, None)
+        return result
+
+    def capture_cert_remove(self):
+        try:
+            result = self.capture.ca.remove()
+        except CaptureError as exc:
+            raise LptiyuError('error', str(exc)) from exc
+        self._cert_cache = (0.0, None)
+        return result
+
+    def capture_stop(self):
+        self.capture.stop('idle', '已停止采集')
+        return self._set_latest('idle', '已停止采集', record=False)
+
+    def _capture_flow(self):
+        """等一次小程序登录, 把 token 与身份一起落盘, 然后当真门探活。"""
+        try:
+            self.capture.start()
+        except CaptureError as exc:
+            raise LptiyuError('error', str(exc)) from exc
+        self._set_latest('capturing',
+                         '等待小程序登录：在微信里打开「数体智慧体育」并进入跑步首页',
+                         record=False)
+        cred = self.capture.wait()
+        if not cred:
+            status = self.capture.status()
+            if status.get('state') == 'idle':
+                return self._set_latest('idle', status.get('message') or '已停止采集',
+                                        record=False)
+            raise LptiyuError('need_token', status.get('message') or '没有抓到凭证')
+        identity = self.store.identity()
+        student_num = str(cred.get('student_num') or identity.get('student_num') or '')
+        self.store.save_identity({
+            'name': identity.get('name') or student_num or '成员',
+            'student_num': student_num,
+            'uid': str(cred.get('uid') or identity.get('uid') or ''),
+            'school_id': str(cred.get('school_id') or identity.get('school_id') or ''),
+            'card_id': str(cred.get('card_id') or student_num
+                           or identity.get('card_id') or ''),
+        })
+        self.store.save_token_record(
+            cred['token'],
+            issued_at=cred.get('issued_at') or self._clock().isoformat(timespec='seconds'),
+            source='capture')
+        client = self.slot.make_client(pace=0.0)
+        try:
+            alive = self._probe_alive(client)
+        except ApiError as exc:
+            raise LptiyuError('error', f'凭证已保存，但探活失败（{exc.code}）') from exc
+        if not alive:
+            self.slot.mark_dead()
+            raise LptiyuError('need_token', '抓到的凭证当场失效了：在小程序里重新登录后再采集')
+        self.store.record_probe(True)
+        return self._set_latest('synced', '已采集凭证，并确认可用')
 
     # ------------------------------------------------------------- 跑区
     @staticmethod

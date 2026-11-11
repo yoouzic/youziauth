@@ -137,10 +137,11 @@ class RenewLadderTests(RenewTestCase):
         self.assertEqual(self.store.token(), 'CONSUMED-BUT-ALIVE')
         self.assertEqual(self.probe.calls, 1)
 
-    def test_without_a_lab_it_asks_for_one_minute_of_the_users_time(self):
+    def test_without_a_lab_it_names_the_missing_capture_component(self):
         outcome = self.renewer().renew()
         self.assertEqual(outcome.state, 'need_user')
-        self.assertIn('小程序', outcome.message)
+        self.assertIn('研究库', outcome.message,
+                      '没有采集组件时要说清缺的是什么, 而不是让人去开小程序')
         self.assertEqual(self.grab.calls, 0)
 
     def test_capture_runs_at_most_twice_a_day(self):

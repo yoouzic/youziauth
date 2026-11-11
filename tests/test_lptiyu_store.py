@@ -270,6 +270,48 @@ class LabSyncTests(unittest.TestCase):
                 self.assertIn('未找到', message)
 
 
+class LabStatusTests(unittest.TestCase):
+    """采集组件(研究库)的状态: 没它就是采不到新凭证, 界面得能解释清楚。"""
+
+    def _lab(self, root: Path):
+        lab = root / "lab"
+        lab.mkdir(parents=True, exist_ok=True)
+        (lab / "lpctl.py").write_text("# lab stub\n", encoding="utf-8")
+        return lab
+
+    def test_not_configured_and_not_found(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(Store, "_known_desktop_dirs", lambda self: []):
+            store = Store(Path(tmp))
+            status = store.lab_status()
+            self.assertFalse(status["ok"])
+            self.assertEqual(status["reason"], "not_configured")
+
+    def test_configured_but_missing_lpctl(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(Store, "_known_desktop_dirs", lambda self: []):
+            root = Path(tmp)
+            (root / "empty").mkdir()
+            store = Store(root / "store")
+            store.save_settings(Settings(lab_dir=str(root / "empty")))
+            status = store.lab_status()
+            self.assertFalse(status["ok"])
+            self.assertEqual(status["reason"], "missing_lpctl")
+            self.assertEqual(status["configured"], str(root / "empty"))
+
+    def test_configured_and_valid(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(Store, "_known_desktop_dirs", lambda self: []):
+            root = Path(tmp)
+            lab = self._lab(root)
+            store = Store(root / "store")
+            store.save_settings(Settings(lab_dir=str(lab)))
+            status = store.lab_status()
+            self.assertTrue(status["ok"])
+            self.assertEqual(status["found"], str(lab))
+            self.assertEqual(status["reason"], "")
+
+
 class ZoneCatalogTests(unittest.TestCase):
     """跑区目录: 清单、点位、每块场地的特调都各自落盘。"""
 
