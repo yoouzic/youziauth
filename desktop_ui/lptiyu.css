@@ -1,0 +1,217 @@
+.bi.bi-runner::before {
+  content: "";
+  width: 1em;
+  height: 1em;
+  background-color: currentColor;
+  mask: url("icons/runner.svg") center / contain no-repeat;
+  forced-color-adjust: none;
+}
+
+#lptiyu {
+  container-type: inline-size;
+}
+
+#lptiyu .page-heading {
+  align-items: center;
+  margin-bottom: 18px;
+}
+
+#lptiyu .section-mark {
+  width: 48px;
+  height: 48px;
+  font-size: 28px;
+}
+
+.lp-overview {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.lp-card {
+  min-width: 0;
+  padding: clamp(16px, 3cqi, 26px);
+  overflow-wrap: anywhere;
+}
+
+.lp-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+.lp-card-header h2,
+.lp-venues h2 {
+  font-size: 18px;
+}
+
+.lp-status {
+  margin-top: 8px;
+  font-size: 13px;
+}
+
+.lp-details {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 18px;
+  margin: 16px 0 0;
+  padding: 14px 0 0;
+  border-top: 1px solid var(--border);
+}
+
+.lp-details dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.lp-details dd {
+  margin: 3px 0 0;
+  font-size: 13px;
+}
+
+.lp-details strong {
+  font-weight: 600;
+}
+
+.lp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.lp-actions button {
+  max-width: 100%;
+  padding-inline: 12px;
+  white-space: normal;
+}
+
+.lp-help {
+  margin-top: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--soft);
+  font-size: 12px;
+}
+
+.lp-help summary {
+  color: var(--strong);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.lp-help summary:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+.lp-help p {
+  margin-top: 6px;
+  color: var(--muted);
+}
+
+.lp-help .lp-actions {
+  margin-top: 10px;
+}
+
+.lp-card .field-hint:empty {
+  display: none;
+}
+
+.lp-venues {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: center;
+  gap: 12px 22px;
+  margin-bottom: 16px;
+}
+
+.lp-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+
+.lp-toggle input,
+.lp-form .switch-row input {
+  margin: 0;
+}
+
+.lp-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px 22px;
+  margin-top: 16px;
+}
+
+.lp-field {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.lp-field label,
+.lp-field legend {
+  margin: 0 0 6px;
+  padding: 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.lp-field input {
+  font-variant-numeric: tabular-nums;
+}
+
+.lp-range {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.lp-pace-notes {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  column-gap: 10px;
+}
+
+#lp-pace-hint {
+  color: var(--blue);
+}
+
+.lp-form .form-footer {
+  flex-wrap: wrap;
+  margin-top: 16px;
+  padding-top: 16px;
+}
+
+@container (max-width: 660px) {
+  .lp-overview {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@container (max-width: 460px) {
+  .lp-venues,
+  .lp-settings-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@container (max-width: 290px) {
+  .lp-details {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

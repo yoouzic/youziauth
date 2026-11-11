@@ -94,6 +94,25 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertTrue(self.controller.store.has_session.called)
         self.assertIsInstance(state['dorm']['has_session'], bool)
 
+    def test_official_sports_link_uses_only_the_verified_wechat_uri(self):
+        with patch('desktop_bridge.os.startfile', create=True) as launch:
+            result = self.bridge.dispatch('lptiyu_open_official', {'uri': 'https://example.invalid/'})
+        self.assertTrue(result['ok'])
+        launch.assert_called_once_with('weixin://launchapplet/?app_id=wxb2043232183dac7f')
+
+    def test_official_sports_link_failure_gives_wechat_search_fallback(self):
+        with patch('desktop_bridge.os.startfile', side_effect=OSError('unavailable'), create=True):
+            result = self.bridge.dispatch('lptiyu_open_official')
+        self.assertFalse(result['ok'])
+        self.assertIn('搜索「数体智慧体育」', result['message'])
+
+    def test_preview_official_sports_link_does_not_launch_wechat(self):
+        with patch('desktop_bridge.os.startfile', create=True) as launch:
+            result = PreviewBridge().dispatch('lptiyu_open_official')
+        self.assertTrue(result['ok'])
+        self.assertIn('演示', result['message'])
+        launch.assert_not_called()
+
     def test_dorm_login_state_degrades_instead_of_failing_the_snapshot(self):
         """会话文件读不动时只降级这一小块：不能把「读不出登录态」变成「后台连不上」。"""
         self.controller.store.has_session.side_effect = OSError('磁盘读不动')

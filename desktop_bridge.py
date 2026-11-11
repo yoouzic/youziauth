@@ -27,6 +27,8 @@ from dorm_location import (PICK_SOURCE, distance_metres, gcj02_to_wgs84, map_pic
 # 「演示预览不得创建真实控制器」，并且它仍是本模块对外的控制器符号。
 from dorm_panel import DormController  # noqa: F401
 
+OFFICIAL_SPORTS_MINI_PROGRAM_URI = 'weixin://launchapplet/?app_id=wxb2043232183dac7f'
+
 
 # The picker draws a real map, so tiles come from a third party. OpenStreetMap stays first because
 # it needs no key and its licence is clear, but its tile servers are run by volunteers who block
@@ -799,6 +801,12 @@ class DesktopBridge(LocationProbe):
             if not self._dorm.start(action.removeprefix('dorm_')):
                 raise RuntimeError('打卡操作正在进行，请等待完成或取消当前操作。')
             return '操作已开始，请查看任务状态'
+        if action == 'lptiyu_open_official':
+            try:
+                os.startfile(OFFICIAL_SPORTS_MINI_PROGRAM_URI)
+            except (OSError, AttributeError):
+                raise RuntimeError('无法打开小程序，请在微信搜索「数体智慧体育」。') from None
+            return '已请求微信打开小程序。若未弹出，请在微信搜索「数体智慧体育」。'
         if action in ('lptiyu_run', 'lptiyu_dry', 'lptiyu_sync', 'lptiyu_renew',
                       'lptiyu_zones'):
             controller = self._lptiyu
@@ -1501,6 +1509,8 @@ class PreviewBridge(LocationProbe):
                 lp.update(state='checked', message='全链验证通过，未提交（演示）', busy=False)
             elif action == 'lptiyu_sync':
                 self._data['lptiyu'].update(has_token=True, message='已同步研究库的最新凭证（演示）')
+            elif action == 'lptiyu_open_official':
+                return {'ok': True, 'message': '演示：正式桌面端会请求微信打开「数体智慧体育」。'}
             elif action == 'lptiyu_zones':
                 lp = self._data['lptiyu']
                 for index, zone in enumerate(lp['zones']):

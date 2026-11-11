@@ -125,16 +125,4 @@
 .proxy-hint .stack-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;flex:0 0 auto}
 @media(max-width:760px){.proxy-hint{flex-direction:column;align-items:flex-start}.proxy-hint .stack-actions{width:100%}}
 
-.number-field.wide{max-width:236px}
 .number-field>span{white-space:nowrap}
-/* 配速区间: 两个「分'秒"」输入 + 旁注, 比单个秒数输入更容易对照手表。 */
-.pace-range{display:flex;align-items:center;gap:8px;font-size:12px}
-.pace-range input{width:76px;text-align:center}
-.pace-range>span{white-space:nowrap;color:var(--muted)}
-.pace-range>span#lp-pace-hint{color:var(--blue);min-width:34px}
-/* 跑区: 下拉框 + 同步按钮, 以及这块场地的三只特调旋钮。 */
-.zone-picker{display:flex;align-items:center;gap:8px;font-size:12px}
-.zone-picker select{min-width:168px}
-.zone-tuning{display:flex;align-items:center;gap:8px;font-size:12px;flex-wrap:wrap;justify-content:flex-end}
-.zone-tuning select{min-width:104px}
-.zone-tuning input{width:78px;text-align:center}

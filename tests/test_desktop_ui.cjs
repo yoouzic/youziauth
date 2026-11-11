@@ -2090,15 +2090,20 @@ test('lptiyu states read as their own words on the overview card and the page',a
   assert.equal(h.el('lp-summary').textContent,"今日跑步已完成 · 2.98km · 配速 4'02\"/km");
   assert.equal(h.el('lp-token-badge').textContent,'凭证就绪');
   assert.match(h.el('lp-credential-line').textContent,/3\.2 小时前同步/);
+  assert.equal(h.el('lp-first-use').hidden,true);
   assert.equal(h.el('lp-identity-line').textContent,'当前成员：陈同学');
   assert.equal(h.el('lp-submit').disabled,true,'今日已完成时不再提供第二次提交');
 });
 
-test('lptiyu waiting for credentials explains the one thing to do',async()=>{
+test('lptiyu without a credential shows the official first-use guide',async()=>{
   const h=await lptiyuPage({state:'need_token',message:'还没有可用的跑步凭证',has_token:false});
   assert.equal(h.el('lp-badge').textContent,'等待凭证');
   assert.match(h.el('lp-token-badge').textContent,/待同步/);
-  assert.match(h.el('lp-credential-line').textContent,/打开一次跑步首页/);
+  assert.equal(h.el('lp-first-use').hidden,false);
+  assert.equal(h.el('lp-first-use').tagName,'DETAILS');
+  h.el('lp-open-official').listeners.click();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(h.calls.at(-1).action,'lptiyu_open_official');
 });
 
 test('lptiyu settings sync from the snapshot and save through the bridge',async()=>{
@@ -2117,44 +2122,33 @@ test('lptiyu settings sync from the snapshot and save through the bridge',async(
   await h.el('lptiyu-form').fire('submit');
   await new Promise(resolve=>setTimeout(resolve,0));
   assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1))),{action:'lptiyu_save',payload:{enabled:true,run_time:'06:30',
-    dist_lo:2.9,dist_hi:3.2,pace_lo:245,pace_hi:280,anchor_max_m:20,auto_renew:true,
-    zone_id:'',zone_name:'',zone_direction:'auto',zone_anchor_m:0,zone_lane_m:0}},
+    dist_lo:2.9,dist_hi:3.2,pace_lo:245,pace_hi:280,anchor_max_m:20,auto_renew:true}},
     '合法修改按表单内容发往后台');
 });
 
-test('lptiyu zones pick a field and save its own tuning',async()=>{
-  const settings={enabled:true,run_time:'06:30',zone_id:'1873',zone_name:'第二运动场',
-    dist_lo:2.03,dist_hi:2.35,pace_lo:0,pace_hi:0,anchor_max_m:20,max_per_day:1,
-    time_lo:'06:00',time_hi:'23:00',auto_renew:true,renew_lead_min:45,renew_interval_min:180,
-    api_proxy:'',lab_dir:''};
-  const h=await lptiyuPage({settings,
-    zones:[{id:'1873',name:'第二运动场',default:false,points:4},
-           {id:'1874',name:'第一运动场',default:true,points:4},
-           {id:'1876',name:'南区操场',default:false,points:0}],
-    zone:{id:'1873',name:'第二运动场',
-          tuning:{direction:'cw',lane_m:5,anchor_m:12,start_deg:0},
-          summary:{text:'长轴东西 · 96m×64m · 顺时针 · 跑道 5.0m · 贴点 12m'}}});
-  assert.equal(h.el('lp-zone').options.length,4,'当前跑区 + 目录里的三个');
-  assert.equal(h.el('lp-zone').value,'1873');
-  assert.equal(h.el('lp-zone-hint').textContent,
-    '长轴东西 · 96m×64m · 顺时针 · 跑道 5.0m · 贴点 12m','这块场地的朝向要写在选跑区旁边');
-  assert.equal(h.el('lp-zone-direction').value,'cw','特调跟着跑区回填');
-  assert.equal(String(h.el('lp-zone-anchor').value),'12');
-  assert.equal(String(h.el('lp-zone-lane').value),'5');
-  assert.match(h.el('lp-zone').options[3].textContent,/未同步/,'没点位的跑区要标出来');
-  h.el('lp-zone').value='1874';
-  h.el('lp-zone').fire('change');
-  assert.equal(h.el('lp-zone-direction').value,'auto','换场地就把特调清回自动, 别把 A 的调参写到 B 上');
-  assert.equal(String(h.el('lp-zone-anchor').value),'');
-  await h.el('lptiyu-form').fire('submit');
-  await new Promise(resolve=>setTimeout(resolve,0));
-  const saved=h.calls.at(-1);
-  assert.equal(saved.action,'lptiyu_save');
-  assert.equal(saved.payload.zone_id,'1874');
-  assert.equal(saved.payload.zone_name,'第一运动场');
-  h.el('lp-zones').listeners.click();
-  await new Promise(resolve=>setTimeout(resolve,0));
-  assert.equal(h.calls.at(-1).action,'lptiyu_zones','同步跑区按钮要真的叫后台去抓点位');
+test('lptiyu displays the saved zone as a read-only summary',async()=>{
+  const h=await lptiyuPage({settings:{run_time:'06:30',zone_id:'1873',zone_name:'第二运动场'}});
+  assert.equal(h.el('lp-zone').tagName,'STRONG');
+  assert.equal(h.el('lp-zone').textContent,'第二运动场');
+  const defaults=await lptiyuPage({});
+  assert.equal(defaults.el('lp-zone').textContent,'以学校配置为准');
+});
+
+test('lptiyu offers the observed official venues for local browsing',async()=>{
+  const h=await lptiyuPage({});
+  const picker=h.el('lp-visit-venue');
+  assert.equal(picker.tagName,'SELECT');
+  assert.deepEqual(picker.options.filter(option=>option.value).map(option=>option.text),[
+    '西南大学第二运动场跑区',
+    '西南大学-第一运动场跑区',
+    '西南大学第四运动场跑区',
+    '西南大学（荣昌校区）',
+  ]);
+  const previousCalls=h.calls.length;
+  picker.value=picker.options[1].value;
+  picker.fire('change');
+  assert.equal(h.calls.length,previousCalls);
+  assert.equal(h.el('lp-zone').textContent,'以学校配置为准');
 });
 
 test('lptiyu pace accepts minutes and seconds, and refuses nonsense',async()=>{

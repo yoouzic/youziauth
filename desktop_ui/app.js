@@ -580,17 +580,6 @@ $('network-form').addEventListener('submit',async event=>{
   if(await act('network_save',payload)){if(revision===revisions.network){markDirty('network',false);$('password').value='';}render();}
 });
 $('location-source').addEventListener('change',()=>{sourceRevision++;sourceDirty=true;markDirty('dorm',true);});
-/* 换跑区时把特调清回自动: 上一块场地的方向/贴点/跑道不能顺手写到新场地上。
-   不这样, 保存一次就把 A 场地的特调安到 B 场地上, 而用户看不出来。 */
-$('lp-zone').addEventListener('change',()=>{
-  const current=String((state&&state.lptiyu&&state.lptiyu.zone&&state.lptiyu.zone.id)||'');
-  if($('lp-zone').value===current)return;
-  $('lp-zone-direction').value='auto';
-  $('lp-zone-anchor').value='';
-  $('lp-zone-lane').value='';
-  $('lp-zone-hint').textContent='保存后按这块场地的点位自动特调';
-  revisions.lptiyu++;markDirty('lptiyu',true);
-});
 ['lp-pace-lo','lp-pace-hi'].forEach(id=>$(id).addEventListener('input',()=>{
   const lo=parsePace($('lp-pace-lo').value),hi=parsePace($('lp-pace-hi').value);
   $('lp-pace-hint').textContent=Number.isNaN(lo)||Number.isNaN(hi)?'格式 4\'05"':paceRangeLabel(lo,hi);
@@ -602,18 +591,10 @@ $('lptiyu-form').addEventListener('submit',async event=>{
     notify('配速请写成 4\'05" 这样（分钟\'秒"），留空为自动。',true);return;}
   if((paceLo>0)!==(paceHi>0)){notify('配速区间要么上下限都填，要么都留空。',true);return;}
   if(paceLo&&paceLo>paceHi){notify('配速下限要比上限快（4\'05" 在 4\'30" 前面）。',true);return;}
-  const zoneSelect=$('lp-zone');
-  const zoneId=zoneSelect?zoneSelect.value:'';
-  const zoneName=zoneId&&zoneSelect?((Array.from(zoneSelect.options||[])
-    .find(option=>option.value===zoneId)||{}).textContent||''):'';
   const payload={enabled:$('lp-enabled').checked,run_time:$('lp-run-time').value,
     dist_lo:Number($('lp-dist-lo').value),dist_hi:Number($('lp-dist-hi').value),
     pace_lo:paceLo,pace_hi:paceHi,anchor_max_m:Number($('lp-anchor').value),
-    auto_renew:$('lp-auto-renew').checked,
-    zone_id:zoneId,zone_name:zoneName,
-    zone_direction:$('lp-zone-direction').value,
-    zone_anchor_m:Number($('lp-zone-anchor').value)||0,
-    zone_lane_m:Number($('lp-zone-lane').value)||0};
+    auto_renew:$('lp-auto-renew').checked};
   if(payload.dist_lo>=payload.dist_hi){notify('距离下限要小于上限，暂不支持倒序范围。',true);return;}
   const revision=revisions.lptiyu;
   if(await act('lptiyu_save',payload)){
@@ -761,85 +742,61 @@ function renewalText(lp,rn){
   const needs=rn.message&&['need_user','error','cooldown','capped'].includes(rn.state);
   return needs?`${head} · ${rn.message}`:head;
 }
-/* 跑区: 下拉框来自后端目录(含「当前跑区」); 选中跑区的几何摘要说明这块场地怎么特调。
-   方向/贴点/跑道是按跑区存的 —— 换一块朝向不同的场地, 这三只旋钮要跟着换。 */
-const ZONE_DIRECTIONS=['auto','ccw','cw'];
-function zoneOptionItems(lp){
-  const zones=(lp.zones||[]).filter(zone=>zone&&zone.id);
-  return [{id:'',label:'当前跑区（学校默认）'}].concat(zones.map(zone=>({
-    id:String(zone.id),
-    label:(zone.name||String(zone.id))+(zone.points?'':'（未同步）')})));
-}
-function renderZones(lp,s){
-  if(!$('lp-zone'))return;
-  const select=$('lp-zone');
-  const selected=s.zone_id?String(s.zone_id):'';
-  const items=zoneOptionItems(lp);
-  // 选中跑区还没进目录(没同步过)时也要显示出来, 否则下拉框会静默跳回默认
-  if(selected&&!items.some(item=>item.id===selected))
-    items.push({id:selected,label:s.zone_name||selected});
-  select.replaceChildren(...items.map(item=>{
-    const option=document.createElement('option');
-    option.value=item.id;option.textContent=item.label;return option;
-  }));
-  select.value=selected;
-  const summary=(lp.zone||{}).summary;
-  $('lp-zone-hint').textContent=summary&&summary.text?summary.text
-    :((lp.zones||[]).length?'选一块场地后保存，跑步就按这块场地的点位特调'
-      :'先点「同步跑区」，拿到学校开放的场地和它们的点位');
-  const tuning=(lp.zone||{}).tuning||{};
-  $('lp-zone-direction').value=ZONE_DIRECTIONS.includes(tuning.direction)?tuning.direction:'auto';
-  $('lp-zone-anchor').value=tuning.anchor_m||'';
-  $('lp-zone-lane').value=tuning.lane_m||'';
-}
-function renderLptiyu(){
-  if(!$('lp-task-badge'))return;
-  const lp=state.lptiyu||{state:'idle',message:'',busy:false,settings:{},identity:{},
-    has_token:false,token_age_hours:null,zone:{},today_done:0,today_max:1,last:null};
+function renderRunStatus(lp,s){
   const label=lp.busy?'正在处理…':(LP_NAMES[lp.state]||'请查看任务状态');
   const tone=lp.state==='signed'?'success':['need_token','error','uncertain','quota'].includes(lp.state)?'warning':'';
   badge('lp-badge',label,tone);badge('lp-task-badge',label,tone);
   $('lp-headline').textContent=label;
-  $('lp-headline-page').textContent=label;
   $('lp-summary').textContent=lp.message;
-  $('lp-message').textContent=lp.busy?'正在处理，请稍候。':lp.message;
-  const s=lp.settings||{};
+  const message=lp.busy?'正在处理，请稍候。':lp.message;
+  if($('lp-message').textContent!==message)$('lp-message').textContent=message;
   $('lp-details').hidden=!s.run_time;
   if(s.run_time){
-    $('lp-zone').textContent=s.zone_name?`${s.zone_name}（${s.zone_id}）`:'以学校配置为准';
+    $('lp-zone').textContent=s.zone_name||s.zone_id||'以学校配置为准';
     $('lp-distance').textContent=`${s.dist_lo}–${s.dist_hi} km`;
     $('lp-pace-detail').textContent=paceRangeLabel(...paceWindow(lp));
     $('lp-last').textContent=lp.last
       ?`${lp.last.date} · ${lp.last.distance||''}${lp.last.zone?' · '+lp.last.zone:''}`:'—';
   }
-  if(!dirty.lptiyu){
-    $('lp-enabled').checked=!!s.enabled;
-    $('lp-run-time').value=s.run_time||'06:30';
-    $('lp-dist-lo').value=s.dist_lo??2.03;
-    $('lp-dist-hi').value=s.dist_hi??2.35;
-    const pace=paceWindow(lp);
-    $('lp-pace-lo').value=pace[0]?paceLabel(pace[0]):'';
-    $('lp-pace-hi').value=pace[1]?paceLabel(pace[1]):'';
-    $('lp-anchor').value=s.anchor_max_m??20;
-    $('lp-pace-hint').textContent=paceRangeLabel(pace[0],pace[1]);
-    // 老快照没有这一项：自动续期本来默认开，渲染成「开」与后端的默认值一致。
-    $('lp-auto-renew').checked=s.auto_renew!==false;
-    renderZones(lp,s);
-    $('lp-schedule').textContent=lp.schedule||'自动跑步：关闭';
-  }
   $('lp-auto-summary').textContent=s.enabled?`${s.run_time||'06:30'} 自动`:'未开启';
+  $('lp-submit').disabled=pending||syncedEpoch!==epoch||lp.busy||['signed','quota'].includes(lp.state);
+  $('lp-cancel').disabled=pending||!lp.busy;
+  $('lp-dry').disabled=pending||lp.busy;
+}
+function renderRunSettings(lp,s){
+  if(dirty.lptiyu)return;
+  $('lp-enabled').checked=!!s.enabled;
+  $('lp-run-time').value=s.run_time||'06:30';
+  $('lp-dist-lo').value=s.dist_lo??2.03;
+  $('lp-dist-hi').value=s.dist_hi??2.35;
+  const [paceLo,paceHi]=paceWindow(lp);
+  $('lp-pace-lo').value=paceLo?paceLabel(paceLo):'';
+  $('lp-pace-hi').value=paceHi?paceLabel(paceHi):'';
+  $('lp-anchor').value=s.anchor_max_m??20;
+  $('lp-pace-hint').textContent=paceRangeLabel(paceLo,paceHi);
+  $('lp-auto-renew').checked=s.auto_renew!==false;
+  $('lp-schedule').textContent=lp.schedule||'自动跑步：关闭';
+}
+function renderRunCredential(lp){
   badge('lp-token-badge',lp.has_token?'凭证就绪':'待同步',lp.has_token?'success':'warning');
+  $('lp-first-use').hidden=!!lp.has_token;
+  $('lp-open-official').disabled=pending;
   $('lp-renew-line').textContent=lp.available===false
     ?'自动续期：乐跑功能在本机暂不可用。'
     :renewalText(lp,lp.renewal||{});
   const age=lp.token_age_hours;
   $('lp-credential-line').textContent=lp.has_token
     ?`凭证已加密保存在本机${age!=null?`，${age<1?Math.max(1,Math.round(age*60))+' 分钟前':age.toFixed(1)+' 小时前'}同步`:''}，跑步前会自动确认可用。`
-    :'在小程序里打开一次跑步首页，然后点「同步凭证」。';
+    :'本机尚无跑步凭证。';
   $('lp-identity-line').textContent=lp.identity?.name?`当前成员：${lp.identity.name}`:'';
-  document.querySelectorAll('[data-action="lptiyu_dry"],[data-action="lptiyu_sync"],[data-action="lptiyu_renew"],[data-action="lptiyu_zones"]').forEach(b=>b.disabled=pending||lp.busy);
-  $('lp-submit').disabled=pending||syncedEpoch!==epoch||lp.busy||['signed','quota'].includes(lp.state);
-  $('lp-cancel').disabled=pending||!lp.busy;
+  document.querySelectorAll('[data-action="lptiyu_sync"],[data-action="lptiyu_renew"]').forEach(b=>b.disabled=pending||lp.busy);
+}
+function renderLptiyu(){
+  const lp=state.lptiyu||{state:'idle',message:'',busy:false,has_token:false};
+  const settings=lp.settings||{};
+  renderRunStatus(lp,settings);
+  renderRunCredential(lp);
+  renderRunSettings(lp,settings);
 }
 /* 学校登录 ---------------------------------------------------------------------------------
    登录态只有后端能回答：快照里的 has_session 直接读本机保存的学校会话。不用 state 反推 ——
