@@ -10,6 +10,26 @@ from unittest.mock import patch
 
 from lptiyu import flow as lptiyu_flow
 from lptiyu.client import ApiError
+from lptiyu.tracks import TemplateShift
+
+
+def track_winding(track):
+    """轨迹绕质心的累计转角(弧度): 正=逆时针, 负=顺时针。独立实现, 不复用引擎。"""
+    clat = sum(p['a'] for p in track) / len(track)
+    clng = sum(p['o'] for p in track) / len(track)
+    k = math.cos(math.radians(clat))
+    total, prev = 0.0, None
+    for p in track:
+        ang = math.atan2(p['a'] - clat, (p['o'] - clng) * k)
+        if prev is not None:
+            d = ang - prev
+            while d > math.pi:
+                d -= 2 * math.pi
+            while d < -math.pi:
+                d += 2 * math.pi
+            total += d
+        prev = ang
+    return total
 
 
 def make_template(root: Path) -> str:
@@ -209,6 +229,65 @@ class DryRunTests(unittest.TestCase):
         self.assertGreater(out['track_points'], 50)
 
 
+class ZoneSwitchClient(FakeClient):
+    """模拟服务端跑区状态: setRunZone 成功才换 beforeRun 的点位; refuse=True 时拒绝切换。"""
+
+    CATALOG = {
+        '1874': ('第一运动场', [(29.8237, 106.4302), (29.8245, 106.4315),
+                               (29.8231, 106.4318), (29.8223, 106.4305)]),
+        '1873': ('第二运动场', [(29.8257, 106.4282), (29.8265, 106.4295),
+                               (29.8251, 106.4298), (29.8243, 106.4285)]),
+    }
+
+    def __init__(self, script=None, refuse=False):
+        super().__init__(script or {})
+        self.current = '1874'
+        self.refuse = refuse
+
+    def before_run(self):
+        self.calls.append('before_run')
+        name, pts = self.CATALOG[self.current]
+        return {'run_zone_id': int(self.current), 'run_zone_name': name,
+                'term_id': 13103,
+                'run_line_info': {'point_list': [
+                    {'id': int(self.current) * 10 + i,
+                     'jingwei': f'{lat},{lng}'}
+                    for i, (lat, lng) in enumerate(pts)]},
+                'time_rule_arr': [{'min_distance': 2.0, 'max_distance': 10.0}]}
+
+    def set_zone(self, zone_id):
+        self.calls.append(('set_zone', str(zone_id)))
+        if not self.refuse:
+            self.current = str(zone_id)
+        return {'status': 1}
+
+
+class ZoneSwitchTests(unittest.TestCase):
+    """切换跑区必须真的换掉提交的场地: 服务器拒绝时不得拿旧点位冒充新跑区。"""
+
+    def test_refused_switch_aborts_before_generating_or_submitting(self):
+        slot = FakeSlot()
+        slot.client = ZoneSwitchClient(refuse=True)
+        flow = make_flow(slot)
+        out, code = flow.run(submit=True, zone_override='1873')
+        self.assertEqual(code, 4, '切换被拒必须中止, 不能拿旧跑区点位冒充新跑区提交')
+        self.assertIsNone(out)
+        self.assertNotIn('oss_sts', slot.client.calls)
+        self.assertNotIn('stop_run', slot.client.calls)
+
+    def test_successful_switch_submits_the_new_zone_points(self):
+        slot = FakeSlot()
+        slot.client = ZoneSwitchClient()
+        flow = make_flow(slot)
+        out, code = flow.run(submit=False, zone_override='1873')
+        self.assertEqual(code, 0)
+        biz = out['stopRun_biz']
+        self.assertEqual(biz['game_id'], '1873')
+        self.assertEqual(sorted(row['point_id'] for row in out['log_data']),
+                         ['18730', '18731', '18732', '18733'],
+                         '打卡点必须来自新跑区, 而不是只改 game_id')
+
+
 class SubmitTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -386,7 +465,8 @@ class TemplateScaleTests(unittest.TestCase):
         slot = FakeSlot()
         slot.client = FakeClient({})
         flow = make_flow(slot, policy={'dist_lo': 2.9, 'dist_hi': 3.1})
-        flow.zone_profile = {'direction': 'ccw', 'lane_m': 4.0, 'anchor_m': 18.0}
+        # 本测试只关心双尺度上报; 贴点放到判定半径40m, 免得随机距离缩放耗尽重试落到 ring
+        flow.zone_profile = {'direction': 'ccw', 'lane_m': 4.0, 'anchor_m': 40.0}
         # 用现成的迷你模板走一遍真实模板路径
         with tempfile.TemporaryDirectory() as tmp:
             flow.template_path = make_template(Path(tmp))
@@ -395,6 +475,54 @@ class TemplateScaleTests(unittest.TestCase):
         scale_xy = out['meta'].get('scale_xy')
         self.assertIsInstance(scale_xy, tuple)
         self.assertEqual(len(scale_xy), 2, '两个方向的缩放都要报出来')
+
+
+class TemplateDirectionTests(unittest.TestCase):
+    """模板绕向要服从跑区特调: 场地要求顺时针时, 逆时针模板必须镜像过来。"""
+
+    ANCHORS = [{'point_id': '1', 'latitude': 29.8237, 'longtitude': 106.4302},
+               {'point_id': '2', 'latitude': 29.8245, 'longtitude': 106.4315},
+               {'point_id': '3', 'latitude': 29.8231, 'longtitude': 106.4318},
+               {'point_id': '4', 'latitude': 29.8223, 'longtitude': 106.4305}]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.template_path = make_template(Path(self._tmp.name))
+
+    def test_cw_zone_mirrors_the_ccw_template(self):
+        gen = TemplateShift(self.ANCHORS, distance_km=2.95, seed=7,
+                            template_path=self.template_path,
+                            profile={'direction': 'cw'})
+        track, meta = gen.generate(return_meta=True)
+        self.assertLess(track_winding(track), 0,
+                        '顺时针跑区必须生成顺时针轨迹, 不能沿用模板的逆时针')
+        self.assertTrue(meta.get('mirrored'), '镜像发生了就要在 meta 里看得见')
+        for anchor in self.ANCHORS:
+            nearest = min(lptiyu_flow.TRK.haversine_m(
+                p['a'], p['o'], anchor['latitude'], anchor['longtitude'])
+                for p in track)
+            self.assertLess(nearest, 20.0,
+                            '镜像之后仍要贴住每个打卡点(默认验收半径20m, 判定半径40m)')
+
+    def test_matching_direction_keeps_the_template_unmirrored(self):
+        gen = TemplateShift(self.ANCHORS, distance_km=2.95, seed=7,
+                            template_path=self.template_path,
+                            profile={'direction': 'ccw'})
+        track, meta = gen.generate(return_meta=True)
+        self.assertGreater(track_winding(track), 0)
+        self.assertFalse(meta.get('mirrored'))
+
+    def test_flow_honours_zone_direction_with_template_engine(self):
+        slot = FakeSlot()
+        slot.client = FakeClient({})
+        flow = make_flow(slot, policy={'dist_lo': 2.9, 'dist_hi': 3.1},
+                         template_path=self.template_path,
+                         zone_tuning={'direction': 'cw'})
+        out, code = flow.run(submit=False)
+        self.assertEqual(code, 0)
+        self.assertLess(track_winding(out['track']), 0,
+                        '跑区特调的方向必须真的落到模板引擎生成的轨迹上')
 
 
 class PaceTextTests(unittest.TestCase):

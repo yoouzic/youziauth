@@ -752,7 +752,7 @@ function renderRunStatus(lp,s){
   if($('lp-message').textContent!==message)$('lp-message').textContent=message;
   $('lp-details').hidden=!s.run_time;
   if(s.run_time){
-    $('lp-zone').textContent=s.zone_name||s.zone_id||'以学校配置为准';
+    $('lp-zone').textContent=(lp.zone&&lp.zone.name)||s.zone_name||s.zone_id||'未指定';
     $('lp-distance').textContent=`${s.dist_lo}–${s.dist_hi} km`;
     $('lp-pace-detail').textContent=paceRangeLabel(...paceWindow(lp));
     $('lp-last').textContent=lp.last
@@ -785,9 +785,9 @@ function renderRunCredential(lp){
     ?'自动续期：乐跑功能在本机暂不可用。'
     :renewalText(lp,lp.renewal||{});
   const age=lp.token_age_hours;
-  $('lp-credential-line').textContent=lp.has_token
-    ?`凭证已加密保存在本机${age!=null?`，${age<1?Math.max(1,Math.round(age*60))+' 分钟前':age.toFixed(1)+' 小时前'}同步`:''}，跑步前会自动确认可用。`
-    :'本机尚无跑步凭证。';
+  const ageText=age==null?'凭证已就绪':age<1/60?'刚刚同步'
+    :`${age<1?Math.max(1,Math.round(age*60))+' 分钟前':age.toFixed(1)+' 小时前'}同步`;
+  $('lp-credential-line').textContent=lp.has_token?ageText:'尚未同步凭证。';
   $('lp-identity-line').textContent=lp.identity?.name?`当前成员：${lp.identity.name}`:'';
   document.querySelectorAll('[data-action="lptiyu_sync"],[data-action="lptiyu_renew"]').forEach(b=>b.disabled=pending||lp.busy);
 }

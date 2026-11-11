@@ -2131,7 +2131,9 @@ test('lptiyu displays the saved zone as a read-only summary',async()=>{
   assert.equal(h.el('lp-zone').tagName,'STRONG');
   assert.equal(h.el('lp-zone').textContent,'第二运动场');
   const defaults=await lptiyuPage({});
-  assert.equal(defaults.el('lp-zone').textContent,'以学校配置为准');
+  assert.equal(defaults.el('lp-zone').textContent,'未指定','快照没给名字时不替学校编配置');
+  const named=await lptiyuPage({zone:{id:'',name:'第二运动场跑区'}});
+  assert.equal(named.el('lp-zone').textContent,'第二运动场跑区','没选跑区时显示快照补的学校默认场地');
 });
 
 test('lptiyu offers the observed official venues for local browsing',async()=>{
@@ -2148,7 +2150,18 @@ test('lptiyu offers the observed official venues for local browsing',async()=>{
   picker.value=picker.options[1].value;
   picker.fire('change');
   assert.equal(h.calls.length,previousCalls);
-  assert.equal(h.el('lp-zone').textContent,'以学校配置为准');
+  assert.equal(h.el('lp-zone').textContent,'未指定');
+});
+
+test('lptiyu credential line reports the local sync age',async()=>{
+  const fresh=await lptiyuPage({has_token:true,token_age_hours:0.001});
+  assert.equal(fresh.el('lp-credential-line').textContent,'刚刚同步');
+  const minutes=await lptiyuPage({has_token:true,token_age_hours:0.4});
+  assert.equal(minutes.el('lp-credential-line').textContent,'24 分钟前同步');
+  const unknown=await lptiyuPage({has_token:true,token_age_hours:null});
+  assert.equal(unknown.el('lp-credential-line').textContent,'凭证已就绪');
+  const none=await lptiyuPage({has_token:false});
+  assert.equal(none.el('lp-credential-line').textContent,'尚未同步凭证。');
 });
 
 test('lptiyu pace accepts minutes and seconds, and refuses nonsense',async()=>{

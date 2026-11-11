@@ -414,12 +414,12 @@ class DesktopBridge(LocationProbe):
                 state = 'signed'
                 message = '今日跑步已完成' + (
                     f" · {signed.get('distance')}" if signed.get('distance') else '')
-            issued = store.token_issued_at() if store.has_token() else ''
+            synced = store.sync_record().get('at') or ''
             age = None
-            if issued:
+            if store.has_token() and synced:
                 try:
-                    issued_at = dt.datetime.fromisoformat(issued)
-                    age = round((dt.datetime.now() - issued_at).total_seconds() / 3600.0, 1)
+                    synced_at = dt.datetime.fromisoformat(synced)
+                    age = round((dt.datetime.now() - synced_at).total_seconds() / 3600.0, 1)
                 except ValueError:
                     age = None
             signed = store.signed_record()
@@ -442,6 +442,7 @@ class DesktopBridge(LocationProbe):
                               'points': len(entry.get('points') or [])})
             zones.sort(key=lambda zone: (not zone['default'], zone['name'] or zone['id']))
             selected = str(settings.zone_id or '')
+            default_name = next((z['name'] for z in zones if z['default']), '')
             return {
                 'state': state, 'message': message, 'busy': bool(controller.busy),
                 'available': True,
@@ -451,7 +452,6 @@ class DesktopBridge(LocationProbe):
                              'student_num': identity.get('student_num', '')},
                 'has_token': store.has_token(),
                 'token_age_hours': age,
-                'zone': {'id': settings.zone_id, 'name': settings.zone_name},
                 'today_done': int(daily.get('run', 0)),
                 'today_max': settings.max_per_day,
                 'last': last,
@@ -460,7 +460,7 @@ class DesktopBridge(LocationProbe):
                 # 跑区: 目录给下拉框, 选中跑区的几何摘要给「特调」这行字。
                 'zones': zones,
                 'zone': {'id': selected,
-                         'name': str(settings.zone_name or ''),
+                         'name': str(settings.zone_name or '') if selected else default_name,
                          'tuning': store.zone_tuning(selected) if selected else
                                    {'direction': 'auto', 'lane_m': 0.0,
                                     'anchor_m': 0.0, 'start_deg': 0.0},
@@ -1256,14 +1256,14 @@ class PreviewBridge(LocationProbe):
                        'settings':dataclasses.asdict(lptiyu_settings({})),
                        'identity':{'name':'演示同学', 'student_num':'2026000000'},
                        'has_token':True, 'token_age_hours':3.2,
-                       'zone':{'id':'', 'name':''}, 'today_done':0, 'today_max':1,
+                       'today_done':0, 'today_max':1,
                        'last':{'date':dt.date.today().isoformat(), 'distance':'2.31km',
                                'pace':"4'05\"", 'zone':'第一运动场'},
                        'pace_range':{'lo':0, 'hi':0},
                        'zones':[{'id':'1873', 'name':'演示·第二运动场', 'default':False, 'points':4},
                                 {'id':'1874', 'name':'演示·第一运动场', 'default':True, 'points':4},
                                 {'id':'1876', 'name':'演示·南区操场', 'default':False, 'points':0}],
-                       'zone':{'id':'', 'name':'',
+                       'zone':{'id':'', 'name':'演示·第一运动场',
                                'tuning':{'direction':'auto','lane_m':0.0,'anchor_m':0.0,'start_deg':0.0},
                                'summary':None},
                        'renewal':{'auto':True, 'state':'ok', 'message':'凭证可用',
@@ -1508,7 +1508,8 @@ class PreviewBridge(LocationProbe):
                 lp = self._data['lptiyu']
                 lp.update(state='checked', message='全链验证通过，未提交（演示）', busy=False)
             elif action == 'lptiyu_sync':
-                self._data['lptiyu'].update(has_token=True, message='已同步研究库的最新凭证（演示）')
+                self._data['lptiyu'].update(has_token=True, token_age_hours=0.0,
+                                            message='已同步研究库的最新凭证（演示）')
             elif action == 'lptiyu_open_official':
                 return {'ok': True, 'message': '演示：正式桌面端会请求微信打开「数体智慧体育」。'}
             elif action == 'lptiyu_zones':

@@ -64,6 +64,27 @@ def path_len_m(coords):
                for a, b in zip(coords, coords[1:]))
 
 
+def _path_winding(points):
+    """路径绕质心的累计转角(弧度): 正=逆时针, 负=顺时针; 多圈时按圈数累加。"""
+    if len(points) < 3:
+        return 0.0
+    clat = sum(p[0] for p in points) / len(points)
+    clng = sum(p[1] for p in points) / len(points)
+    xy = [enu_of(lat, lng, clat, clng) for lat, lng in points]
+    total, prev = 0.0, None
+    for x, y in xy:
+        ang = math.atan2(y, x)
+        if prev is not None:
+            d = ang - prev
+            while d > math.pi:
+                d -= 2 * math.pi
+            while d < -math.pi:
+                d += 2 * math.pi
+            total += d
+        prev = ang
+    return total
+
+
 def used_seconds(track, min_s=300, max_s=2400, rnd=None):
     """模板用时: 按 s 字段(m/s)逐段积分; 缺 s 段按步长走; 超窗兜底。"""
     rnd = rnd or random.Random()
@@ -152,6 +173,24 @@ class TemplateShift:
                             else self.rnd.uniform(0.82, 1.18))
         self.profile = dict(profile or {})     # 跑区特调(lptiyu.zones.profile)
         self.tpl = template if template is not None else load_template(template_path)
+        self.mirrored = False
+        want = str(self.profile.get("direction") or "").lower()
+        if want in ("cw", "ccw") and len(self.tpl) >= 3:
+            wind = _path_winding([(p["a"], p["o"]) for p in self.tpl])
+            if abs(wind) > 0.5 and (want == "cw") != (wind < 0):
+                # 模板绕向与跑区特调相反: 在锚点匹配之前镜像模板, 旋转/尺度会重新对齐,
+                # 打卡点覆盖不受影响; s/b/c 序列原样保留, 只是换了绕向。
+                clat = sum(p["a"] for p in self.tpl) / len(self.tpl)
+                clng = sum(p["o"] for p in self.tpl) / len(self.tpl)
+                flipped = []
+                for p in self.tpl:
+                    x, y = enu_of(p["a"], p["o"], clat, clng)
+                    lat, lng = geo_of(-x, y, clat, clng)
+                    q = dict(p)
+                    q["a"], q["o"] = lat, lng
+                    flipped.append(q)
+                self.tpl = flipped
+                self.mirrored = True
 
     def _map(self, sx, sy, rot, src_c, dst_c):
         cos_r, sin_r = math.cos(rot), math.sin(rot)
@@ -258,6 +297,7 @@ class TemplateShift:
             "scale": round(scale, 4),
             "scale_xy": (round(sx_scale, 4), round(sy_scale, 4)),
             "rot_deg": round(math.degrees(rot), 1),
+            "mirrored": self.mirrored,
             "pace_factor": round(self.pace_factor, 3),
             "path_m": round(path_len_m([(p["a"], p["o"]) for p in track])),
             "anchor_cover": [

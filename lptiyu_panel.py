@@ -265,6 +265,8 @@ class LptiyuController:
         state = 'synced' if changes else 'idle'
         if not changes and message.startswith('未找到'):
             state = 'error'
+        if changes or message == '本机凭证已是最新':
+            self.store.record_sync(message)
         return self._set_latest(state, message)
 
     # ------------------------------------------------------------- 跑区

@@ -25,7 +25,7 @@
       <a class="nav-link" href="#records"><i class="bi bi-clock-history" aria-hidden="true"></i><span>运行记录</span></a>
       <a class="nav-link" href="#updates" aria-label="软件更新"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i><span>软件更新</span></a>
     </nav>
-    <div class="sidebar-bottom"><div class="local-note"><i class="bi bi-shield-check" aria-hidden="true"></i><span>凭据加密保存在本机<small>你的校园小助手</small></span></div><button class="text-button" data-action="hide"><i class="bi bi-window-dock" aria-hidden="true"></i> 收到托盘</button><button class="text-button" id="quit"><i class="bi bi-box-arrow-right" aria-hidden="true"></i> 退出程序</button></div>
+    <div class="sidebar-bottom"><div class="local-note"><span>你的校园小助手</span></div><button class="text-button" data-action="hide"><i class="bi bi-window-dock" aria-hidden="true"></i> 收到托盘</button><button class="text-button" id="quit"><i class="bi bi-box-arrow-right" aria-hidden="true"></i> 退出程序</button></div>
   </aside>
   <div class="workspace">
     <header class="topbar"><span id="page-context">今日概览</span><div class="topbar-end"><span id="preview-tag" class="badge" hidden>演示预览</span><span id="date-label"></span><span class="topbar-divider"></span><i class="bi bi-laptop" aria-hidden="true"></i><span>本机工作台</span></div></header>
@@ -133,7 +133,7 @@
             <dl class="lp-details" id="lp-details" hidden>
               <div>
                 <dt>已保存跑区</dt>
-                <dd><strong id="lp-zone">以学校配置为准</strong></dd>
+                <dd><strong id="lp-zone">未指定</strong></dd>
               </div>
               <div><dt>目标距离</dt><dd id="lp-distance">2.03–2.35 km</dd></div>
               <div><dt>目标配速</dt><dd id="lp-pace-detail">自动</dd></div>
@@ -171,7 +171,7 @@
         <section class="paper-card lp-card lp-venues" aria-labelledby="lp-venues-title">
           <header>
             <h2 id="lp-venues-title">开放跑区</h2>
-            <p class="field-hint" id="lp-venues-source">数体智慧体育「校园乐跑 → 切换跑区」 · 2026-11-11 查阅</p>
+            <p class="field-hint" id="lp-venues-source">更新于 2026-11-11</p>
           </header>
           <div class="lp-field">
             <label for="lp-visit-venue">出行参考</label>
@@ -182,7 +182,6 @@
               <option value="fourth-field">西南大学第四运动场跑区</option>
               <option value="rongchang">西南大学（荣昌校区）</option>
             </select>
-            <p class="field-hint" id="lp-venues-note">跑前请在微信小程序确认可用场地并切换。</p>
           </div>
         </section>
 

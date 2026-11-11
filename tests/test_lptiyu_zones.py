@@ -3,10 +3,11 @@
 这些参数决定「每块场地怎么跑」, 所以逐条钉死: 朝向算错 90°, 轨迹就会横穿球场。
 """
 import math
+import random
 import unittest
 
 from lptiyu import zones
-from lptiyu.tracks import geo_of
+from lptiyu.tracks import enu_of, geo_of
 
 CENTER = (29.8200, 106.4300)
 
@@ -139,6 +140,63 @@ class ProfileTests(unittest.TestCase):
         self.assertNotIn('29.82', text, '摘要里不该出现坐标')
 
 
+class TrackLoopTests(unittest.TestCase):
+    """四点场地绕打卡点成环: 直道走直线, 弯道外凸贴跑道, 不切内场。"""
+
+    THETA = math.radians(20)
+    A, R = 45.0, 30.0
+
+    def boundary(self, u, v):
+        x = u * math.cos(self.THETA) - v * math.sin(self.THETA)
+        y = u * math.sin(self.THETA) + v * math.cos(self.THETA)
+        return geo_of(x, y, *CENTER)
+
+    def off_tangent_points(self):
+        a, r = self.A, self.R
+        return [self.boundary(-20, -r),
+                self.boundary(a + r * math.cos(math.radians(-50)),
+                              r * math.sin(math.radians(-50))),
+                self.boundary(10, r),
+                self.boundary(-a + r * math.cos(math.radians(140)),
+                              r * math.sin(math.radians(140)))]
+
+    def enu(self, p):
+        return enu_of(p[0], p[1], *CENTER)
+
+    def test_loop_passes_every_checkpoint(self):
+        points = self.off_tangent_points()
+        route = zones.route_points(points, lane_m=0, direction='ccw',
+                                   rnd=random.Random(7))
+        for corner in points:
+            cx, cy = self.enu(corner)
+            nearest = min(math.hypot(x - cx, y - cy)
+                          for x, y in map(self.enu, route))
+            self.assertLess(nearest, 3.0, '绕环路线仍要经过每个打卡点')
+
+    def test_loop_bulges_outward_instead_of_cutting_the_infield(self):
+        points = self.off_tangent_points()
+        route = zones.route_points(points, lane_m=0, direction='ccw',
+                                   rnd=random.Random(7))
+        clat, clng = CENTER
+        quad_r = max(math.hypot(*self.enu(p)) for p in points)
+        route_r = max(math.hypot(*self.enu(p)) for p in route)
+        self.assertGreater(route_r, quad_r + 2.0,
+                           '弯道要外凸贴住跑道, 不能拿弦切内场')
+        self.assertEqual(route[0], route[-1], '路线闭合')
+
+    def test_auto_lane_is_zero_once_the_points_form_a_track_loop(self):
+        prof = zones.profile(self.off_tangent_points())
+        self.assertEqual(prof['lane_m'], 0.0, '打卡点已在跑进线上, 不再自动外扩车道')
+
+    def test_user_lane_override_survives_the_track_loop(self):
+        prof = zones.profile(self.off_tangent_points(), {'lane_m': 4})
+        self.assertEqual(prof['lane_m'], 4.0)
+
+    def test_square_is_not_a_track(self):
+        xy = [enu_of(p[0], p[1], *CENTER) for p in rect(80, 80)]
+        self.assertIsNone(zones._track_loop(xy), '正方形不该被铺成带弯道的跑道环')
+
+
 class RouteTests(unittest.TestCase):
     def test_route_is_closed_and_starts_near_a_corner(self):
         points = rect()
@@ -155,6 +213,50 @@ class RouteTests(unittest.TestCase):
         cw = zones.route_points(points, lane_m=4, direction='cw', start_deg=0)
         self.assertGreater(signed_area(ccw[:-1]), 0)
         self.assertLess(signed_area(cw[:-1]), 0)
+
+
+class OvalRouteTests(unittest.TestCase):
+    """四点椭圆场地的路线必须是田径场形: 直道+半圆弯, 而不是切弯的多边形。"""
+
+    def enu(self, p):
+        return ((p[1] - CENTER[1]) * 111320 * math.cos(math.radians(CENTER[0])),
+                (p[0] - CENTER[0]) * 110570)
+
+    def test_curves_bulge_out_to_the_hand_computed_apex(self):
+        # rect(120, 60): 角点(±30, ±60), 弯道弦=60 → 半径30 → 顶点(0, ±90)
+        route = zones.route_points(rect(), lane_m=0, direction='ccw',
+                                   rnd=random.Random(1))
+        for apex in ((0.0, 90.0), (0.0, -90.0)):
+            nearest = min(math.hypot(x - apex[0], y - apex[1])
+                          for x, y in map(self.enu, route))
+            self.assertLess(nearest, 4.0,
+                            f'弯道要外凸到 {apex}, 多边形切弯会差 30m')
+        self.assertGreater(max(abs(y) for _x, y in map(self.enu, route)), 85.0)
+
+    def test_every_checkpoint_stays_on_the_oval_route(self):
+        corners = rect()
+        route = zones.route_points(corners, lane_m=0, direction='ccw',
+                                   rnd=random.Random(1))
+        for corner in corners:
+            cx, cy = self.enu(corner)
+            nearest = min(math.hypot(x - cx, y - cy) for x, y in map(self.enu, route))
+            self.assertLess(nearest, 4.0, '改弯形后仍要经过每个打卡点')
+
+    def test_square_field_keeps_the_polygon_route(self):
+        route = zones.route_points(rect(80, 80), lane_m=0, direction='ccw',
+                                   rnd=random.Random(1))
+        self.assertLess(max(abs(y) for _x, y in map(self.enu, route)), 45.0,
+                        '正方形不是跑道, 不该鼓出半圆弯')
+
+    def test_six_point_campus_keeps_the_polygon_route(self):
+        campus = [geo_of(x, y, *CENTER) for x, y in
+                  ((-160, -40), (-40, -55), (120, -30), (160, 20), (40, 50), (-120, 35))]
+        route = zones.route_points(campus, lane_m=0, direction='ccw',
+                                   rnd=random.Random(1))
+        corner_r = max(math.hypot(x, y) for x, y in map(self.enu, campus))
+        route_r = max(math.hypot(x, y) for x, y in map(self.enu, route))
+        self.assertLess(route_r, corner_r + 8.0,
+                        '跨校区点位环不是田径场, 保持多边形')
 
 
 if __name__ == '__main__':

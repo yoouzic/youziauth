@@ -268,7 +268,10 @@ class DailyFlow:
                 client.set_zone(zone_override)
                 self.log(f"[1b] setRunZone → {zone_override}")
                 rule = self._zone_rule(client)
-                rule["zone"] = zone_override
+                if rule["zone"] != zone_override:
+                    # 切换被拒时 beforeRun 仍是旧跑区: 拿旧点位冒充新跑区提交必被判无效
+                    raise ApiError(4, f"跑区切换未生效: 请求 {zone_override}, "
+                                      f"服务器仍在 {rule['zone']}({rule['zone_name']})")
             self._quota(client, rule["term_id"], submit)
             self._sleep(self.rnd.uniform(0.6, 1.4))
             srv_now = client.server_time()
@@ -327,6 +330,7 @@ class DailyFlow:
 
             if not submit:
                 out = {"stopRun_biz": biz, "track_points": len(track),
+                       "track": track,
                        "track_head": track[:3], "track_tail": track[-2:],
                        "log_data": log_rows, "oss_record_file": record_file,
                        "meta": {k: v for k, v in meta.items()

@@ -1323,6 +1323,35 @@ class LptiyuBridgeTests(unittest.TestCase):
         # sync 在后台线程写状态文件, 等它收尾再进入临时目录清理, 否则清理会撞上写入
         self.controller._wait_for_work()
 
+    def test_credential_age_counts_from_the_local_sync_not_the_issue_time(self):
+        self.store.save_token_record('LP-SECRET-TOKEN', issued_at='2026-11-11T02:00:00')
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertIsNone(state['token_age_hours'], '没同步过就不报「多久前同步」')
+        self.store.record_sync('已同步研究库的最新凭证')
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertLess(state['token_age_hours'], 0.1, '同步后相对时间必须归零重计')
+
+    def test_sync_refreshes_the_ledger_even_when_the_token_is_already_current(self):
+        from unittest.mock import patch
+
+        with patch.object(self.store, 'sync_from_lab',
+                          return_value=([], '本机凭证已是最新')):
+            self.controller._sync()
+        self.assertTrue(self.store.sync_record().get('at'))
+        with patch.object(self.store, 'sync_from_lab',
+                          return_value=([], '未找到研究库目录，请先在设置中填写路径')):
+            self.controller._sync()
+        self.assertEqual(self.store.sync_record().get('message'), '本机凭证已是最新',
+                         '失败的同步不该把时间戳往前拨')
+
+    def test_unselected_zone_shows_the_school_default_name(self):
+        self.store.save_zone_list([
+            {'id': '1873', 'name': '第二运动场跑区', 'is_default': 1, 'points': []},
+            {'id': '1874', 'name': '第一运动场跑区', 'is_default': 0, 'points': []}])
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertEqual(state['zone']['id'], '')
+        self.assertEqual(state['zone']['name'], '第二运动场跑区')
+
     def test_snapshot_carries_the_renewal_ledger_without_the_token(self):
         self.store.record_renewal('ok', '凭证可用',
                                   next_due='2026-11-11T10:00:00')

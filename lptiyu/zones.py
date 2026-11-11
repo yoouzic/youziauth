@@ -178,11 +178,89 @@ def offset_ring(points, lane_m, direction='ccw'):
     return out
 
 
+def _track_loop(xy, spacing_m=12.0):
+    """四点打卡环铺成贴跑道的闭合环(ENU, 首点重复): 直道走直线, 弯道外凸圆弧。
+
+    打卡点就在跑进线上, 环必须穿过每个点; 两条直道边保持直线, 两条弯道边用
+    半径≈半宽 的圆弧向外凸, 避免拿弦切内场。四边等长的近正方形不是跑道, 返回 None。
+    """
+    n = len(xy)
+    if n != 4:
+        return None
+    cx = sum(p[0] for p in xy) / n
+    cy = sum(p[1] for p in xy) / n
+    ring = sorted(xy, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+    edges = [(ring[i], ring[(i + 1) % n]) for i in range(n)]
+    lengths = [math.hypot(q[0] - p[0], q[1] - p[1]) for p, q in edges]
+    if min(lengths) <= 0 or max(lengths) / min(lengths) < 1.1:
+        return None
+    dirs = [math.atan2(q[1] - p[1], q[0] - p[0]) % math.pi for p, q in edges]
+
+    def pdiff(i, j):
+        d = abs(dirs[i] - dirs[j]) % math.pi
+        return min(d, math.pi - d)
+
+    def width_of(pair):
+        (a1, _a2), (b1, _b2) = edges[pair[0]], edges[pair[1]]
+        th = dirs[pair[0]]
+        nx, ny = -math.sin(th), math.cos(th)
+        return abs((a1[0] * nx + a1[1] * ny) - (b1[0] * nx + b1[1] * ny)) / 2
+
+    # 直道 = 更平行、且通常更长的一对对边; 两项加权打分取小者
+    best = None
+    for straight, caps in (((0, 2), (1, 3)), ((1, 3), (0, 2))):
+        r = width_of(straight)
+        if r < 8.0:
+            continue
+        score = math.degrees(pdiff(*straight)) \
+            + 0.1 * ((lengths[caps[0]] + lengths[caps[1]])
+                     - (lengths[straight[0]] + lengths[straight[1]]))
+        if best is None or score < best[0]:
+            best = (score, straight, caps, r)
+    if best is None:
+        return None
+    _score, straight, _caps, r = best
+    step = max(5.0, spacing_m)
+    out = []
+    for i, (p, q) in enumerate(edges):
+        c = lengths[i]
+        if i in straight:
+            steps = max(1, int(round(c / step)))
+            for k in range(steps):
+                t = k / steps
+                out.append((p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t))
+            continue
+        rr = max(r, c / 2)
+        mx, my = (p[0] + q[0]) / 2, (p[1] + q[1]) / 2
+        h = math.sqrt(max(0.0, rr * rr - (c / 2) ** 2))
+        ux, uy = (q[0] - p[0]) / c, (q[1] - p[1]) / c
+        n1x, n1y = -uy, ux
+        # 圆心靠质心一侧, 弧才向外凸
+        if ((mx + n1x * h - cx) ** 2 + (my + n1y * h - cy) ** 2
+                > (mx - n1x * h - cx) ** 2 + (my - n1y * h - cy) ** 2):
+            n1x, n1y = -n1x, -n1y
+        ccx, ccy = mx + n1x * h, my + n1y * h
+        a0 = math.atan2(p[1] - ccy, p[0] - ccx)
+        a1 = math.atan2(q[1] - ccy, q[0] - ccx)
+        sweep = (a1 - a0) % (2 * math.pi)
+        mid = a0 + sweep / 2
+        if ((ccx + rr * math.cos(mid) - cx) ** 2 + (ccy + rr * math.sin(mid) - cy) ** 2
+                < (mx - cx) ** 2 + (my - cy) ** 2):
+            sweep -= 2 * math.pi
+        steps = max(6, int(round(abs(sweep) * rr / step)))
+        for k in range(steps):
+            ang = a0 + sweep * k / steps
+            out.append((ccx + rr * math.cos(ang), ccy + rr * math.sin(ang)))
+    out.append(out[0])
+    return out
+
+
 def route_points(points, lane_m=0.0, direction='auto', start_deg=None,
                  spacing_m=12.0, rnd=None):
-    """把「点位环 + 车道」铺成一条可跑的多边形路线(闭合, 首点重复)。
+    """把「点位环 + 车道」铺成一条可跑的路线(闭合, 首点重复)。
 
-    直道按 spacing_m 采样并带一点横向游走(真人不会贴着白线跑), 拐点保留原样。
+    四点场地绕打卡点成环: 直道走直线、弯道外凸贴跑道, 不切内场; 其余场地保持多边形。
+    直道按 spacing_m 采样并带一点横向游走(真人不会贴着白线跑)。
     """
     rnd = rnd or random.Random()
     geom = analyze(points)
@@ -192,6 +270,29 @@ def route_points(points, lane_m=0.0, direction='auto', start_deg=None,
         return ring
     lane = float(lane_m or 0.0)
     drift = rnd.uniform(-1.4, 1.4)          # 整圈的内外漂移(同一条跑道不会圈圈不同)
+    clat, clng = _centroid(ring)
+    xy = [enu_of(p[0], p[1], clat, clng) for p in ring]
+    loop = _track_loop(xy, spacing_m) if geom['shape'] == 'poly' else None
+    if loop is not None:
+        if use_dir == 'cw':
+            loop = loop[::-1]
+        dense = [geo_of(x, y, clat, clng) for x, y in loop]
+        off = offset_ring(dense, lane + drift, direction=use_dir)
+        oxy = [enu_of(p[0], p[1], clat, clng) for p in off]
+        n = len(oxy)
+        route = []
+        wobble = 0.0
+        for i in range(n - 1):              # 末点=首点, 游走不重复加
+            px, py = oxy[i - 1]
+            cx, cy = oxy[i]
+            nx, ny = oxy[(i + 1) % n]
+            dx, dy = nx - px, ny - py
+            d = math.hypot(dx, dy) or 1.0
+            wobble = _clamp(wobble * 0.7 + rnd.gauss(0, 0.5), -1.2, 1.2)
+            route.append(geo_of(cx - dy / d * wobble, cy + dx / d * wobble,
+                                clat, clng))
+        route.append(route[0])
+        return route
     ring = offset_ring(ring, lane + drift, direction=use_dir)
     clat, clng = _centroid(ring)
     route = []
@@ -270,12 +371,19 @@ def profile(points, tuning=None):
         start_deg = 0.0
     if not start_deg:
         start_deg = geom['long_axis_deg']
+    lane = _coerce_lane(tuning.get('lane_m'), geom['width_m'])
+    if not float(tuning.get('lane_m') or 0.0) and geom['count'] == 4 \
+            and geom['shape'] == 'poly':
+        pts = _points(points)
+        clat, clng = _centroid(pts)
+        if _track_loop([enu_of(lat, lng, clat, clng) for lat, lng in pts]) is not None:
+            lane = 0.0                # 打卡点已在跑进线上: 不再自动外扩车道
     return {
         'zone_shape': geom['shape'],
         'direction': resolved_direction,
         'direction_choice': direction,
         'start_deg': round(start_deg % 180.0, 1),
-        'lane_m': _coerce_lane(tuning.get('lane_m'), geom['width_m']),
+        'lane_m': lane,
         'anchor_m': _coerce_anchor(tuning.get('anchor_m'), geom['width_m']),
         'long_axis_deg': geom['long_axis_deg'],
         'length_m': geom['length_m'],

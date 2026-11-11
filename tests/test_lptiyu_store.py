@@ -1,4 +1,5 @@
 """乐跑存储层: 设置、凭证加密、状态历史、每日计数、研究库同步。"""
+import datetime as dt
 import json
 import tempfile
 import unittest
@@ -6,6 +7,23 @@ from pathlib import Path
 from unittest.mock import patch
 
 from lptiyu_store import Settings, Store
+
+
+class SyncLedgerTests(unittest.TestCase):
+    def test_record_sync_stamps_the_local_clock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.record_sync('本机凭证已是最新')
+            record = store.sync_record()
+            self.assertEqual(record['message'], '本机凭证已是最新')
+            stamped = dt.datetime.fromisoformat(record['at'])
+            self.assertLess(abs((dt.datetime.now() - stamped).total_seconds()), 5)
+
+    def test_sync_record_tolerates_a_corrupt_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            (Path(tmp) / 'sync.json').write_text('{bad', encoding='utf-8')
+            self.assertEqual(store.sync_record(), {})
 
 
 class SettingsTests(unittest.TestCase):

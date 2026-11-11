@@ -205,6 +205,18 @@ class Store:
         value = self._read('status.json', {})
         return value if isinstance(value, dict) else {}
 
+    def sync_record(self):
+        try:
+            value = self._read('sync.json', {})
+        except (OSError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def record_sync(self, message=''):
+        """本地同步时刻: 界面「多久前同步」只认这本台账, 不认服务器签发时间。"""
+        self._write('sync.json', {'at': now().isoformat(timespec='seconds'),
+                                  'message': str(message or '')[:160]})
+
     def _append_history(self, line):
         self.root.mkdir(parents=True, exist_ok=True)
         path = self.root / 'history.log'
