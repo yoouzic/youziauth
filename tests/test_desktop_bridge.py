@@ -10,6 +10,22 @@ from unittest.mock import MagicMock, patch
 import agent_ipc
 import dorm_points
 import proxy_rules
+# 没有注入 lptiyu 控制器的用例会让 DesktopBridge 现场造一个真控制器, 而真控制器
+# 默认写 %LOCALAPPDATA%\youziauth\lptiyu —— 一次测试就把开发者本机的乐跑历史刷满。
+# 把 Store 的默认根目录钉到临时目录: 显式传 root 的用例不受影响。
+import lptiyu_store as _lptiyu_store
+
+_ORIGINAL_STORE_INIT = _lptiyu_store.Store.__init__
+_SCRATCH_STORE = Path(tempfile.mkdtemp(prefix="youziauth-lptiyu-test-"))
+
+
+def _isolated_store_init(self, root=None, protector=None):
+    _ORIGINAL_STORE_INIT(
+        self, root if root is not None else _SCRATCH_STORE / "default", protector)
+
+
+_lptiyu_store.Store.__init__ = _isolated_store_init
+
 from desktop_bridge import DesktopBridge, PreviewBridge
 from campus_auth_gui import GuiSettings
 from dorm_accounts import DormAccounts

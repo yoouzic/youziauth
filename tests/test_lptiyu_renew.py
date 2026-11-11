@@ -118,7 +118,7 @@ class RenewLadderTests(RenewTestCase):
         self.assertEqual(record['next_due'],
                          (START + dt.timedelta(minutes=180)).isoformat(timespec='seconds'))
         self.assertEqual(self.store.status(), {}, '续期是维护动作, 不写任务状态')
-        self.assertIn('[ok]', self.store.history(), '但历史里要留痕')
+        self.assertNotIn('[ok]', self.store.history(), '例行探活只进台账, 不进运行记录')
 
     def test_dead_token_adopts_the_lab_token_without_capture(self):
         self.token('OLD')

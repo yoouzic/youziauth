@@ -279,8 +279,11 @@ class Store:
             'events': events[-20:],
         }
         self._write('renewal.json', value)
-        self._append_history(f'{stamp} [{state}] {text}'
-                             + (f' · {detail}' if detail else ''))
+        if state != 'ok':
+            # 例行探活不是「发生过的事」: 台账里有记录就够了, 运行记录页只留
+            # 换号 / 需要人动手 / 链路故障这类需要人看的行。
+            self._append_history(f'{stamp} [{state}] {text}'
+                                 + (f' · {detail}' if detail else ''))
         return value
 
     def history(self):

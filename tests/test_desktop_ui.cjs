@@ -2263,6 +2263,28 @@ test('an inverted distance range is refused before reaching the bridge',async()=
     '下限大于上限的设置不发往后台');
 });
 
+test('lptiyu folds the routine probes and repeated lines',async()=>{
+  const h=harness('windows',{logs:{lptiyu:
+    '2026-11-11T06:00:00 [idle] 尚未开始今天的跑步\n'
+    +'2026-11-11T06:31:40 [signed] 今日跑步已完成 · 3.01km · 配速 3\'58"/km · 第二运动场\n'
+    +'2026-11-11T07:05:00 [ok] 凭证可用 · 真门探活\n'
+    +'2026-11-11T10:05:00 [ok] 凭证可用 · 真门探活\n'
+    +'2026-11-11T13:05:00 [ok] 凭证可用 · 真门探活\n'
+    +'2026-11-11T17:05:00 [ok] 凭证可用 · 真门探活\n'
+    +'2026-11-11T18:20:00 [need_token] 凭证已失效：在小程序里打开一次跑步首页\n'
+    +'2026-11-11T18:21:00 [need_token] 凭证已失效：在小程序里打开一次跑步首页\n'
+    +'2026-11-11T18:22:00 [need_token] 凭证已失效：在小程序里打开一次跑步首页'}});
+  h.showLog('lptiyu');
+  h.navigate('records');
+  await h.refresh();
+  assert.equal(h.el('log-output').textContent,[
+    '11月11日 周三',
+    '  06:31  今日跑步已完成 · 3.01km · 配速 3\'58"/km · 第二运动场',
+    '  07:05  凭证可用 · 真门探活（×4，至 17:05）',
+    '  18:20  凭证已失效：在小程序里打开一次跑步首页（×3，至 18:22）'].join('\n'),
+    '例行探活只占一行, 连续重复的失败合成一行');
+});
+
 test('lptiyu records read as one line per run, grouped by day',async()=>{
   const h=harness('windows',{logs:{lptiyu:
     '2026-11-10T06:33:12 [signed] 今日跑步已完成 · 2.31km · 配速 4\'05"/km · 第二运动场\n'

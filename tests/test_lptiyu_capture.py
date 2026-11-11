@@ -8,11 +8,14 @@
 """
 import json
 import socket
+import subprocess
 import tempfile
 import threading
 import unittest
 import urllib.parse
 from pathlib import Path
+
+from unittest.mock import patch
 
 from lptiyu.cipher import seal
 
@@ -87,6 +90,67 @@ class CertificateTests(unittest.TestCase):
             self.assertIn("api2.lptiyu.com", san.get_values_for_type(x509.DNSName))
             self.assertFalse(leaf.extensions.get_extension_for_class(
                 x509.BasicConstraints).value.ca)
+
+    def test_store_listing_is_compared_case_insensitively(self):
+        # certutil 打印小写指纹, 我们按 Windows 习惯存大写; 只比大写就永远认不出
+        # 自己刚装进去的证书(界面: 装成功却报失败, 采集按钮一直灰着)。
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = cap.CertificateAuthority(Path(tmp))
+            ca.ensure()
+            fp = ca.fingerprint()
+            listing = f"证书哈希(sha1): {fp.lower()}\r\n"
+            done = subprocess.CompletedProcess(args=[], returncode=0,
+                                               stdout=listing, stderr="")
+            with patch.object(cap.subprocess, "run", return_value=done):
+                self.assertTrue(ca.installed())
+
+    def test_install_reports_success_when_the_store_shows_lowercase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = cap.CertificateAuthority(Path(tmp))
+            ca.ensure()
+            fp = ca.fingerprint()
+            add = subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout=f"Root ... 添加到存储。\r\nCertUtil: -addstore 命令成功完成。\r\n",
+                stderr="")
+            listing = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=f"证书哈希(sha1): {fp.lower()}", stderr="")
+            calls = {"n": 0}
+
+            def fake_run(args, **kwargs):
+                calls["n"] += 1
+                return add if "-addstore" in args else listing
+
+            with patch.object(cap.subprocess, "run", side_effect=fake_run):
+                result = ca.install()
+            self.assertTrue(result["ok"])
+            self.assertIn("证书", result["detail"])
+
+    def test_install_says_so_when_the_store_still_does_not_show_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = cap.CertificateAuthority(Path(tmp))
+            ca.ensure()
+            add = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
+            listing = subprocess.CompletedProcess(args=[], returncode=0,
+                                                  stdout="no certs here", stderr="")
+
+            def fake_run(args, **kwargs):
+                return add if "-addstore" in args else listing
+
+            with patch.object(cap.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(cap.CaptureError) as caught:
+                    ca.install()
+            self.assertIn("受信任根", str(caught.exception))
+
+    def test_removal_timeout_explains_the_confirmation_dialog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = cap.CertificateAuthority(Path(tmp))
+            ca.ensure()
+            with patch.object(cap.subprocess, "run",
+                              side_effect=cap.subprocess.TimeoutExpired(cmd="certutil", timeout=1)):
+                with self.assertRaises(cap.CaptureError) as caught:
+                    ca.remove()
+            self.assertIn("弹窗", str(caught.exception))
 
     def test_uninstall_without_a_certificate_is_a_no_op(self):
         with tempfile.TemporaryDirectory() as tmp:

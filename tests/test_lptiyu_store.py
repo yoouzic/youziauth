@@ -408,7 +408,18 @@ class RenewalLedgerTests(unittest.TestCase):
             store.record_renewal('ok', '凭证可用')
             self.assertEqual(store.status()['state'], 'signed',
                              '续期是维护动作, 不该顶掉今日跑步的状态')
-            self.assertIn('[ok] 凭证可用', store.history())
+            self.assertNotIn('[ok]', store.history(), '例行探活不写运行记录, 台账里有就行')
+            self.assertEqual(store.renewal()['state'], 'ok')
+
+    def test_renewal_writes_history_only_when_it_needs_a_human(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.record_renewal('need_user', '凭证已失效：请在小程序里开一次')
+            self.assertIn('[need_user]', store.history())
+            store.record_renewal('renewed', '已自动续期')
+            self.assertIn('[renewed]', store.history())
+            store.record_renewal('ok', '凭证可用')
+            self.assertEqual(store.history().count('[ok]'), 0)
 
 
 if __name__ == '__main__':

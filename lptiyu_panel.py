@@ -144,7 +144,9 @@ class LptiyuController:
         self._poll_at = 0.0
         self.cancel = threading.Event()
         self.latest = None
-        self._set_latest('idle', '尚未开始今天的跑步')
+        # 初始状态不是「发生过的事」: 每造一个控制器就往历史里写一行, 记录页会被
+        # 「尚未开始今天的跑步」刷满(测试和预览尤其明显)。
+        self._set_latest('idle', '尚未开始今天的跑步', record=False)
 
     # ------------------------------------------------------------- 状态
     def _set_latest(self, state, message, detail='', record=True):

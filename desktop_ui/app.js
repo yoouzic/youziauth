@@ -80,20 +80,43 @@ function compactDormLog(text){
     lines.push(block.title);
     for(const record of block.entries){
       if(done && record.message === DORM_ROUTINE) continue;
+      // 寝室打卡重复几次就是几次（几点失败过本身是证据），这里不合并。
       lines.push('  ' + record.time + '  ' + dormRecordText(record));
     }
   }
   return lines.join('\n');
 }
 
-/* 乐跑：history.log 与寝室打卡同一行格式，按天分段展示即可，无需再合并重复。 */
+/* 乐跑：history.log 与寝室打卡同一行格式。和另外两个模块一样把噪音折起来：
+   例行探活（凭证可用）一天只占一行、标出次数与最后一次时间；连续相同的记录合并。
+   换号、需要人动手、链路故障、跑步结果这些真正发生过的事原样保留。 */
+const LPTIYU_ROUTINE = new Set(['凭证可用', '尚未开始今天的跑步']);
 function compactLptiyuLog(text){
   const lines = [];
   for(const block of groupByDay(text, dormRecord)){
     if(!block.entries){lines.push(block.raw); continue;}
-    lines.push(block.title);
+    const runs = [];
+    const routine = new Map();          // 例行动作可能隔几小时来一次, 按文案归并
     for(const record of block.entries){
-      lines.push('  ' + record.time + '  ' + dormRecordText(record));
+      const rendered = dormRecordText(record);
+      // 默认状态不是记录: 旧版本每次造控制器都写一行, 折叠成「×99」也还是噪音。
+      if(record.state === 'idle' && record.message === '尚未开始今天的跑步') continue;
+      if(LPTIYU_ROUTINE.has(record.message)){
+        const seen = routine.get(rendered);
+        if(seen){seen.count++; seen.until = record.time; continue;}
+        const run = {time:record.time, until:record.time, text:rendered, count:1};
+        routine.set(rendered, run);
+        runs.push(run);
+        continue;
+      }
+      const last = runs[runs.length - 1];
+      if(last && last.text === rendered){last.count++; last.until = record.time; continue;}
+      runs.push({time:record.time, until:record.time, text:rendered, count:1});
+    }
+    lines.push(block.title);
+    for(const run of runs){
+      lines.push('  ' + run.time + '  ' + run.text
+        + (run.count > 1 ? `（×${run.count}，至 ${run.until}）` : ''));
     }
   }
   return lines.join('\n');
@@ -111,6 +134,8 @@ const NET_UPDATE_STATE = {idle:'等待检查', checking:'正在检查', download
   installed:'已更新完成', error:'更新未完成', launching:'正在安装', launched:'已更新完成'};
 // 例行行：心跳与「已认证」的例行检测。它们每分钟/每半小时来一条，不该把人从旧记录里叫回来。
 const LOG_ROUTINE_LINE = /^\d{2}:\d{2}\s+(?:后台检查正常|例行检测：已认证)(?:（×\d+，至 \d{2}:\d{2}）)?$/;
+// 乐跑自己的例行行：探活成功一天出现好几次，不该把人从旧记录里叫回来。
+const LPTIYU_ROUTINE_LINE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\s+\[(?:ok|idle)\]\s+(?:凭证可用|尚未开始今天的跑步)/;
 function netLabel(message){
   let m;
   // 心跳：句尾的「)」容忍缺失，日志被写了一半时也认得出。
@@ -172,6 +197,7 @@ function compactNetworkLog(text){
       if(last && last.text === line){last.count++; last.until = record.time; continue;}
       runs.push({time:record.time, until:record.time, text:line, count:1});
     }
+    if(!runs.length) continue;          // 一整天只剩默认状态, 就别留个空标题
     lines.push(block.title);
     for(const run of runs){
       lines.push('  ' + run.time + '  ' + run.text
@@ -189,7 +215,8 @@ function logText(){
   return compactNetworkLog(raw);
 }
 // 例行 status 行每分钟一条，不该被算成「新记录」。压缩后的心跳/例行检测行同样不算。
-function isStatusLine(line){return LOG_STATUS_LINE.test(line) || LOG_ROUTINE_LINE.test(line);}
+function isStatusLine(line){return LOG_STATUS_LINE.test(line) || LOG_ROUTINE_LINE.test(line)
+  || LPTIYU_ROUTINE_LINE.test(line);}
 // 用户眼里「一条记录」的数量：非空、且不是例行 status 的行。
 function logTold(text){return text.split('\n').filter(line=>line.trim()&&!isStatusLine(line)).length;}
 // 元素没有渲染出来（还没显示 / 测试桩）时按「在底部」处理：只有真正能滚动时才谈打断。

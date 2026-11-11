@@ -233,7 +233,9 @@ class CertificateAuthority:
                 text=True, errors="replace").stdout or ""
         except (OSError, subprocess.SubprocessError):
             return False
-        return fp.replace(" ", "") in (out or "").replace(" ", "")
+        # certutil 打印的是小写指纹; 我们按 Windows 习惯返回大写。不折叠大小写就永远
+        # 认不出自己刚装进去的证书(装成功却报失败, 采集按钮一直灰着)。
+        return fp.lower() in (out or "").lower()
 
     def install(self):
         self.ensure()
@@ -247,24 +249,32 @@ class CertificateAuthority:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except (OSError, subprocess.SubprocessError) as exc:
             raise CaptureError(f"安装证书失败：{exc}") from exc
-        if done.returncode != 0 or not self.installed():
+        if done.returncode != 0:
             tail = ((done.stdout or "") + (done.stderr or "")).strip()[-300:]
             raise CaptureError(f"安装证书失败：{tail or 'certutil 返回异常'}")
+        if not self.installed():
+            raise CaptureError('证书已写入, 但在受信任根里查不到; 请重试一次, '
+                               '或在「管理计算机证书」里确认当前用户的受信任根')
         return {"ok": True, "detail": "证书已装入当前用户", "fingerprint": self.fingerprint()}
 
     def remove(self):
+        """从当前用户的受信任根卸载。Windows 会弹一次「根证书存储」确认, 必须点「是」。"""
         fp = self.fingerprint()
         if not fp:
             return {"ok": True, "detail": "本机还没有生成采集证书"}
         try:
             subprocess.run(
                 ["certutil", "-user", "-delstore", "Root", fp],
-                capture_output=True, timeout=90, text=True, errors="replace",
+                capture_output=True, timeout=120, text=True, errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except subprocess.TimeoutExpired:
+            raise CaptureError("卸载证书需要在系统弹窗里点「是」；这次没等到确认，"
+                               "证书仍在受信任根里") from None
         except (OSError, subprocess.SubprocessError) as exc:
             raise CaptureError(f"卸载证书失败：{exc}") from exc
-        return {"ok": not self.installed(), "detail": "证书已从当前用户卸载"
-                if not self.installed() else "证书仍在本机, 请重试", "fingerprint": fp}
+        if self.installed():
+            raise CaptureError("证书仍在受信任根里：系统确认弹窗可能被关掉了，请重试")
+        return {"ok": True, "detail": "证书已从当前用户卸载", "fingerprint": fp}
 
 
 # ================================================================ 系统代理
