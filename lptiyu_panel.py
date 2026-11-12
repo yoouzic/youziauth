@@ -264,7 +264,7 @@ class LptiyuController:
     # ------------------------------------------------------------- 入口
     def start(self, action):
         if action not in ('run', 'dry', 'sync', 'renew', 'renew_auto', 'zones',
-                          'capture'):
+                          'capture', 'zone_apply'):
             return False
         with self._gate:
             if self.closed or self.busy:
@@ -278,6 +278,8 @@ class LptiyuController:
                     result = self._sync()
                 elif action == 'zones':
                     result = self._sync_zones()
+                elif action == 'zone_apply':
+                    result = self._apply_zone()
                 elif action == 'capture':
                     result = self._capture_flow()
                 elif action == 'renew':
@@ -633,14 +635,15 @@ class LptiyuController:
     def _zone_sink(self, zone_id, zone_name, points, zone_list):
         """流水线读到真机点位后留档: 每块场地的朝向/宽窄不同, 特调各算各的。
 
-        顺带把「当前跑区」写回设置 —— 用户在小程序里换了场地时, 这里是唯一
-        读得到新跑区的地方; 不写回去, 状态栏会一直显示上一次的场地。
+        只在「还没选过跑区」时才把服务器当前跑区写进设置 —— 用户自己选了场地,
+        选择权就在他手上, 反过来被小程序带跑会让每次跑完都跳回旧场地。
         """
         try:
             if zone_list:
                 self.store.save_zone_list(zone_list)
             self.store.save_zone_points(zone_id, zone_name, points)
-            self.store.save_zone_selection(zone_id, zone_name)
+            if not self.store.settings().zone_id:
+                self.store.save_zone_selection(zone_id, zone_name)
         except Exception:  # noqa: BLE001 —— 留档失败不影响这一次跑步
             pass
 
@@ -664,9 +667,21 @@ class LptiyuController:
                  if isinstance(zone, dict) and str(zone.get('id') or '')]
         self.store.save_zone_list(zones)
         original = str(cfg.get('run_zone_id') or '')
-        # 服务端当前跑区 = 用户在小程序里选的那块: 先记进设置, 收尾才能还原到
-        # 正确的那块。以前还原的是设置里的旧值, 于是换了跑区后状态栏一直不同步。
-        self.store.save_zone_selection(original, str(cfg.get('run_zone_name') or ''))
+        # 用户自己选过跑区时, 服务器那块会被他在设置里指定的替换掉: 先把他的选择
+        # 推上去, 再以它为准遍历 —— 否则同步完会乖乖还原成小程序里的旧场地。
+        chosen = str(self.store.settings().zone_id or '')
+        if chosen and chosen != original:
+            try:
+                client.set_zone(chosen)
+                switched = client.before_run()
+                if isinstance(switched, dict) and \
+                        str(switched.get('run_zone_id') or '') == chosen:
+                    cfg, original = switched, chosen
+            except ApiError:
+                pass
+        if not chosen:
+            # 没选过就跟服务器走: 小程序里换了场地, 设置要跟着更新
+            self.store.save_zone_selection(original, str(cfg.get('run_zone_name') or ''))
         last = original
         done = set()
         if original:
@@ -697,6 +712,45 @@ class LptiyuController:
         except ApiError:
             pass
         return self._set_latest('zones', f'已同步 {len(done)} 个跑区的点位')
+
+    def _apply_zone(self):
+        """把「我选的跑区」推到服务端: 小程序那边也会跟着切过去。
+
+        跑区是会话态, 只能 setRunZone 改; 切完必须再读一次 beforeRun 确认,
+        不然界面说切好了、实际还在旧场地 —— 那样提交的轨迹就是错的场地。
+        """
+        settings = self.store.settings()
+        zone_id = str(settings.zone_id or '')
+        if not zone_id:
+            raise LptiyuError('error', '先在跑步设置里选一个跑区')
+        self._ensure_credentials()
+        client = self.slot.make_client(pace=0.8)
+        try:
+            cfg = client.before_run()
+        except ApiError as exc:
+            raise LptiyuError('need_token' if exc.code == 101 else 'error',
+                              '读取跑区失败：凭证已失效' if exc.code == 101
+                              else '读取跑区失败，接口暂时不可用') from exc
+        current = str((cfg or {}).get('run_zone_id') or '')
+        if current != zone_id:
+            try:
+                client.set_zone(zone_id)
+                cfg = client.before_run()
+            except ApiError as exc:
+                raise LptiyuError('error', f'切换跑区失败：{exc}') from exc
+        got = str((cfg or {}).get('run_zone_id') or '')
+        if got != zone_id:
+            raise LptiyuError('error',
+                              f'切换没生效：服务器还是 {got or "未知"}，稍后再试')
+        name = str((cfg or {}).get('run_zone_name') or settings.zone_name or '')
+        try:
+            self.store.save_zone_points(zone_id, name, self._points_of(cfg))
+            self.store.save_zone_list([zone for zone in ((cfg or {}).get('run_zone_list') or [])
+                                       if isinstance(zone, dict)])
+            self.store.save_zone_selection(zone_id, name)
+        except Exception:              # noqa: BLE001 —— 留档失败不影响切换结果
+            pass
+        return self._set_latest('zones', f'已切到 {name or zone_id}，小程序也会用这块场地')
 
     # ------------------------------------------------------------- 凭证续期
     def _renewal_due(self, settings):

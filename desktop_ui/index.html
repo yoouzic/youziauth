@@ -240,6 +240,14 @@
               <input id="lp-lab" type="text" spellcheck="false" placeholder="留空自动查找">
               <p class="field-hint" id="lp-lab-hint">采集凭证用的研究库，留空自动查找</p>
             </div>
+            <div class="lp-field lp-field-wide">
+              <label for="lp-zone-select">跑区</label>
+              <div class="lp-range">
+                <select id="lp-zone-select" aria-describedby="lp-zone-hint"></select>
+                <button type="button" class="secondary" data-action="lptiyu_zone_apply" id="lp-zone-apply">切到这块</button>
+              </div>
+              <p class="field-hint" id="lp-zone-hint">选定后点「切到这块」，小程序里的当前跑区也会跟着换，下次就按这块场地跑。</p>
+            </div>
           </div>
           <label class="switch-row" for="lp-auto-renew"><span>自动续期凭证</span><input id="lp-auto-renew" type="checkbox" role="switch"></label>
           <p class="schedule" id="lp-schedule">自动跑步：关闭</p>

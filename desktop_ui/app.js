@@ -611,6 +611,17 @@ $('location-source').addEventListener('change',()=>{sourceRevision++;sourceDirty
   const lo=parsePace($('lp-pace-lo').value),hi=parsePace($('lp-pace-hi').value);
   $('lp-pace-hint').textContent=Number.isNaN(lo)||Number.isNaN(hi)?'格式 4\'05"':paceRangeLabel(lo,hi);
 }));
+const zoneSelect=$('lp-zone-select');
+if(zoneSelect)zoneSelect.addEventListener('change',async ()=>{
+  const zoneId=$('lp-zone-select').value;
+  const zone=(state.lptiyu?.zones||[]).find(item=>item.id===zoneId);
+  markDirty('lptiyu',true);
+  const revision=revisions.lptiyu;
+  if(await act('lptiyu_save',{zone_id:zoneId,zone_name:zone?.name||''})){
+    if(revision===revisions.lptiyu)markDirty('lptiyu',false);
+    render();
+  }
+});
 $('lptiyu-form').addEventListener('submit',async event=>{
   event.preventDefault();
   const paceLo=parsePace($('lp-pace-lo').value),paceHi=parsePace($('lp-pace-hi').value);
@@ -621,7 +632,9 @@ $('lptiyu-form').addEventListener('submit',async event=>{
   const payload={enabled:$('lp-enabled').checked,run_time:$('lp-run-time').value,
     dist_lo:Number($('lp-dist-lo').value),dist_hi:Number($('lp-dist-hi').value),
     pace_lo:paceLo,pace_hi:paceHi,anchor_max_m:Number($('lp-anchor').value),
-    auto_renew:$('lp-auto-renew').checked,lab_dir:$('lp-lab').value.trim()};
+    auto_renew:$('lp-auto-renew').checked,lab_dir:$('lp-lab').value.trim(),
+    zone_id:$('lp-zone-select').value,
+    zone_name:(state.lptiyu?.zones||[]).find(z=>z.id===$('lp-zone-select').value)?.name||''};
   if(payload.dist_lo>=payload.dist_hi){notify('距离下限要小于上限，暂不支持倒序范围。',true);return;}
   const revision=revisions.lptiyu;
   if(await act('lptiyu_save',payload)){
@@ -804,6 +817,25 @@ function renderRunSettings(lp,s){
   $('lp-anchor').value=s.anchor_max_m??20;
   $('lp-pace-hint').textContent=paceRangeLabel(paceLo,paceHi);
   $('lp-auto-renew').checked=s.auto_renew!==false;
+  const zones=Array.isArray(lp.zones)?lp.zones:[];
+  const select=$('lp-zone-select');
+  const selected=(lp.zone&&lp.zone.id)||s.zone_id||'';
+  const wanted=[{id:'', name:'未指定（跟随小程序）'},
+    ...zones.map(zone=>({id:zone.id,
+      name:`${zone.name||zone.id}${zone.points?' · '+zone.points+' 点':''}`}))];
+  const signature=wanted.map(zone=>zone.id+':'+zone.name).join('|')+'#'+selected;
+  if(select&&select.dataset.signature!==signature){
+    // 只在真的变了时重建, 否则每次轮询都会把用户正在展开的下拉收起来
+    select.dataset.signature=signature;
+    select.replaceChildren(...wanted.map(zone=>{
+      const option=document.createElement('option');
+      option.value=zone.id;
+      option.textContent=zone.name;
+      return option;
+    }));
+  }
+  if(select&&select.value!==selected)select.value=selected;
+  if($('lp-zone-apply'))$('lp-zone-apply').disabled=pending||lp.busy||!selected;
   const lab=lp.lab||{};
   $('lp-lab').value=lab.configured||'';
   $('lp-lab-hint').textContent=lab.ok?'已找到研究库，可以自动采集凭证'

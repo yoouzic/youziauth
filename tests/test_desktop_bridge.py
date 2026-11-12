@@ -1453,6 +1453,23 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertIn('跑区', result['message'])
         self.controller._wait_for_work()
 
+    def test_zone_apply_reaches_the_controller(self):
+        with patch.object(type(self.controller), '_apply_zone',
+                          lambda ctl: ctl._set_latest('zones', '已切到第一运动场')):
+            result = self.bridge.dispatch('lptiyu_zone_apply')
+        self.assertTrue(result['ok'])
+        self.controller._wait_for_work()
+        self.assertEqual(self.controller.latest['state'], 'zones')
+
+    def test_saving_a_zone_keeps_the_other_settings(self):
+        self.bridge.dispatch('lptiyu_save', {'enabled': True, 'run_time': '06:30',
+                                            'dist_lo': 2.9, 'dist_hi': 3.2,
+                                            'zone_id': '1874', 'zone_name': '第一运动场'})
+        self.assertEqual(self.store.settings().zone_id, '1874')
+        self.bridge.dispatch('lptiyu_save', {'enabled': False})
+        self.assertEqual(self.store.settings().zone_id, '1874',
+                         '只改开关不能把已选跑区清掉')
+
     def test_the_snapshot_names_the_selected_zone_from_the_catalog(self):
         self.store.save_zone_points('1874', '第一运动场',
                                     [{'lat': 29.8237, 'lng': 106.4302, 'point_id': '1'},

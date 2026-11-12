@@ -327,15 +327,74 @@ class FakeZoneClient:
                 'time_rule_arr': [{'min_distance': 2.0, 'max_distance': 10.0}]}
 
 
+class ZoneApplyTests(PanelTestCase):
+    """我选的跑区要推给服务端: 小程序那边也得切过去, 否则下次还跑旧场地。"""
+
+    def apply(self, chosen, current):
+        controller = self.make_controller(
+            settings=Settings(enabled=True, zone_id=chosen))
+        client = FakeZoneClient(ZoneSyncTests.ZONES, current=current)
+        with patch.object(TokenSlot, 'make_client', lambda self, pace=0: client), \
+                patch.object(LptiyuController, '_ensure_credentials',
+                             lambda self: {'token': 'T'}):
+            result = controller._apply_zone()
+        return controller, client, result
+
+    def test_it_switches_the_server_to_my_choice(self):
+        controller, client, result = self.apply('1874', '1873')
+        self.assertIn('1874', client.set_calls, '要把 1874 推上去')
+        self.assertEqual(client.current, '1874')
+        self.assertEqual(result['state'], 'zones')
+        self.assertIn('第一运动场', result['message'])
+        self.assertEqual(controller.store.settings().zone_id, '1874')
+
+    def test_a_zone_already_in_place_is_not_switched_again(self):
+        _controller, client, _result = self.apply('1874', '1874')
+        self.assertEqual(client.set_calls, [], '已经在这块场地就别多余切一次')
+
+    def test_a_refused_switch_is_reported(self):
+        controller = self.make_controller(settings=Settings(enabled=True, zone_id='1874'))
+
+        class Stubborn(FakeZoneClient):
+            def set_zone(self, zone_id):
+                self.set_calls.append(zone_id)
+                return {'status': 1}          # 假装成功, 但 current 不变
+
+        client = Stubborn(ZoneSyncTests.ZONES, current='1873')
+        with patch.object(TokenSlot, 'make_client', lambda self, pace=0: client), \
+                patch.object(LptiyuController, '_ensure_credentials',
+                             lambda self: {'token': 'T'}):
+            with self.assertRaises(LptiyuError) as caught:
+                controller._apply_zone()
+        self.assertIn('切换没生效', caught.exception.message)
+
+    def test_without_a_choice_it_says_so(self):
+        controller = self.make_controller(settings=Settings(enabled=True))
+        with self.assertRaises(LptiyuError) as caught:
+            controller._apply_zone()
+        self.assertIn('先', caught.exception.message)
+
+
 class ZoneSyncAdoptsTests(PanelTestCase):
-    def test_syncing_adopts_the_zone_the_mini_program_has(self):
+    def test_syncing_keeps_the_zone_i_chose(self):
+        # 用户选过场地就以他为准: 同步顺手把服务器切回他选的那块, 不能反被
+        # 小程序里的旧场地带跑。
         controller = self.make_controller(
             settings=Settings(enabled=True, zone_id='1873', zone_name='第二运动场'))
         client = FakeZoneClient(ZoneSyncTests.ZONES, current='1874')
         with patch.object(TokenSlot, 'make_client', lambda self, pace=0: client):
             controller._sync_zones()
         current = controller.store.settings()
-        self.assertEqual(current.zone_id, '1874', '服务器当前跑区(1874)才是事实')
+        self.assertEqual(current.zone_id, '1873', '我选的 1873 不能被同步改掉')
+        self.assertEqual(client.current, '1873', '收尾要还原到我选的那块')
+
+    def test_syncing_follows_the_server_when_i_never_chose(self):
+        controller = self.make_controller(settings=Settings(enabled=True))
+        client = FakeZoneClient(ZoneSyncTests.ZONES, current='1874')
+        with patch.object(TokenSlot, 'make_client', lambda self, pace=0: client):
+            controller._sync_zones()
+        current = controller.store.settings()
+        self.assertEqual(current.zone_id, '1874', '没选过就跟服务器走')
         self.assertEqual(current.zone_name, '第一运动场')
 
     def test_the_sink_writes_the_selection_too(self):

@@ -2123,7 +2123,7 @@ test('lptiyu settings sync from the snapshot and save through the bridge',async(
   await new Promise(resolve=>setTimeout(resolve,0));
   assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1))),{action:'lptiyu_save',payload:{enabled:true,run_time:'06:30',
     dist_lo:2.9,dist_hi:3.2,pace_lo:245,pace_hi:280,anchor_max_m:20,auto_renew:true,
-    lab_dir:''}},
+    lab_dir:'',zone_id:'',zone_name:''}},
     '合法修改按表单内容发往后台');
 });
 
@@ -2200,6 +2200,25 @@ test('lptiyu capture walks from certificate to waiting',async()=>{
   waiting.el('lp-capture-stop').listeners.click();
   await new Promise(resolve=>setTimeout(resolve,0));
   assert.equal(waiting.calls.at(-1).action,'lptiyu_capture_stop');
+});
+
+test('lptiyu lets me pick a zone and push it to the applet',async()=>{
+  const h=await lptiyuPage({has_token:true, zone:{id:'1874', name:'第一运动场'},
+    zones:[{id:'1873', name:'第二运动场', points:4, default:true},
+           {id:'1874', name:'第一运动场', points:4, default:false}]});
+  const select=h.el('lp-zone-select');
+  assert.deepEqual(select.options.map(option=>option.value),['','1873','1874'],
+    '下拉里要有「跟随小程序」和每块场地');
+  assert.equal(select.value,'1874','默认选中当前跑区');
+  select.value='1873';
+  select.listeners.change();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1))),
+    {action:'lptiyu_save', payload:{zone_id:'1873', zone_name:'第二运动场'}},
+    '选了场地要立刻存下来');
+  h.el('lp-zone-apply').listeners.click();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(h.calls.at(-1).action,'lptiyu_zone_apply','还要能一键推到小程序');
 });
 
 test('lptiyu can refresh the selected zone from the server',async()=>{

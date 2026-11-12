@@ -887,7 +887,7 @@ class DesktopBridge(LocationProbe):
                 raise RuntimeError(str(getattr(exc, 'message', exc))) from None
             return str(result.get('detail') or '完成')
         if action in ('lptiyu_run', 'lptiyu_dry', 'lptiyu_sync', 'lptiyu_renew',
-                      'lptiyu_zones'):
+                      'lptiyu_zones', 'lptiyu_zone_apply'):
             controller = self._lptiyu
             if controller is None:
                 raise RuntimeError('乐跑功能在本机暂不可用')
@@ -899,6 +899,8 @@ class DesktopBridge(LocationProbe):
                 return '正在确认并续期凭证，请稍候'
             if action == 'lptiyu_zones':
                 return '正在读取每个跑区的打卡点，请稍候'
+            if action == 'lptiyu_zone_apply':
+                return '正在把选中的跑区同步到小程序，请稍候'
             return '操作已开始，请查看任务状态'
         if action == 'lptiyu_cancel':
             controller = self._lptiyu
@@ -1630,6 +1632,17 @@ class PreviewBridge(LocationProbe):
                 lp.update(state='zones', message='已同步 3 个跑区的点位（演示）')
                 self._data['logs']['lptiyu'] += (
                     f'{dt.datetime.now().isoformat(timespec="seconds")} [zones] 已同步跑区点位（演示）\n')
+            elif action == 'lptiyu_zone_apply':
+                lp = self._data['lptiyu']
+                selected = str(lp['settings'].get('zone_id') or '')
+                zone = next((item for item in lp['zones'] if item['id'] == selected), None)
+                name = (zone or {}).get('name') or selected
+                lp['zone'] = dict(lp['zone'], id=selected, name=name)
+                message = f'已切到 {name}（演示）'
+                lp.update(state='zones', message=message)
+                self._data['logs']['lptiyu'] += (
+                    f'{dt.datetime.now().isoformat(timespec="seconds")} [zones] {message}\n')
+                return {'ok': True, 'message': message}
             elif action == 'lptiyu_renew':
                 lp = self._data['lptiyu']
                 lp.update(has_token=True, message='已确认凭证可用（演示）')
