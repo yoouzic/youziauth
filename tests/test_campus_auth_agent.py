@@ -459,6 +459,29 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(agent.request_update_check().update, before)
         self.assertEqual(agent.periodic_update_check().update, before)
 
+    def test_a_restart_does_not_defer_the_next_check_by_a_whole_interval(self):
+        # 2026-11-12 现场：agent 随开机重启，恢复了一条 up_to_date 就把下一次检查
+        # 推到 6 小时之后；下午发布的版本整晚都没被看到。
+        class Restoring:
+            def recover_install_result(inner):
+                return auto_update.UpdateStatus(state='up_to_date', current_version='1.9.13',
+                                                latest_version='1.9.13',
+                                                message='当前已是最新正式版。')
+
+        agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]), updater=Restoring())
+        agent._recover_update()
+        self.assertTrue(agent.update_due(), '恢复一条普通检查结果不该把下一拍推后')
+
+    def test_a_recovered_install_still_defers_the_next_check(self):
+        class Restoring:
+            def recover_install_result(inner):
+                return auto_update.UpdateStatus(state='installed', current_version='1.9.14',
+                                                latest_version='1.9.14')
+
+        agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]), updater=Restoring())
+        agent._recover_update()
+        self.assertFalse(agent.update_due(), '刚装完不能重启后立刻再装一遍')
+
     def test_the_periodic_schedule_is_set_before_the_work_so_a_restart_cannot_loop(self):
         class CountingUpdater:
             def __init__(inner):

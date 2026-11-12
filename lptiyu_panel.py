@@ -11,7 +11,7 @@
   * 自动: poll() 每拍先问 renewer.due() —— 低频探活到期, 或进了「跑步前
     renew_lead_min 分钟」保活窗 —— 就在后台跑一遍, 成功不打扰界面, 只有
     「需要用户开一次小程序」才冒泡成 need_token。这一拍不受「今天已经打过卡」
-    限制: 打完卡凭证照样会过期, 保持每 renew_interval_min 一次的低频探活。
+    或「有效时段」限制: token 按天死, 而面板什么时候被打开由用户决定。
 这样到点自动跑时手上已经有一枚确认过的凭证, 不会等到提交那一步才发现号死了。
 """
 from __future__ import annotations
@@ -330,10 +330,11 @@ class LptiyuController:
             run_ready = current.time() >= parse_time(settings.run_time)
         except ValueError:
             return
-        # 保活和「今天跑没跑完」无关: 卡打完了凭证照样会过期, 一过期第二天的到点
-        # 自动跑就得先等一次小程序。所以续期这一拍排在所有「跑步」闸门(已打卡、
-        # 自动尝试次数上限、还没到点)前面, 只受有效时段约束 —— 半夜不探接口。
-        if in_window and self._renewal_due(settings):
+        # 保活和「今天跑没跑完」「在不在有效时段」都无关: token 是按天死的, 晚上
+        # 十一点打开面板也该立刻探一次, 而不是干等到第二天六点的窗口 —— 2026-11-12
+        # 现场: 23:08 装上修好的版本, 16:49 的 next_due 一直挂着不动, 看着像没修。
+        # 它仍然排在所有「跑步」闸门(已打卡、自动尝试次数上限、还没到点)前面。
+        if self._renewal_due(settings):
             self.start('renew_auto')
             return
         if not in_window or self.store.is_signed_today(current.date()):

@@ -143,6 +143,17 @@ def sanitized_detail(value: str) -> str:
     return detail[:200]
 
 
+def _is_install_result(status) -> bool:
+    """这条恢复出来的更新状态是不是「安装」本身，而不是一次普通检查的回显。
+
+    只有「装过 / 正在装」才配得上把下一次检查推后一整轮：那是防止「装完重启，
+    立刻又装一遍」的闸。up_to_date、签名失败之类的普通结果只是状态回显。
+    """
+    state = getattr(status, "state", "")
+    detail = str(getattr(status, "detail", "") or "")
+    return state in ("installed", "installing") or detail.startswith("install")
+
+
 class Agent:
     def __init__(
         self,
@@ -885,9 +896,16 @@ class Agent:
             status = recover()
             if status is not None:
                 self._publish_update(status)
-                # monotonic deadlines do not survive a process restart. Schedule
-                # from the recovered terminal state, so its feedback stays visible.
-                self._next_update_at = time.monotonic() + self.update_interval_seconds
+                # monotonic deadlines do not survive a process restart, so an install
+                # outcome is scheduled forward to keep its feedback visible and to stop
+                # a relaunch from reinstalling in a loop.
+                #
+                # 但只对「安装」这么做。恢复一条 up_to_date 也算的话，每次开机
+                # （agent 随开机重启）都会把下一次检查推后 6 小时，新版本发布后
+                # 一整天都不会被发现 —— 2026-11-12 现场：1.9.14 15:05 发布，
+                # 机器 18:08 开机，检查被排到 00:08，整晚都还是旧版。
+                if _is_install_result(status):
+                    self._next_update_at = time.monotonic() + self.update_interval_seconds
         except Exception as exc:  # noqa: BLE001 - recovery must never stop authentication
             self.logger.warning("update result recovery failed: %s", type(exc).__name__)
         finally:

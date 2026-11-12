@@ -234,7 +234,8 @@ class PollTests(PanelTestCase):
         controller._wait_for_work()
         self.assertEqual(actions, ['renew_auto'], '保活那一拍不起跑')
 
-    def test_poll_leaves_the_quiet_hours_alone(self):
+    def test_poll_keeps_the_keep_alive_outside_the_run_window(self):
+        # 有效时段管的是「自动起跑」；凭证保活不看钟点，晚上开机就该立刻探一次。
         actions = []
         original = LptiyuController.start
 
@@ -249,7 +250,7 @@ class PollTests(PanelTestCase):
         with patch.object(LptiyuController, 'start', spy):
             controller.poll()
         controller._wait_for_work()
-        self.assertEqual(actions, [], '有效时段外不去探接口')
+        self.assertEqual(actions, ['renew_auto'], '窗口外也要保活, 但不能起跑')
 
     def test_poll_skips_when_disabled(self):
         controller = self.make_controller(settings=Settings(enabled=False))
