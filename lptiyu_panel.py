@@ -10,7 +10,8 @@
     结果直接进界面;
   * 自动: poll() 每拍先问 renewer.due() —— 低频探活到期, 或进了「跑步前
     renew_lead_min 分钟」保活窗 —— 就在后台跑一遍, 成功不打扰界面, 只有
-    「需要用户开一次小程序」才冒泡成 need_token。
+    「需要用户开一次小程序」才冒泡成 need_token。这一拍不受「今天已经打过卡」
+    限制: 打完卡凭证照样会过期, 保持每 renew_interval_min 一次的低频探活。
 这样到点自动跑时手上已经有一枚确认过的凭证, 不会等到提交那一步才发现号死了。
 """
 from __future__ import annotations
@@ -320,21 +321,24 @@ class LptiyuController:
             settings = self.store.settings()
         except Exception:  # noqa: BLE001 —— 设置坏了不轰炸，由快照呈现
             return
-        if not settings.enabled or self.store.is_signed_today(self._clock().date()):
+        if not settings.enabled:
             return
         current = self._clock()
         try:
-            if not (parse_time(settings.time_lo) <= current.time() <= parse_time(settings.time_hi)):
-                return
+            in_window = (parse_time(settings.time_lo) <= current.time()
+                         <= parse_time(settings.time_hi))
             run_ready = current.time() >= parse_time(settings.run_time)
         except ValueError:
             return
-        if self.store.daily().get('auto', 0) >= MAX_DAILY_AUTO_ATTEMPTS:
-            return
-        # 保活先于起跑: 到点时手上必须已经有一枚确认过的凭证, 否则那一拍只会白报
-        # 「需要凭证」。续期成功后台账会推到 interval 之后, 所以这里不会连环触发。
-        if self._renewal_due(settings):
+        # 保活和「今天跑没跑完」无关: 卡打完了凭证照样会过期, 一过期第二天的到点
+        # 自动跑就得先等一次小程序。所以续期这一拍排在所有「跑步」闸门(已打卡、
+        # 自动尝试次数上限、还没到点)前面, 只受有效时段约束 —— 半夜不探接口。
+        if in_window and self._renewal_due(settings):
             self.start('renew_auto')
+            return
+        if not in_window or self.store.is_signed_today(current.date()):
+            return
+        if self.store.daily().get('auto', 0) >= MAX_DAILY_AUTO_ATTEMPTS:
             return
         if not run_ready:
             return
@@ -772,13 +776,15 @@ class LptiyuController:
     def _renew_auto(self):
         """后台保活: 成功不打扰界面, 只有「需要用户动一次」才冒泡。
 
-        成功时不写 latest —— 续期是维护动作, 不该把「今日跑步已完成」顶成
-        「凭证可用」。台账(renewal.json)与历史里已经留了痕。
+        跑完当天也照常保活 —— 凭证是按天死的, 今天不用不代表明天不用。成功时
+        不写 latest: 续期是维护动作, 不该把「今日跑步已完成」顶成「凭证可用」;
+        台账(renewal.json)里有痕, 界面那行「上次 13:49」就是它。
         """
-        if self.store.is_signed_today(self._clock().date()):
-            return None
         outcome = self.renewer.renew(force=False)
-        if outcome.state == 'need_user':
+        if (outcome.state == 'need_user'
+                and not self.store.is_signed_today(self._clock().date())):
+            # 今天已经跑完了就别再喊「需要凭证」: 状态栏该留住「今日已完成」,
+            # 这次失败在续期台账里(界面那行会写出原因), 明天到点前还会再试。
             return self._set_latest('need_token', outcome.message, record=False)
         return None
 

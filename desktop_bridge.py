@@ -483,6 +483,9 @@ class DesktopBridge(LocationProbe):
                             'state': str(renewal.get('state') or ''),
                             'message': str(renewal.get('message') or ''),
                             'next_due': str(renewal.get('next_due') or ''),
+                            # 「上次真的问过服务器」与「上次确认成功」分开给: 失败
+                            # 时界面要能指出「几点试过、为什么没成」。
+                            'last_attempt': str(renewal.get('last_attempt') or ''),
                             'last_success': str(renewal.get('last_success') or ''),
                             'failures': failures,
                             'interval_min': int(settings.renew_interval_min),

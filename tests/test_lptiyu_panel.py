@@ -215,6 +215,42 @@ class PollTests(PanelTestCase):
         controller._wait_for_work()
         self.assertFalse(controller.busy)
 
+    def test_poll_keeps_the_keep_alive_after_the_daily_run(self):
+        started = threading.Event()
+        actions = []
+        original = LptiyuController.start
+
+        def spy(self, action):
+            actions.append(action)
+            started.set()
+            return original(self, action)
+
+        controller = self.make_controller(settings=Settings(enabled=True, run_time='06:30'),
+                                          renewer=FakeRenewer(due=True))
+        controller.store.mark_signed(controller._clock().date().isoformat())
+        with patch.object(LptiyuController, 'start', spy):
+            controller.poll()
+        self.assertTrue(started.wait(3.0), '打完卡也要按间隔继续保活')
+        controller._wait_for_work()
+        self.assertEqual(actions, ['renew_auto'], '保活那一拍不起跑')
+
+    def test_poll_leaves_the_quiet_hours_alone(self):
+        actions = []
+        original = LptiyuController.start
+
+        def spy(self, action):
+            actions.append(action)
+            return original(self, action)
+
+        night = lambda: dt.datetime(2026, 11, 11, 23, 30)  # noqa: E731
+        controller = self.make_controller(settings=Settings(enabled=True, run_time='06:30'),
+                                          clock=night,
+                                          renewer=FakeRenewer(due=True))
+        with patch.object(LptiyuController, 'start', spy):
+            controller.poll()
+        controller._wait_for_work()
+        self.assertEqual(actions, [], '有效时段外不去探接口')
+
     def test_poll_skips_when_disabled(self):
         controller = self.make_controller(settings=Settings(enabled=False))
         controller.poll()
@@ -269,12 +305,22 @@ class RenewActionTests(PanelTestCase):
             renewer=FakeRenewer(outcome=RenewOutcome('need_user', '请在小程序里开一次')))
         self.assertEqual(controller._renew_auto()['state'], 'need_token')
 
-    def test_auto_renew_skips_the_day_that_already_ran(self):
-        renewer = FakeRenewer(outcome=RenewOutcome('need_user', 'x'))
+    def test_auto_renew_keeps_going_after_the_daily_run(self):
+        renewer = FakeRenewer(outcome=RenewOutcome('ok', '凭证可用'))
         controller = self.make_controller(renewer=renewer)
         controller.store.mark_signed(controller._clock().date().isoformat())
         self.assertIsNone(controller._renew_auto())
-        self.assertNotIn(('renew', False), renewer.calls)
+        self.assertIn(('renew', False), renewer.calls,
+                      '卡打完了凭证照样会过期，后台要按节奏继续保活')
+
+    def test_auto_renew_stays_quiet_when_the_day_is_done(self):
+        renewer = FakeRenewer(outcome=RenewOutcome('need_user', '请在小程序里开一次'))
+        controller = self.make_controller(renewer=renewer)
+        controller.store.mark_signed(controller._clock().date().isoformat())
+        before = controller.store.status()
+        self.assertIsNone(controller._renew_auto(), '今日已完成不该被顶成「需要凭证」')
+        self.assertEqual(controller.store.status(), before)
+        self.assertIn(('renew', False), renewer.calls, '安静不等于不续')
 
 
 class ProbePolicyTests(PanelTestCase):

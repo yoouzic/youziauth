@@ -2284,7 +2284,9 @@ test('lptiyu auto renew reads as its own line under the credential card',async()
     next_due:'2026-11-11T14:30:00',last_success:'2026-11-11T11:30:00',failures:0,
     interval_min:180,lead_min:45}});
   assert.equal(h.el('lp-renew-line').textContent,
-    '自动续期：每 3 小时确认一次，下次 14:30','续期行要写清节奏与下次时间');
+    '自动续期：每 3 小时确认一次，上次 11:30，下次 14:30','续期行要写清节奏、上次与下次时间');
+  assert.equal(h.el('lp-credential-line').textContent,'凭证可用 · 11:30 确认',
+    '凭证行要跟续期台账走，不能一直显示「几小时前同步」');
   const off=await lptiyuPage({has_token:true,
     settings:{enabled:true,run_time:'06:30',zone_id:'',zone_name:'',dist_lo:2.03,dist_hi:2.35,
               pace_target:0,anchor_max_m:20,max_per_day:1,time_lo:'06:00',time_hi:'23:00',

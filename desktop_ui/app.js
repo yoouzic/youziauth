@@ -777,8 +777,12 @@ function renewalText(lp,rn){
     :'自动续期已关闭：拿到凭证后可以打开它，跑步前自动确认可用。';
   const minutes=Number(rn.interval_min)||0;
   const every=minutes>=60?`每 ${Number((minutes/60).toFixed(1))} 小时`:`每 ${minutes} 分钟`;
+  // 只写「下次」的话，后台每三小时真跑一遍，这行字也看不出任何变化：
+  // 「上次」才是让人相信它还活着的那个时间戳。
+  const last=clockText(rn.last_success)||clockText(rn.last_attempt);
   const next=clockText(rn.next_due);
-  const head=`自动续期：${minutes?every+'确认一次':'每次跑步前确认'}`+(next?`，下次 ${next}`:'');
+  const when=[last?`上次 ${last}`:'',next?`下次 ${next}`:''].filter(Boolean).join('，');
+  const head=`自动续期：${minutes?every+'确认一次':'每次跑步前确认'}`+(when?`，${when}`:'');
   const needs=rn.message&&['need_user','error','cooldown','capped'].includes(rn.state);
   return needs?`${head} · ${rn.message}`:head;
 }
@@ -865,7 +869,11 @@ function renderRunCredential(lp){
   const age=lp.token_age_hours;
   const ageText=age==null?'凭证已就绪':age<1/60?'刚刚同步'
     :`${age<1?Math.max(1,Math.round(age*60))+' 分钟前':age.toFixed(1)+' 小时前'}同步`;
-  $('lp-credential-line').textContent=lp.has_token?ageText
+  // sync.json 只在真抓到新 token 时前移，探活续期不动它 —— 只看它会永远写着
+  // 「3.5 小时前同步」，而后台其实每三小时都在确认这枚凭证还能用。
+  const confirmed=clockText((lp.renewal||{}).last_success);
+  $('lp-credential-line').textContent=lp.has_token
+    ?(confirmed?`凭证可用 · ${confirmed} 确认`:ageText)
     :((lp.lab&&lp.lab.ok===false)
       ?'本机没有采集组件（研究库），无法自动取凭证：先在「跑步设置」里填写研究库目录。'
       :'尚未同步凭证。');
