@@ -108,8 +108,9 @@ def export_file_name() -> str:
     return f'{PREFIX}{now():%Y%m%d-%H%M%S}.json'
 
 
-def desktop_dir() -> Path:
-    """桌面真实位置(常被重定向, Path.home() 会指错) —— 与 lptiyu_store 同款做法。"""
+def _known_folder_path(guid):
+    """SHGetKnownFolderPath 解析已知文件夹 —— 桌面/下载常被重定向到别的盘,
+    Path.home() 拼出来的路径会指向一个空壳目录。"""
     try:
         import ctypes
         from ctypes import wintypes
@@ -118,10 +119,7 @@ def desktop_dir() -> Path:
             _fields_ = [('Data1', wintypes.DWORD), ('Data2', wintypes.WORD),
                         ('Data3', wintypes.WORD), ('Data4', ctypes.c_ubyte * 8)]
 
-        # FOLDERID_Desktop {B4BFCC3B-DB2C-424C-B029-7FE99A87C641}
-        folder = GUID(0xB4BFCC3B, 0xDB2C, 0x424C,
-                      (ctypes.c_ubyte * 8)(0xB0, 0x29, 0x7F, 0xE9,
-                                           0x9A, 0x87, 0xC6, 0x41))
+        folder = GUID(*guid)
         pointer = ctypes.c_wchar_p()
         if ctypes.windll.shell32.SHGetKnownFolderPath(
                 ctypes.byref(folder), 0, None, ctypes.byref(pointer)) == 0:
@@ -130,13 +128,30 @@ def desktop_dir() -> Path:
             return path
     except Exception:               # noqa: BLE001 —— 解析不出就退回拼接
         pass
-    return Path.home() / 'Desktop'
+    return None
+
+
+# FOLDERID_Desktop {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
+_DESKTOP_GUID = (0xB4BFCC3A, 0xDB2C, 0x424C,
+                 (0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41))
+# FOLDERID_Downloads {374DE290-123F-4565-9164-39C4925E467B}
+_DOWNLOADS_GUID = (0x374DE290, 0x123F, 0x4565,
+                   (0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B))
+
+
+def desktop_dir() -> Path:
+    """桌面真实位置(常被重定向到非系统盘)。"""
+    return _known_folder_path(_DESKTOP_GUID) or Path.home() / 'Desktop'
+
+
+def downloads_dir() -> Path:
+    """下载文件夹真实位置(微信「另存为」的默认去处之一)。"""
+    return _known_folder_path(_DOWNLOADS_GUID) or Path.home() / 'Downloads'
 
 
 def candidate_dirs() -> list[Path]:
-    """导入端扫描凭证文件的目录: 桌面 + 下载(微信收文件常落在这两处)。"""
-    home = Path.home()
-    dirs = [desktop_dir(), home / 'Downloads']
+    """导入端扫描凭证文件的目录: 桌面 + 下载。"""
+    dirs = [desktop_dir(), downloads_dir()]
     return [d for d in dirs if d.is_dir()]
 
 

@@ -81,5 +81,19 @@ class ScanTests(unittest.TestCase):
                 self.assertIsNone(lc.find_latest_export())
 
 
+class KnownFolderTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'Windows 已知文件夹解析')
+    def test_redirected_known_folders_are_resolved(self):
+        # 桌面/下载被重定向到别的盘时, 必须走 KnownFolder, 不能 Path.home() 硬拼
+        # (2026-11-13 事故: 拼出来的 C 盘空壳目录让导入找不到文件)。
+        desktop = lc.desktop_dir()
+        downloads = lc.downloads_dir()
+        self.assertTrue(desktop.is_absolute())
+        self.assertEqual(downloads.name.lower(), 'downloads')
+        self.assertTrue(desktop.is_dir(), '解析出的桌面目录应真实存在')
+        for directory in lc.candidate_dirs():
+            self.assertTrue(directory.is_dir())
+
+
 if __name__ == '__main__':
     unittest.main()
