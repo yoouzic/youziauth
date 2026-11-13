@@ -666,7 +666,11 @@ class ProcessBoundaryTests(unittest.TestCase):
         self.assertEqual(len(command), 5)
         self.assertIs(options["shell"], False)
         self.assertEqual(options["stdin"], subprocess.DEVNULL)
-        self.assertLessEqual(options["timeout"], 20)
+        # The launcher wait must stay bounded (the worker it started is not tied to it),
+        # but 20 s was one cold PowerShell start on an idle machine; a loaded one breaks
+        # that and turns a soon-to-succeed update into a failure.
+        self.assertEqual(options["timeout"], update.WORKER_LAUNCH_TIMEOUT_SECONDS)
+        self.assertLessEqual(options["timeout"], 120)
         self.assertEqual(options["creationflags"], 0x08000000)
         self.assertEqual(options["env"]["YOUZIAUTH_UPDATE_MSI"], str(self.release.msi))
         self.assertEqual(options["env"]["YOUZIAUTH_UPDATE_EXE"], str(self.anchor))

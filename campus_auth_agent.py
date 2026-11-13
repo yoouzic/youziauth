@@ -32,6 +32,17 @@ from windows_credentials import CredentialError, CredentialStore, machine_config
 
 AGENT_PIPE_NAME = "youziauth-agent"
 TRANSIENT_RETRY_DELAYS = (5, 15, 30)
+# 自动更新的调度。``update_interval_seconds`` 只回答「稳定状态多久看一次」，下面这三个
+# 更短的值决定「出过事之后多久能自己回来」—— 它们以前全都等于一整个间隔，于是任何一次
+# 没能起跑的检查、任何一次断网，都等于白等 6 小时。
+#
+# 刚装完的静默期：版本已经落在盘上，``run_cycle`` 也不会重复安装，所以不需要把下一次
+# 检查推后一整个间隔 —— 装完 10 分钟后发布的新版本不该等到 6 小时后才被看到。
+UPDATE_SETTLE_SECONDS = 15 * 60
+# 上一次更新还挂着（下载/验签没回来）：一分钟后再看，而不是丢掉这一拍。
+UPDATE_START_RETRY_SECONDS = 60.0
+# 「这一拍没能起跑」的日志节流：卡住的那一轮会让重试每 60 秒来一次。
+UPDATE_START_LOG_THROTTLE_SECONDS = 300.0
 # While the uplink is fine the agent has nothing to report, so it says so on entry
 # to that state and then this often. Without it a quiet log is indistinguishable
 # from a stopped agent.
@@ -256,6 +267,7 @@ class Agent:
         self.update_interval_seconds = max(300, int(update_interval_seconds))
         self._next_update_at = 0.0
         self._update_lock = threading.Lock()
+        self._update_start_logged_at = None
         self._online_logged_at = None
         suppressed = False
         try:
@@ -904,8 +916,15 @@ class Agent:
                 # （agent 随开机重启）都会把下一次检查推后 6 小时，新版本发布后
                 # 一整天都不会被发现 —— 2026-11-12 现场：1.9.14 15:05 发布，
                 # 机器 18:08 开机，检查被排到 00:08，整晚都还是旧版。
+                #
+                # 而且只推后一个**静默期**，不是一整个间隔：这条恢复记录代表的事件是
+                # 「刚刚装完」，它要挡的只是「装完立刻再装一遍」。按 6 小时去挡，等于
+                # 把「装完之后发布的下一个版本」也一起挡掉 —— 发布节奏比间隔更快时，
+                # 后台检查会被一次接一次地推到永远轮不到（本机 2026-11-11 06:28 之后
+                # 48 小时没有一次自动检查，就是每次都撞在这个推迟上）。
                 if _is_install_result(status):
-                    self._next_update_at = time.monotonic() + self.update_interval_seconds
+                    self._next_update_at = max(
+                        self._next_update_at, time.monotonic() + UPDATE_SETTLE_SECONDS)
         except Exception as exc:  # noqa: BLE001 - recovery must never stop authentication
             self.logger.warning("update result recovery failed: %s", type(exc).__name__)
         finally:
@@ -953,7 +972,29 @@ class Agent:
             reason, status.state, status.current_version, status.latest_version,
             f" detail={status.detail}" if status.detail else "",
         )
+        self._shorten_next_check(status)
         return self._publish_update(status)
+
+    def _shorten_next_check(self, status) -> None:
+        """把「暂时的失败」安排在半小时后再试，而不是白等一整个间隔。
+
+        一次断网、一次下载停滞，都不该让这台机器停更 6 小时 —— 本机日志里 8 次自动更新
+        失败全都在拿到版本信息之前就断了（行尾都是 ``latest=``），一次就是半天不检查。
+
+        校验失败、安装失败、健康检查失败**不**走这条捷径：它们是明确结论，而且安装
+        路径会 taskkill 掉窗口和 agent，按 30 分钟一轮反复重试等于反复关掉用户的程序。
+        哪种算「暂时」由更新器自己判断（``retry_after_seconds``），agent 不去猜文案。
+        """
+        retry_after = getattr(self.updater, "retry_after_seconds", None)
+        if not isinstance(retry_after, (int, float)) or retry_after <= 0:
+            return
+        retry_at = time.monotonic() + float(retry_after)
+        if retry_at >= self._next_update_at:
+            return
+        self._next_update_at = retry_at
+        self.logger.info(
+            "automatic update will retry in %ss instead of waiting the full interval",
+            int(retry_after))
 
     def request_update_check(self) -> RuntimeSnapshot:
         """界面请求「现在检查一次更新」—— 只是一个信号，没有任何参数。
@@ -961,7 +1002,10 @@ class Agent:
         **立刻返回**：检查加下载可能好几分钟，而这条指令走在 named pipe 上，界面那边
         三秒就超时。真正的更新在后台线程里跑，进度由运行时快照回报。
         """
-        self._start_update_thread("requested")
+        if not self._start_update_thread("requested"):
+            # 已经有一轮在跑：不排队（重复发起只会争同一把锁），但要留一句话 ——
+            # 否则「点了没反应」在日志里没有任何证据。
+            self.logger.info("update check requested while another run is in flight; ignored")
         return self._current_snapshot()
 
     def update_due(self) -> bool:
@@ -972,16 +1016,38 @@ class Agent:
 
         它是在网络循环的间隙被调用的，而一次更新要下载几十 MB。同步跑会把校园网认证
         推迟几分钟 —— 那是这个进程的本职工作，不能给更新让路。
+
+        排期必须**先**往后推：安装会把这个进程杀掉，重启后不该立刻再跑一遍。但推后
+        不能早于「确认这一轮真的起来了」—— 原来的写法先推 6 小时再试着启动，而启动会
+        因为「上一轮还挂着」（界面每秒一次的 status 轮询也会短暂持有那把锁）静默失败，
+        于是整整一个间隔就这么没了，日志里连一行都不留。现在起不来就短间隔重试并说明
+        原因，这是「自动更新有时候不跑」里最隐蔽的一条。
         """
-        # 先排下一次，再动手：安装会把这个进程杀掉，重启后不该立刻再跑一遍。
-        self._next_update_at = time.monotonic() + self.update_interval_seconds
-        self._start_update_thread("periodic")
+        if self.updater is None:
+            return self.snapshot
+        now = time.monotonic()
+        self._next_update_at = now + self.update_interval_seconds
+        if not self._start_update_thread("periodic"):
+            self._next_update_at = now + UPDATE_START_RETRY_SECONDS
+            if (self._update_start_logged_at is None
+                    or now - self._update_start_logged_at >= UPDATE_START_LOG_THROTTLE_SECONDS):
+                self._update_start_logged_at = now
+                self.logger.warning(
+                    "the previous update check is still running; retrying in %ss "
+                    "instead of skipping this interval",
+                    int(UPDATE_START_RETRY_SECONDS),
+                )
         return self.snapshot
 
-    def _start_update_thread(self, reason: str) -> None:
-        """拿不到锁就说明已经有一次在跑，直接返回（不排队、不重复发起）。"""
+    def _start_update_thread(self, reason: str) -> bool:
+        """拿到锁就起一个更新线程并返回 True；已经有一轮在跑就返回 False。
+
+        失败路径**必须**把锁还回去：``Thread.start()`` 抛异常却留着锁的话，这个进程
+        活着的每一天都不会再有任何自动更新（巡检、指令、定时全都在这把锁上排队），
+        而外表看不出任何异常。返回布尔值是为了让调用方知道「这一拍没跑」。
+        """
         if self.updater is None or not self._update_lock.acquire(blocking=False):
-            return
+            return False
 
         def work():
             try:
@@ -989,7 +1055,14 @@ class Agent:
             finally:
                 self._update_lock.release()
 
-        threading.Thread(target=work, name="youziauth-agent-update", daemon=True).start()
+        thread = threading.Thread(target=work, name="youziauth-agent-update", daemon=True)
+        try:
+            thread.start()
+        except Exception as exc:  # noqa: BLE001 - 任何启动失败都必须释放锁
+            self._update_lock.release()
+            self.logger.error("could not start the update worker: %s", type(exc).__name__)
+            return False
+        return True
 
     def wait_for_update(self, timeout: float = 5.0) -> bool:
         """等正在跑的那次更新结束。给测试和退出流程用，不参与正常调度。"""

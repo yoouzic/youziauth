@@ -46,6 +46,7 @@ READY = {'state': 'ready', 'latest_version': '1.9.0', 'progress': 100,
 UP_TO_DATE = {'state': 'up_to_date', 'latest_version': '1.8.4', 'progress': 0,
               'checked': '2026-10-10 18:00', 'message': '当前已是最新正式版。',
               'changes': {'entries': [], 'total': 0, 'more': False, 'note': 'x'}}
+_NO_CHANGES = {'entries': [], 'total': 0, 'more': False, 'note': ''}
 
 
 class UpdaterTests(unittest.TestCase):
@@ -589,6 +590,117 @@ class SlowDownloadTests(unittest.TestCase):
         self.assertEqual(controller.closed, 1)
         self.assertEqual(self.installations, [])
         self.assertEqual(sum(self.joins), 3600)
+
+
+class StalledTransferTests(unittest.TestCase):
+    """A connection that stays open and stops delivering is a failure, not a wait.
+
+    The hour deadline alone cannot tell those apart: with nothing arriving, this cycle
+    owns the schedule (and the partial file) for a whole hour. Observed 2026-11-12: one
+    cycle started at 19:12 and installed nothing until 23:07.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.install = self.root / 'install'
+        self.install.mkdir()
+        (self.install / 'VERSION').write_text('1.8.4', encoding='utf-8')
+        self.cache = self.root / 'updates'
+        self.clock = 0.0
+        self.joins = []
+
+    def build(self, downloaded_bytes):
+        owner = self
+
+        class Worker:
+            def join(self, timeout):
+                owner.joins.append(timeout)
+                owner.clock += timeout
+
+            def is_alive(self):
+                return True
+
+        class Controller(FakeController):
+            def __init__(self):
+                super().__init__(READY)
+                self._worker = Worker()
+
+            def snapshot(self):
+                return dict(READY, state='downloading', progress=40,
+                            downloaded_bytes=downloaded_bytes)
+
+        controller = Controller()
+        updater = Updater(self.install, self.cache,
+                          controller_factory=lambda *args: controller)
+        return updater, controller
+
+    def test_a_frozen_byte_count_is_reported_as_stalled_with_a_resumable_file(self):
+        updater, controller = self.build(downloaded_bytes=1024)
+        with patch.object(auto_update.time, 'monotonic', side_effect=lambda: self.clock):
+            status = updater.run_cycle()
+        self.assertEqual(status.state, 'error')
+        self.assertEqual(status.detail, 'download stalled')
+        self.assertIn('停滞', status.message)
+        self.assertEqual(controller.closed, 1, 'the stuck transfer must be cancelled')
+        self.assertLess(sum(self.joins), auto_update._DOWNLOAD_WAIT_SECONDS,
+                        'a stall must not wait for the hour deadline')
+        self.assertEqual(updater.retry_after_seconds,
+                         auto_update._RETRY_AFTER_TRANSPORT_SECONDS,
+                         'a stalled transfer is worth retrying soon, not next interval')
+
+    def test_an_unobserved_byte_count_is_not_evidence_of_a_stall(self):
+        # 快照没有字节数只是「不知道进度」，不能据此判死一次健康的下载。
+        updater, controller = self.build(downloaded_bytes=None)
+        with patch.object(auto_update.time, 'monotonic', side_effect=lambda: self.clock):
+            status = updater.run_cycle()
+        self.assertEqual(status.detail, 'download timeout')
+
+
+class CheckWithoutConclusionTests(unittest.TestCase):
+    """A finished check that never left 'checking' must not be reported as in progress."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.install = self.root / 'install'
+        self.install.mkdir()
+        (self.install / 'VERSION').write_text('1.8.4', encoding='utf-8')
+        self.cache = self.root / 'updates'
+
+    def test_a_check_that_never_concluded_is_an_error_that_retries_soon(self):
+        class Silent(FakeController):
+            def snapshot(self):
+                return {'state': 'checking', 'message': '正在后台检查正式版…', 'progress': 0,
+                        'latest_version': '', 'changes': _NO_CHANGES}
+
+        updater = Updater(self.install, self.cache,
+                          controller_factory=lambda *args: Silent({'state': 'checking'}))
+        status = updater.run_cycle()
+        self.assertEqual(status.state, 'error')
+        self.assertEqual(status.detail, 'check did not finish')
+        self.assertEqual(updater.retry_after_seconds, auto_update._RETRY_AFTER_TRANSPORT_SECONDS)
+
+    def test_the_notes_step_is_published_while_the_check_is_still_running(self):
+        # 「发现 vX，正在读取更新说明」是文档承诺的一段提示；它以前因为 checking
+        # 被映射成 error 而永远发不出去。
+        class Fetching(FakeController):
+            def snapshot(self):
+                return {'state': 'checking', 'message': '发现 v1.9.0，正在读取更新说明…',
+                        'progress': 0, 'latest_version': '1.9.0', 'changes': _NO_CHANGES}
+
+        published = []
+        updater = Updater(self.install, self.cache,
+                          controller_factory=lambda *args: Fetching({'state': 'checking'}),
+                          report=published.append)
+        updater._report_interim(Fetching({'state': 'checking'}), published.append, '1.8.4')
+        # _publish 同时喂给 report 和 progress，同一个 list 会收到两条一样的。
+        self.assertEqual({status.state for status in published}, {'checking'})
+        self.assertIn('v1.9.0', published[0].message)
+
+
 
 
 class AgentTaskRunnerTests(unittest.TestCase):

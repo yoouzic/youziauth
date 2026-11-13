@@ -62,6 +62,13 @@ _CHECK_ATTEMPTS = 3
 _CHECK_BACKOFF = 20
 _DOWNLOAD_WAIT_SECONDS = 60 * 60
 _DOWNLOAD_JOIN_SECONDS = 60
+# 一次传输「完全不动」多久就判停滞。一个小时的总额度管不住这种情况：连接还在、对端
+# 不发字节，于是这 66 MB 既不失败也不完成，而升级排期已经被这一轮占住了（2026-11-12
+# 现场有一轮从 19:12 一直挂到 23:07 才装完）。停滞立刻收工，续传文件留着，下次接着下。
+_DOWNLOAD_STALL_SECONDS = 15 * 60
+# 传输类的暂时失败（断网、下载停滞）隔多久再试。原来的「等下一个间隔」（6 小时）让
+# 一次抖动等于半天不检查；这不是重试风暴 —— 目标是一条稳定的线路，不是一分钟一次。
+_RETRY_AFTER_TRANSPORT_SECONDS = 30 * 60
 
 # 界面已有的状态词表，沿用它们而不是另造一套；多出来的三个是后台自动更新自己的阶段。
 STATES = ("idle", "checking", "downloading", "verifying", "ready", "up_to_date",
@@ -209,6 +216,9 @@ class Updater:
         self._relaunch_agent = agent_relaunch
         self._restored_status = False
         self._last_install_record = ''
+        # 这次失败值不值得早一点再试。``None`` 表示「按正常间隔」，由调用方（agent）
+        # 决定间隔是多少 —— 更新器只回答「这是暂时的吗」，不去猜自己的排期。
+        self.retry_after_seconds: float | None = None
 
     def _publish(self, status: UpdateStatus, progress=None) -> UpdateStatus:
         # The parent may be killed during installation. Preserve the last stage so
@@ -309,6 +319,9 @@ class Updater:
         while they wait.
         """
         current = read_installed_version(self.install_dir)
+        # 每一轮都重新判断「这次失败是不是暂时的」。留着上一轮的结论会让一次断网
+        # 之后的成功轮也被当成「马上再试」。
+        self.retry_after_seconds = None
         # Starting a new cycle makes any previous completion historical. Consume
         # it before publishing a new timestamp so it cannot reappear in polling.
         self._restored_status = True
@@ -328,6 +341,7 @@ class Updater:
         controller = self._controller_factory(current, self.cache_dir, self.executable)
         try:
             status = None
+            transient = False
             for attempt in range(_CHECK_ATTEMPTS):
                 controller.check()
                 worker = getattr(controller, "_worker", None)
@@ -341,21 +355,43 @@ class Updater:
                         # cancel it in finally instead of calling check() again
                         # against a busy controller. Partial files remain resumable.
                         snapshot = controller.snapshot()
+                        # 超时/停滞都是传输问题：续传文件还在，半小时后再试比起等满
+                        # 一个间隔能早得多地接上。原来它们被当成「等下一轮」，那半天
+                        # 里这台机器不会再看一眼新版本。
+                        if waiting in ('timeout', 'stalled'):
+                            self.retry_after_seconds = _RETRY_AFTER_TRANSPORT_SECONDS
+                        message = ('后台更新下载超时，已保留续传文件，将在下次检查时重试。'
+                                   if waiting == 'timeout' else
+                                   '后台更新下载停滞，已保留续传文件，将在下次检查时重试。'
+                                   if waiting == 'stalled' else
+                                   '后台更新已停止，已保留续传文件。')
+                        detail = ('download timeout' if waiting == 'timeout' else
+                                  'download stalled' if waiting == 'stalled' else 'update stopped')
                         return self._publish(UpdateStatus(
                             state='error', current_version=current,
                             latest_version=str(snapshot.get('latest_version', '')),
                             progress=int(snapshot.get('progress', 0) or 0), checked=_timestamp(),
-                            message=('后台更新下载超时，已保留续传文件，将在下次检查时重试。'
-                                     if waiting == 'timeout' else '后台更新已停止，已保留续传文件。'),
-                            detail='download timeout' if waiting == 'timeout' else 'update stopped'))
+                            message=message, detail=detail))
                 snapshot = controller.snapshot()
                 status = self._status_from_check(snapshot, current)
                 # 只重试传输类失败：控制器为这类失败打了 transient 标记。校验、安装
                 # 之类是明确结论，重试等于反复撞同一堵墙。
-                if not snapshot.get("transient") or attempt + 1 >= _CHECK_ATTEMPTS:
+                transient = bool(snapshot.get("transient"))
+                if not transient or attempt + 1 >= _CHECK_ATTEMPTS:
                     break
                 time.sleep(_CHECK_BACKOFF * (attempt + 1))
             if status.state != "ready":
+                if transient and status.state == 'error':
+                    # 断网、超时：这一轮已经在本进程内重试过三次，仍然不行，说明
+                    # 线路暂时不通。别让它等满一整个间隔。
+                    self.retry_after_seconds = _RETRY_AFTER_TRANSPORT_SECONDS
+                elif status.state == "checking":
+                    # 检查线程已经结束，却还停在「正在检查」：它没有给出结论。把它当作
+                    # 一次没有结果的失败报出去，而不是让界面永远显示「正在检查」。
+                    status = dataclasses.replace(
+                        status, state="error", detail="check did not finish",
+                        message="后台检查没有返回结果，将在下次检查时重试。")
+                    self.retry_after_seconds = _RETRY_AFTER_TRANSPORT_SECONDS
                 return self._publish(status)
 
             package, version, digest, signature = controller.package()
@@ -412,13 +448,26 @@ class Updater:
 
         The updater already runs off the authentication thread. A ten-minute join
         is not completion: a slow, healthy transfer may still own the partial file.
+
+        Two deadlines, because they answer different questions:
+
+        * ``_DOWNLOAD_WAIT_SECONDS`` bounds the whole transfer (a genuinely slow link
+          is finite);
+        * ``_DOWNLOAD_STALL_SECONDS`` bounds *progress*. A connection that stays open
+          and stops delivering satisfies neither "finished" nor "failed", so the total
+          deadline alone would pin this cycle for an hour -- and, with it, the schedule
+          of the next check. Observed 2026-11-12: one cycle started at 19:12 and did
+          not install anything until 23:07.
         """
         is_alive = getattr(worker, 'is_alive', None)
         if not callable(is_alive):
             # Compatibility with existing lightweight controller test doubles.
             worker.join(_DOWNLOAD_WAIT_SECONDS)
             return None
-        deadline = time.monotonic() + _DOWNLOAD_WAIT_SECONDS
+        started = time.monotonic()
+        deadline = started + _DOWNLOAD_WAIT_SECONDS
+        received = -1
+        moved_at = started
         while is_alive():
             closed = getattr(controller, '_closed', None)
             if closed is not None and closed.is_set():
@@ -427,7 +476,15 @@ class Updater:
             if remaining <= 0:
                 return 'timeout'
             worker.join(min(_DOWNLOAD_JOIN_SECONDS, remaining))
-            self._report_interim(controller, progress, current)
+            snapshot = self._report_interim(controller, progress, current)
+            downloaded = None if snapshot is None else snapshot.get('downloaded_bytes')
+            if isinstance(downloaded, int) and downloaded > received:
+                received = downloaded
+                moved_at = time.monotonic()
+            elif received >= 0 and time.monotonic() - moved_at >= _DOWNLOAD_STALL_SECONDS:
+                # Only a byte count we actually observed can prove a stall. A snapshot
+                # without one is "progress unknown", which is not evidence of a hang.
+                return 'stalled'
         return None
 
     def _report_interim(self, controller, progress, current):
@@ -437,20 +494,20 @@ class Updater:
         states a controller passes through *before* the download finishes. Guessing at
         the rest would put a status block in front of the user that the next real update
         immediately contradicts.
+
+        Returns the snapshot it read, so the caller can watch transfer progress without
+        taking the controller's lock a second time.
         """
-        if progress is None:
-            return None
         try:
             snapshot = controller.snapshot()
         except Exception:  # noqa: BLE001 - a status peek must never break the update
             return None
-        state = str(snapshot.get("state", ""))
-        if state not in ("checking", "downloading", "verifying"):
-            return None
-        status = self._status_from_check(snapshot, current)
-        if status.state in ("checking", "downloading", "verifying"):
-            return self._publish(status, progress)
-        return None
+        if progress is not None and str(snapshot.get("state", "")) in (
+                "checking", "downloading", "verifying"):
+            status = self._status_from_check(snapshot, current)
+            if status.state in ("checking", "downloading", "verifying"):
+                self._publish(status, progress)
+        return snapshot
 
     def _status_from_check(self, snapshot: dict, current: str) -> UpdateStatus:
         """Translate the controller's check result into a status block.
@@ -459,17 +516,31 @@ class Updater:
         ``ready``: the agent publishes this block once, when the check returns, and the
         interface has to be able to show "what changed" while the package is still
         downloading. Dropping it here would hide the notes exactly when they matter.
+
+        ``checking`` is one of this module's own states (``STATES``) and the one the
+        controller enters before it knows anything; mapping it to ``error`` made the
+        documented "发现 vX，正在读取更新说明" step impossible to publish.
+
+        An error keeps the controller's own ``detail`` (the exception name, or a stage
+        the controller named). Dropping it is why every failure in the installed
+        product's log ended in a bare ``latest=`` with no cause.
         """
         state = str(snapshot.get("state", "error"))
         changes = snapshot.get("changes")
         if not isinstance(changes, dict):
             changes = {}
-        known = state in ("ready", "up_to_date", "error")
+        known = state in ("checking", "ready", "up_to_date", "error")
         interesting = state in ("downloading", "verifying", "ready", "installing")
         if not isinstance(changes.get("entries"), list):
             changes = {}
+        detail = ""
+        if state == "error":
+            detail = str(snapshot.get("detail", "") or "")
+        elif not known and state not in ("downloading", "verifying", "installing"):
+            # 不认识的词不是「没问题」，但也不该整个盖掉真正的结论：报成 error 并说明。
+            state, detail = "error", "check failed"
         return UpdateStatus(
-            state=state if known or state in ("downloading", "verifying", "installing") else "error",
+            state=state,
             current_version=current, latest_version=str(snapshot.get("latest_version", "")),
             progress=int(snapshot.get("progress", 0) or 0),
             # Persistence needs timezone-bearing timestamps to distinguish a new
@@ -477,7 +548,7 @@ class Updater:
             # is a naive local datetime and is unsuitable for that ordering.
             checked=_timestamp(),
             message=str(snapshot.get("message", "")),
-            detail="" if known else "check failed",
+            detail=detail,
             changes=changes if interesting else {},
         )
 

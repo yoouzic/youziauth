@@ -96,6 +96,24 @@ _VERIFY_ARGUMENT = "--verify-update"
 _UPDATE_EXECUTABLES = frozenset({"youziauth.exe", "youziauth-agent.exe"})
 _UPDATE_ANCHOR = "youziauth.exe"
 
+# How long the detached worker may take between starting and launching msiexec.
+#
+# The original 90 seconds described an idle developer machine. In that window the worker
+# waits for the launcher to exit, hashes a ~70 MB MSI, starts Windows PowerShell and asks
+# its COM API for the MSI properties (60 s cap), then runs the frozen verifier (60 s cap)
+# which hashes the same 70 MB again. An on-access virus scan of a freshly downloaded
+# installer, or a busy machine, pushes that past 90 s -- and the whole release is then
+# reported as "更新辅助进程未能安全独立启动或启动超时" with no retry until the next
+# interval. What actually protects the install is the re-hash plus the Ed25519 check under
+# the exclusive lock, not a tight wall clock, so the budget is generous on purpose.
+WORKER_STARTUP_DEADLINE_SECONDS = 300
+# The launcher is a second PowerShell start away from us; 20 s was one cold start on an
+# idle machine. Timing this out does not stop the worker we already started.
+WORKER_LAUNCH_TIMEOUT_SECONDS = 60
+# Waiting for the worker to publish launch.json or final.json starts from the worker's own
+# startup budget, plus room for it to write its verdict.
+WORKER_OBSERVE_DEADLINE_SECONDS = WORKER_STARTUP_DEADLINE_SECONDS + 120
+
 # Signature gates precede Windows Installer COM access; paths never become
 # script source. The worker holds an exclusive read lock throughout, and the
 # verifier re-hashes the locked file instead of trusting a prior digest.
@@ -758,7 +776,7 @@ def _start_worker(msi: Path, anchor: Path, version: str, size: int, digest: str,
     request = {
         "directory": str(directory), "sha256": digest, "signature": signature.hex(),
         "payload": payload.decode("ascii"), "properties": _expected_properties(version),
-        "deadline": int(time.time()) + 90, "silent": bool(silent),
+        "deadline": int(time.time()) + WORKER_STARTUP_DEADLINE_SECONDS, "silent": bool(silent),
     }
     environment = os.environ.copy()
     environment.update({
@@ -777,7 +795,7 @@ def _start_worker(msi: Path, anchor: Path, version: str, size: int, digest: str,
             [str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand", _ENCODED_LAUNCHER],
             env=environment, shell=False, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-            encoding="utf-8", timeout=20, creationflags=0x08000000,
+            encoding="utf-8", timeout=WORKER_LAUNCH_TIMEOUT_SECONDS, creationflags=0x08000000,
         )
         status = json.loads(result.stdout)
         if (result.returncode != 0 or not isinstance(status, dict) or set(status) != {"pid"}
@@ -811,7 +829,7 @@ def _observe_worker(pid: int, directory: Path, on_launch: Callable[[], None],
     finished = False
     notified = False
     notification_error = None
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + WORKER_OBSERVE_DEADLINE_SECONDS
     try:
         handle = api.OpenProcess(0x00100000, False, pid)
         exited = not handle
