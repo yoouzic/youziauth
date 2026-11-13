@@ -456,6 +456,7 @@ class DesktopBridge(LocationProbe):
                              'student_num': identity.get('student_num', '')},
                 'has_token': store.has_token(),
                 'token_age_hours': age,
+                'members': self._lptiyu_members_snapshot(store),
                 'today_done': int(daily.get('run', 0)),
                 'today_max': settings.max_per_day,
                 'last': last,
@@ -494,6 +495,45 @@ class DesktopBridge(LocationProbe):
         except Exception:  # noqa: BLE001 —— 乐跑区块读不动时只降级这一块
             empty['message'] = '乐跑设置暂时无法读取'
             return empty
+
+    @staticmethod
+    def _lptiyu_members_snapshot(store):
+        """乐跑成员清单: 归 Store.members_status 管, 读不动就降级成错误行。"""
+        try:
+            return store.members_status()
+        except Exception as exc:  # noqa: BLE001 —— 成员层坏了不拖垮乐跑区块
+            return {'error': str(exc) or '成员清单不可用', 'max': 0, 'active': '',
+                    'items': []}
+
+    def _lptiyu_member_action(self, action, payload):
+        """乐跑成员管理: 切换 / 重命名 / 删除(= 退出账号)。
+
+        第一阶段只有一个控制器在跑, 而它操作的是「活动成员」的数据 ——
+        所以这三个动作都必须等当前操作结束; 删除沿用 dorm 的第二道确认闸,
+        并且删活动成员后由登记表把活动指针落到第一个剩余成员(可能为空)。
+        """
+        controller = self._lptiyu
+        if controller is None:
+            raise RuntimeError('乐跑功能在本机暂不可用')
+        if controller.busy:
+            raise RuntimeError('请等待当前跑步操作完成后再管理成员。')
+        store = controller.store
+        member_id = str(payload.get('id') or '')
+        if action == 'lptiyu_member_switch':
+            member = store.switch_member(member_id)
+            self._notice = None          # 通知去重键跟人走, 与 dorm 换号同理
+            return f'已切换到「{member.name}」'
+        if action == 'lptiyu_member_rename':
+            member = store.rename_member(member_id, payload.get('name'))
+            return f'已改名为「{member.name}」'
+        if payload.get('confirmed') is not True:
+            raise RuntimeError('请先确认删除该成员及其在本机的全部凭证数据。')
+        member, leftover = store.remove_member(member_id)
+        message = f'已删除「{member.name}」及其全部本机数据'
+        if leftover:
+            message += f'（部分文件被占用没删净：members/{member.id}，重启后可再试）'
+        self._notice = None
+        return message
 
     def _lptiyu_log(self):
         """乐跑的历史记录文本；读不动时给空串，由前端按「暂无记录」呈现。"""
@@ -865,12 +905,14 @@ class DesktopBridge(LocationProbe):
             except OSError as exc:
                 raise RuntimeError(f'写不了桌面文件：{exc}') from None
             return f'已导出 {target.name}（在桌面），原样发回即可'
-        if action == 'lptiyu_capture':
+        if action in ('lptiyu_capture', 'lptiyu_capture_add'):
             controller = self._lptiyu
             if controller is None:
                 raise RuntimeError('乐跑功能在本机暂不可用')
-            if not controller.start('capture'):
+            if not controller.start(action.removeprefix('lptiyu_')):
                 raise RuntimeError('乐跑操作正在进行，请等待完成或取消当前操作。')
+            if action == 'lptiyu_capture_add':
+                return '开始采集新成员凭证：让对方打开小程序，抓到后自动归档并切换过去…'
             return '正在打开小程序并等待凭证…'
         if action == 'lptiyu_capture_stop':
             controller = self._lptiyu
@@ -905,6 +947,31 @@ class DesktopBridge(LocationProbe):
             if action == 'lptiyu_zone_apply':
                 return '正在把选中的跑区同步到小程序，请稍候'
             return '操作已开始，请查看任务状态'
+        if action in ('lptiyu_member_switch', 'lptiyu_member_rename', 'lptiyu_member_delete'):
+            return self._lptiyu_member_action(action, payload)
+        if action == 'lptiyu_member_import':
+            controller = self._lptiyu
+            if controller is None:
+                raise RuntimeError('乐跑功能在本机暂不可用')
+            if controller.busy:
+                raise RuntimeError('请等待当前跑步操作完成后再导入成员。')
+            pin = str(payload.get('pin') or '').strip()
+            if not pin:
+                raise RuntimeError('请输入和对方约定好的 PIN。')
+            from lptiyu_credential import (CredentialFileError, find_latest_export,
+                                           open_credential_file)
+            found = find_latest_export()
+            if found is None:
+                raise RuntimeError('没有找到凭证文件：让对方发来的 '
+                                   'lptiyu-credential-*.json 存到桌面或下载文件夹后再试。')
+            try:
+                cred = open_credential_file(found, pin)
+            except CredentialFileError as exc:
+                raise RuntimeError(f'{found.name}：{exc}') from None
+            cred['source'] = 'export-file'
+            filed = controller.store.file_captured_credential(cred)
+            return (f'已导入「{filed.get("name")}」的凭证（文件 {found.name}）。'
+                    + ('' if filed.get('is_active') else '在成员栏切换到 TA 即可代跑。'))
         if action == 'lptiyu_cancel':
             controller = self._lptiyu
             if controller is None:
@@ -1362,7 +1429,16 @@ class PreviewBridge(LocationProbe):
                                   'next_due':(dt.datetime.now()+dt.timedelta(hours=3))
                                              .isoformat(timespec='seconds'),
                                   'last_success':dt.datetime.now().isoformat(timespec='seconds'),
-                                  'failures':0, 'interval_min':180, 'lead_min':45}},
+                                  'failures':0, 'interval_min':180, 'lead_min':45},
+                       'members':{'error':'', 'max':5, 'active':'demo-m1',
+                                  'items':[{'id':'demo-m1', 'name':'演示成员一',
+                                            'student_num':'2026000000', 'uid':'1',
+                                            'active':True, 'has_token':True,
+                                            'alive':True},
+                                           {'id':'demo-m2', 'name':'演示成员二',
+                                            'student_num':'2026000001', 'uid':'2',
+                                            'active':False, 'has_token':False,
+                                            'alive':None}]}},
             'accounts': {'error':'', 'max':MAX_ACCOUNTS, 'active':'demo1', 'busy':False,
                          'items':[{'id':'demo1', 'name':'演示账号一', 'active':True,
                                    'has_idm_credentials':True, 'idm_username':'2026000000',
@@ -1616,17 +1692,47 @@ class PreviewBridge(LocationProbe):
                 self._data['lptiyu']['capture'].update(cert_installed=False,
                                                        fingerprint='')
                 return {'ok': True, 'message': '演示：证书已卸载。'}
-            elif action == 'lptiyu_capture':
+            elif action in ('lptiyu_capture', 'lptiyu_capture_add'):
                 lp = self._data['lptiyu']
                 lp['capture'].update(state='waiting', remaining_s=300,
                                      message='等待小程序登录（演示）')
                 lp.update(state='capturing', message='等待小程序登录（演示）')
+                if action == 'lptiyu_capture_add':
+                    return {'ok': True, 'message': '演示：抓到后自动归档并切换到新成员。'}
                 return {'ok': True, 'message': '开始采集（演示）'}
             elif action == 'lptiyu_capture_stop':
                 lp = self._data['lptiyu']
                 lp['capture'].update(state='idle', remaining_s=0, message='已停止采集')
                 lp.update(state='idle', message='已停止采集（演示）')
                 return {'ok': True, 'message': '已停止采集（演示）'}
+            elif action == 'lptiyu_member_import':
+                return {'ok': True, 'message': '演示：会解密凭证文件并自动入档为新成员。'}
+            elif action in ('lptiyu_member_switch', 'lptiyu_member_rename',
+                            'lptiyu_member_delete'):
+                members = self._data['lptiyu'].setdefault(
+                    'members', {'error': '', 'max': 5, 'active': '', 'items': []})
+                member_id = str((payload or {}).get('id') or '')
+                if action == 'lptiyu_member_switch':
+                    for item in members['items']:
+                        item['active'] = item['id'] == member_id
+                    members['active'] = member_id
+                    target = next((item for item in members['items']
+                                   if item['id'] == member_id), None)
+                    return {'ok': True,
+                            'message': f"已切换到「{(target or {}).get('name', member_id)}」（演示）"}
+                if action == 'lptiyu_member_rename':
+                    name = str((payload or {}).get('name') or '').strip() or '演示成员'
+                    for item in members['items']:
+                        if item['id'] == member_id:
+                            item['name'] = name
+                    return {'ok': True, 'message': f'已改名为「{name}」（演示）'}
+                members['items'] = [item for item in members['items']
+                                    if item['id'] != member_id]
+                if members['active'] == member_id:
+                    members['active'] = members['items'][0]['id'] if members['items'] else ''
+                    for item in members['items']:
+                        item['active'] = item['id'] == members['active']
+                return {'ok': True, 'message': '已删除该成员（演示）'}
             elif action == 'lptiyu_zones':
                 lp = self._data['lptiyu']
                 for index, zone in enumerate(lp['zones']):

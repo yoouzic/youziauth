@@ -101,8 +101,10 @@ class RenewTestCase(unittest.TestCase):
         record = {'state': 'ok', 'message': '', 'last_attempt': '', 'last_success': '',
                   'failures': 0, 'next_due': '', 'events': []}
         record.update(fields)
-        self.store.root.mkdir(parents=True, exist_ok=True)
-        (self.store.root / 'renewal.json').write_text(json.dumps(record), encoding='utf-8')
+        # renewal.json 是成员级台账: 写进活动成员目录(与 Store 的读路径一致)。
+        member_dir = self.store._member_dir(create=True)
+        member_dir.mkdir(parents=True, exist_ok=True)
+        (member_dir / 'renewal.json').write_text(json.dumps(record), encoding='utf-8')
         return record
 
 

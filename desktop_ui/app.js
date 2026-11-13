@@ -7,7 +7,7 @@ const revisions = {network:0, dorm:0, lptiyu:0};
 let sourceDirty = false, sourceRevision = 0;
 let api;
 let mapState = null;
-let mapDrag = null, mapSuppressPick = false, mapNameFor = null, accountNameFor = null;
+let mapDrag = null, mapSuppressPick = false, mapNameFor = null, accountNameFor = null, memberNameFor = null;
 const MAP_TILE = 256, MAP_MIN_ZOOM = 13, MAP_MAX_ZOOM = 19;
 const MAP_TILE_TRIES = 3, MAP_TILE_BACKOFF = [1200, 4000];  // ms before each retry of one tile
 const MAP_TILE_STALL = 8000;   // ms with nothing drawn before the next provider takes the frame
@@ -694,6 +694,18 @@ function confirmAction(title,text,action){previousFocus=document.activeElement;$
 $('confirm-cancel').onclick=()=>$('confirm-dialog').close();
 $('confirm-dialog').addEventListener('close',()=>{confirmation=null;previousFocus?.focus();});
 $('confirm-ok').onclick=()=>{const action=confirmation;$('confirm-dialog').close();if(action)action();};
+/* 带输入的弹窗(密码框): 目前用于导入凭证的 PIN。确认时把输入值传给回调。 */
+let prompting=null;
+function promptAction(title,text,action){
+  previousFocus=document.activeElement;
+  $('prompt-title').textContent=title;$('prompt-text').textContent=text;
+  $('prompt-input').value='';prompting=action;
+  $('prompt-dialog').showModal();$('prompt-input').focus();
+}
+$('prompt-cancel').onclick=()=>$('prompt-dialog').close();
+$('prompt-dialog').addEventListener('close',()=>{prompting=null;previousFocus?.focus();});
+$('prompt-ok').onclick=()=>{const action=prompting;const value=$('prompt-input').value;$('prompt-dialog').close();if(action)action(value);};
+$('prompt-input').addEventListener('keydown',e=>{if(e.key==='Enter')$('prompt-ok').click();});
 $('check-updates').onclick=()=>{
   // 浏览器不会把点击派发给 disabled 的按钮，但这里仍然显式挡住：同步状态、进行中的
   // 操作、以及代理正在下载/准备安装时都不该再发一次检查。
@@ -894,7 +906,60 @@ function renderLptiyu(){
   const settings=lp.settings||{};
   renderRunStatus(lp,settings);
   renderRunCredential(lp);
+  renderMembers(lp);
   renderRunSettings(lp,settings);
+}
+/* 乐跑成员 -----------------------------------------------------------------------------------
+   成员清单与打卡账号同一套交互: 下拉切换、添加(= 采集, 抓到谁归档给谁)、重命名、删除(= 退出账号)。
+   添加成员不新建空档案 —— 点「添加成员」就是起一次采集, 对方用微信多开(或临时登录)打开一次
+   小程序, 凭证按 uid 自动归档, 活动成员不被顶掉。老快照没有 members 区块时整条栏不出现。 */
+function memberItems(){return state?.lptiyu?.members?.items||[];}
+function activeMember(){
+  const members=state?.lptiyu?.members||{},items=members.items||[];
+  return items.find(member=>member.active)||items.find(member=>member.id===members.active)||null;
+}
+function memberLabel(member){
+  return member.name+(member.student_num?` · ${member.student_num}`:'')
+    +(member.alive===false?' · 凭证已失效':member.has_token?'':' · 无凭证');
+}
+function requireLptiyuSync(){
+  if(!state||syncedEpoch!==epoch){notify('状态尚未同步，请稍后重试。',true);return false;}
+  if(state.lptiyu?.members?.error){notify(state.lptiyu.members.error,true);return false;}
+  return true;
+}
+function renderMembers(lp){
+  const bar=$('lp-member-bar');
+  if(!bar)return;
+  const members=lp.members||{},items=members.items||[],error=members.error||'';
+  bar.hidden=lp.available===false||!(items.length||error);
+  // 成员栏可见时, 「当前成员：X」这行就是冗余的, 藏掉减少一层视觉噪音。
+  $('lp-identity-line').hidden=!bar.hidden;
+  if(bar.hidden)return;
+  const select=$('lp-member');
+  select.replaceChildren(...items.map(member=>{
+    const option=document.createElement('option');
+    option.value=member.id;
+    option.textContent=memberLabel(member);
+    return option;
+  }));
+  const active=activeMember(),activeId=active?active.id:'';
+  if(syncedEpoch===epoch)select.value=activeId;   // 状态没同步时不覆盖用户正在做的选择
+  const blocked=Boolean(pending||error||lp.busy),max=members.max||0,full=max>0&&items.length>=max;
+  select.disabled=blocked||!items.length;
+  $('lp-member-name').disabled=blocked;
+  $('lp-member-add').disabled=blocked||full;
+  $('lp-member-rename').disabled=blocked||!items.length;
+  $('lp-member-delete').disabled=blocked||!items.length;
+  const dead = items.filter(member=>member.alive===false).map(member=>member.name);
+  $('lp-member-state').textContent=error
+    ||(full?`最多 ${max} 个成员。`
+      :'添加成员：让对方用微信多开（或临时登录）打开一次小程序，凭证会自动归档并切换过去。')
+    +(dead.length?` 「${dead.join('、')}」的凭证已失效：让 TA 重跑一次提取器，新文件发来后点「导入凭证」。`:'');
+  // 名字框只在真的换了活动成员时回写：它同时是重命名的输入框, 不能被后台重绘冲掉。
+  if(memberNameFor!==activeId){
+    memberNameFor=activeId;
+    $('lp-member-name').value=active?active.name:'';
+  }
 }
 /* 学校登录 ---------------------------------------------------------------------------------
    登录态只有后端能回答：快照里的 has_session 直接读本机保存的学校会话。不用 state 反推 ——
@@ -987,11 +1052,47 @@ $('account-rename').onclick=async()=>{
   if(await act('account_rename',{id:active.id,name}))accountNameFor=null;   // 按后端清洗后的名字回填
   render();
 };
+/* 导入凭证文件: 对方在自己电脑用提取器生成 lptiyu-credential-*.json 发来,
+   存到桌面/下载后点这里, 输入口头约定好的 PIN 即可入档。 */
+$('lp-member-import').onclick=()=>{
+  if(!requireLptiyuSync())return;
+  promptAction('导入成员凭证',
+    '把对方发来的凭证文件(lptiyu-credential-*.json)存到桌面或下载文件夹，输入你们约定好的 PIN。',
+    async pin=>{
+      if(!pin.trim()){notify('PIN 不能为空。',true);return;}
+      if(await act('lptiyu_member_import',{pin}))render();
+    });
+};
 $('account-delete').onclick=()=>{
   const active=activeAccount();
   if(!active||!requireAccountSync())return;
   confirmAction(`删除账号「${active.name}」？`,'会同时删除这个账号在本机的打卡设置、已保存的打卡点、当日打卡记录和登录凭据；无法撤销。',async()=>{
     await act('account_delete',{id:active.id,confirmed:true});
+    render();
+  });
+};
+/* 乐跑成员: 切换/重命名/删除。删除=退出账号, 与账号删除一样要过第二道确认。 */
+$('lp-member').addEventListener('change',async()=>{
+  const id=$('lp-member').value;
+  const active=activeMember();
+  if(!id||!active||id===active.id)return;             // 选中的就是活动成员：什么都不做
+  if(!requireLptiyuSync()){$('lp-member').value=active.id;return;}
+  await act('lptiyu_member_switch',{id});
+  render();
+});
+$('lp-member-rename').onclick=async()=>{
+  const active=activeMember();
+  if(!active||!requireLptiyuSync())return;
+  const name=$('lp-member-name').value;
+  if(!name.trim()){notify('请填写成员名字，最多 24 个字。',true);return;}
+  if(await act('lptiyu_member_rename',{id:active.id,name}))memberNameFor=null;  // 按后端清洗后的名字回填
+  render();
+};
+$('lp-member-delete').onclick=()=>{
+  const active=activeMember();
+  if(!active||!requireLptiyuSync())return;
+  confirmAction(`删除成员「${active.name}」？`,'会同时删除这个成员在本机的身份与跑步凭证（等于退出账号）；无法撤销。',async()=>{
+    await act('lptiyu_member_delete',{id:active.id,confirmed:true});
     render();
   });
 };

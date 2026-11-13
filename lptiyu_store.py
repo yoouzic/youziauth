@@ -1,5 +1,11 @@
 """乐跑模块的本地存储: 设置、身份、凭证(DPAPI 加密)、状态与历史。
 
+多成员模型(2026-11-13 起): 成员级数据(身份/凭证/状态/台账)一份一份挂在
+`members/<id>/` 下, 登记表在 `members.json`(lptiyu_members.py); settings、
+跑区几何、样本、采集组件是本机共享的, 留在根目录。所有成员级读写在没有
+活动成员时降级为空值, 写入时自动建「成员 1」—— 老的单槽位调用方(以及
+既有测试)由此保持原样。
+
 凭证形态沿用寝室打卡的边界纪律:
   * token 只以 DPAPI(用户域)密文落盘(session/credential.dat), 明文只在内存;
   * 快照只回答「有没有」(has_token), 绝不回传 token 本身;
@@ -17,11 +23,17 @@ import dataclasses
 import datetime as dt
 import json
 import os
+import re
+import shutil
 from pathlib import Path
 
 from windows_credentials import CredentialStore, DpapiProtector, atomic_write_bytes
+from lptiyu_members import MAX_MEMBERS, MemberError, MemberRegistry
 
 HISTORY_MAX_LINES = 99
+
+# 自动命名的成员名(成员 1…)。身份里出现真名时, 这类名字让位给真名。
+_AUTO_MEMBER_NAME = re.compile(r'成员 \d+$')
 
 
 def now():
@@ -122,26 +134,65 @@ class Settings:
 
 
 class Store:
-    def __init__(self, root: Path | None = None, protector=None):
+    def __init__(self, root: Path | None = None, protector=None, members=None):
         self.root = Path(root) if root is not None else Path(
             os.environ.get('LOCALAPPDATA', str(Path.home() / 'AppData' / 'Local'))
         ) / 'youziauth' / 'lptiyu'
         self._protector = protector
+        self._members = members             # MemberRegistry 注入点(测试用)
 
     # ------------------------------------------------------------- 基础读写
-    def _credentials(self):
-        return CredentialStore(self.root / 'session',
+    def _registry(self):
+        if self._members is None:
+            self._members = MemberRegistry(self.root / 'members', legacy_root=self.root)
+        return self._members
+
+    def _credentials(self, directory):
+        return CredentialStore(Path(directory) / 'session',
                                self._protector or DpapiProtector(machine_scope=False))
 
-    def _read(self, name, default):
+    @staticmethod
+    def _read_path(path, default):
         try:
-            return json.loads((self.root / name).read_text(encoding='utf-8-sig'))
+            return json.loads(Path(path).read_text(encoding='utf-8-sig'))
         except FileNotFoundError:
             return default
 
-    def _write(self, name, data):
-        atomic_write_bytes(self.root / name,
+    @staticmethod
+    def _write_path(path, data):
+        atomic_write_bytes(Path(path),
                            json.dumps(data, ensure_ascii=False).encode('utf-8'))
+
+    def _read(self, name, default):
+        return self._read_path(self.root / name, default)
+
+    def _write(self, name, data):
+        self._write_path(self.root / name, data)
+
+    # ------------------------------------------------------------- 成员目录
+    def _member_dir(self, create=False):
+        """活动成员的数据目录。
+
+        create=True 且登记表还没有成员时自动建「成员 1」; 读路径不建,
+        没有活动成员时返回 None, 各读方法降级成空值。
+        """
+        registry = self._registry()
+        registry.ensure()
+        active = registry.active_id()
+        if active:
+            return registry.member_dir(active)
+        if not create:
+            return None
+        return registry.member_dir(registry.add('').id)
+
+    def _m_read(self, name, default):
+        directory = self._member_dir()
+        if directory is None:
+            return default
+        return self._read_path(directory / name, default)
+
+    def _m_write(self, name, data):
+        self._write_path(self._member_dir(create=True) / name, data)
 
     # ------------------------------------------------------------- 设置与身份
     def settings(self):
@@ -175,24 +226,46 @@ class Store:
         return True
 
     def identity(self):
-        value = self._read('identity.json', {})
+        value = self._m_read('identity.json', {})
         return value if isinstance(value, dict) else {}
 
     def save_identity(self, identity):
         clean = {k: str(identity[k]) for k in
                  ('name', 'student_num', 'uid', 'school_id', 'card_id') if identity.get(k)}
-        self._write('identity.json', clean)
+        self._m_write('identity.json', clean)
+        self._sync_member_display_name(self._registry().active_id(), clean)
+
+    def _sync_member_display_name(self, member_id, identity):
+        """成员显示名跟身份里的真名走: 登记表还是自动命名(或学号)时让位给真名。
+
+        显式重命名过的名字(既不是自动命名也不是学号)不覆盖 —— 用户改的名最大。
+        """
+        name = str(identity.get('name') or '')
+        if not name or not member_id:
+            return
+        registry = self._registry()
+        member = registry.find(member_id)
+        if member is None or member.name == name:
+            return
+        student_num = str(identity.get('student_num') or '')
+        if _AUTO_MEMBER_NAME.fullmatch(member.name) or member.name == student_num:
+            try:
+                registry.rename(member_id, name)
+            except MemberError:
+                pass          # 撞名等冲突: 保留原名, 不是关键路径
 
     # ------------------------------------------------------------- 凭证(加密)
     def has_token(self):
-        """本机是否保存着凭证。**只看密文文件在不在，不解密。**"""
-        return (self.root / 'session' / 'credential.dat').exists()
+        """活动成员是否保存着凭证。**只看密文文件在不在，不解密。**"""
+        directory = self._member_dir()
+        return bool(directory) and (directory / 'session' / 'credential.dat').exists()
 
-    def token_record(self):
-        """解密并返回 {'token','issued_at','source'}; 无凭证返回 None; 损坏抛 OSError。"""
-        if not self.has_token():
+    def _token_record_at(self, directory):
+        """解密某个成员目录的凭证; 无凭证返回 None; 损坏抛 OSError。"""
+        directory = Path(directory)
+        if not (directory / 'session' / 'credential.dat').exists():
             return None
-        value = self._credentials().load_password()
+        value = self._credentials(directory).load_password()
         try:
             record = json.loads(value)
         except ValueError:
@@ -205,6 +278,13 @@ class Store:
                 'issued_at': str(record.get('issued_at') or ''),
                 'source': str(record.get('source') or '')}
 
+    def token_record(self):
+        """解密并返回活动成员的 {'token','issued_at','source'}; 无凭证返回 None。"""
+        directory = self._member_dir()
+        if directory is None:
+            return None
+        return self._token_record_at(directory)
+
     def token(self):
         record = self.token_record()
         return record['token'] if record else ''
@@ -213,37 +293,44 @@ class Store:
         record = self.token_record()
         return record['issued_at'] if record else ''
 
-    def save_token_record(self, token, issued_at='', source=''):
+    def _save_token_record_at(self, directory, token, issued_at='', source=''):
         if not isinstance(token, str) or not token.strip() \
                 or any(c in token for c in '\r\n'):
             raise ValueError('凭证格式无效')
         payload = json.dumps({'v': 1, 'token': token, 'issued_at': issued_at,
                               'source': source}, ensure_ascii=False)
-        self._credentials().save_password(payload)
+        self._credentials(directory).save_password(payload)
+
+    def save_token_record(self, token, issued_at='', source=''):
+        self._save_token_record_at(self._member_dir(create=True), token,
+                                   issued_at=issued_at, source=source)
 
     def clear_token(self):
-        (self.root / 'session' / 'credential.dat').unlink(missing_ok=True)
+        directory = self._member_dir()
+        if directory is not None:
+            (directory / 'session' / 'credential.dat').unlink(missing_ok=True)
 
     # ------------------------------------------------------------- 状态与历史
     def status(self):
-        value = self._read('status.json', {})
+        value = self._m_read('status.json', {})
         return value if isinstance(value, dict) else {}
 
     def sync_record(self):
         try:
-            value = self._read('sync.json', {})
+            value = self._m_read('sync.json', {})
         except (OSError, ValueError):
             return {}
         return value if isinstance(value, dict) else {}
 
     def record_sync(self, message=''):
         """本地同步时刻: 界面「多久前同步」只认这本台账, 不认服务器签发时间。"""
-        self._write('sync.json', {'at': now().isoformat(timespec='seconds'),
-                                  'message': str(message or '')[:160]})
+        self._m_write('sync.json', {'at': now().isoformat(timespec='seconds'),
+                                    'message': str(message or '')[:160]})
 
     def _append_history(self, line):
-        self.root.mkdir(parents=True, exist_ok=True)
-        path = self.root / 'history.log'
+        directory = self._member_dir(create=True)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / 'history.log'
         try:
             lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
         except OSError:
@@ -254,17 +341,45 @@ class Store:
 
     def record(self, state, message, detail='', at=None):
         stamp = (at or now()).isoformat(timespec='seconds')
-        self._write('status.json', {'state': state, 'message': message,
-                                    'detail': detail, 'at': stamp})
+        self._m_write('status.json', {'state': state, 'message': message,
+                                      'detail': detail, 'at': stamp})
         line = f'{stamp} [{state}] {message}' + (f' · {detail}' if detail else '')
         self._append_history(line)
 
-    def record_probe(self, alive):
-        probes = self.status().get('probe_evidence') or []
+    def record_probe(self, alive, member_id=None):
+        """把探活结果写进成员级台账(默认活动成员; 巡检可指定旁席成员)。"""
+        registry = self._registry()
+        directory = self._member_dir(create=True) if member_id is None \
+            else registry.member_dir(str(member_id))
+        status = self._read_path(directory / 'status.json', {})
+        if not isinstance(status, dict):
+            status = {}
+        probes = status.get('probe_evidence') or []
         probes.append({'at': now().isoformat(timespec='seconds'), 'alive': bool(alive)})
-        status = self.status()
         status['probe_evidence'] = probes[-20:]
-        self._write('status.json', status)
+        status['last_probe_alive'] = bool(alive)
+        status['last_probe_at'] = now().isoformat(timespec='seconds')
+        self._write_path(directory / 'status.json', status)
+
+    def member_token_record(self, member_id):
+        """读某个成员的凭证(给巡检/探活用); 无凭证或成员不存在返回 None。"""
+        try:
+            directory = self._registry().member_dir(str(member_id))
+        except MemberError:
+            return None
+        try:
+            return self._token_record_at(directory)
+        except OSError:
+            return None
+
+    def member_identity(self, member_id):
+        """读某个成员的身份(巡检/探活用); 没有返回空 dict。"""
+        try:
+            directory = self._registry().member_dir(str(member_id))
+            value = self._read_path(directory / 'identity.json', {})
+        except MemberError:
+            return {}
+        return value if isinstance(value, dict) else {}
 
     # ------------------------------------------------------------- 续期台账
     MAX_SAMPLES = 200
@@ -322,7 +437,7 @@ class Store:
         所以这里容忍损坏(与 settings.json 的 fail-closed 不同)。
         """
         try:
-            value = self._read('renewal.json', {})
+            value = self._m_read('renewal.json', {})
         except (OSError, ValueError):
             return {}
         return value if isinstance(value, dict) else {}
@@ -350,7 +465,7 @@ class Store:
             'next_due': str(next_due or ''),
             'events': events[-20:],
         }
-        self._write('renewal.json', value)
+        self._m_write('renewal.json', value)
         if state != 'ok' and not self._same_as_last_history(text):
             # 例行探活不是「发生过的事」: 台账里有记录就够了, 运行记录页只留
             # 换号 / 需要人动手 / 链路故障这类需要人看的行; 同一句话重复十几次
@@ -368,15 +483,18 @@ class Store:
         return str(text) and str(text) in tail
 
     def history(self):
+        directory = self._member_dir()
+        if directory is None:
+            return ''
         try:
-            return (self.root / 'history.log').read_text(encoding='utf-8', errors='replace')
+            return (directory / 'history.log').read_text(encoding='utf-8', errors='replace')
         except OSError:
             return ''
 
     # ------------------------------------------------------------- 每日计数
     def daily(self, date=None):
         day = (date or now()).date().isoformat()
-        value = self._read('daily.json', {})
+        value = self._m_read('daily.json', {})
         if not isinstance(value, dict):
             value = {}
         value = {k: v for k, v in value.items() if k >= (now().date() - dt.timedelta(days=30)).isoformat()}
@@ -384,25 +502,25 @@ class Store:
 
     def bump_daily(self, date=None, kind='run'):
         day = (date or now()).date().isoformat()
-        value = self._read('daily.json', {})
+        value = self._m_read('daily.json', {})
         if not isinstance(value, dict):
             value = {}
         value = {k: v for k, v in value.items() if k >= (now().date() - dt.timedelta(days=30)).isoformat()}
         day_value = value.get(day) if isinstance(value.get(day), dict) else {}
         day_value[kind] = int(day_value.get(kind, 0)) + 1
         value[day] = day_value
-        self._write('daily.json', value)
+        self._m_write('daily.json', value)
         return day_value[kind]
 
     def signed_record(self):
-        value = self._read('signed.json', {})
+        value = self._m_read('signed.json', {})
         return value if isinstance(value, dict) else {}
 
     def mark_signed(self, date, summary=None):
         record = {'date': date}
         if isinstance(summary, dict):
             record.update(summary)
-        self._write('signed.json', record)
+        self._m_write('signed.json', record)
 
     def is_signed_today(self, today=None):
         """今天打过卡没有。today 由调用方按自己的时钟给, 测试才不会跨零点漂移。"""
@@ -606,7 +724,7 @@ class Store:
     # ------------------------------------------------------------- 研究库同步
     @staticmethod
     def _lab_member(config, identity):
-        """按本机身份挑研究库成员: 学号 → uid → active → 第一个。
+        """按身份挑研究库成员: 学号 → uid → active → 第一个。
 
         研究库是多成员白名单, `active` 只是「上次在用的那个」。直接按 active 取,
         在换过成员的机器上会把别人的号装进来 —— 凭证是认人的, 这里必须先认身份。
@@ -631,16 +749,59 @@ class Store:
                 return member
         return None
 
+    def _adopt_lab_member(self, member_cfg, directory, include_consumed=False):
+        """把研究库某个成员的身份与凭证并进本机成员目录。返回变更列表。"""
+        changes = []
+        student_num = str(member_cfg.get('student_num') or '')
+        identity = self._read_path(directory / 'identity.json', {})
+        identity = identity if isinstance(identity, dict) else {}
+        if student_num and identity.get('student_num') != student_num:
+            self._write_path(directory / 'identity.json', {
+                'name': member_cfg.get('alias') or member_cfg.get('name') or student_num,
+                'student_num': student_num,
+                'uid': str(member_cfg.get('uid') or ''),
+                'school_id': str(member_cfg.get('school_id') or ''),
+                'card_id': str(member_cfg.get('card_id') or student_num),
+            })
+            changes.append('identity')
+        auth = member_cfg.get('auth') or {}
+        lab_token = str(auth.get('token') or '')
+        lab_issued = str(auth.get('issued_at') or '')
+        consumed = bool(auth.get('consumed_at'))
+        if lab_token and (include_consumed or not consumed):
+            current = None
+            try:
+                current = self._token_record_at(directory)
+            except OSError:
+                (directory / 'session' / 'credential.dat').unlink(missing_ok=True)
+            if current and current['token'] == lab_token:
+                # 同一枚号只补签发时间, 不重复落盘, 免得台账每天多一条「已同步」。
+                if lab_issued and current['issued_at'] != lab_issued:
+                    self._save_token_record_at(directory, lab_token, issued_at=lab_issued,
+                                               source=current['source'] or 'lab-sync')
+            else:
+                newer = (not current) or (not current['issued_at']) \
+                    or (lab_issued and lab_issued > current['issued_at'])
+                if newer:
+                    self._save_token_record_at(
+                        directory, lab_token, issued_at=lab_issued,
+                        source='lab-consumed' if consumed else 'lab-sync')
+                    changes.append('token')
+        return changes
+
     def sync_from_lab(self, include_consumed=False):
-        """从研究库单向同步身份与凭证。凭证「取更新的一方」: 以 issued_at 为准。
+        """从研究库单向同步身份与凭证, 遍历全部本机成员按身份认领。
 
         include_consumed: 研究库把「提交完」的号记成 consumed, 但 2026-11-11 实测
         说明 token 只由下一次 loginByCode 轮换才死。自动续期走这条路时允许采纳
         consumed 号, 由真门探活裁决 —— 否则每次都要把用户赶去重新开一次小程序。
         默认 False 保持「同步凭证」按钮原有的语义。
 
+        每个本机成员按自己的学号/uid 认领研究库里对应的那个人; 没有身份的
+        旁席成员无从认领, 只有活动成员保留旧行为(认领研究库的 active)。
+
         返回 (changes:list[str], message:str)。不做任何破坏性写入——youziauth
-        只在被同步方更新时采纳，绝不反向覆盖研究库。
+        只在被同步方更新时采纳，绝无反向覆盖研究库。
         """
         lab = self.lab_dir()
         if not lab:
@@ -652,48 +813,133 @@ class Store:
             return [], '研究库配置无法读取'
         if not isinstance(config, dict) or not (config.get('members') or {}):
             return [], '研究库还没有成员'
-        identity = self.identity()
-        member = self._lab_member(config, identity)
-        if member is None:
-            return [], '研究库还没有成员'
+        try:
+            registry = self._registry()
+            registry.ensure()
+        except MemberError as exc:
+            return [], str(exc)
+        if not registry.members():
+            # 空库先落「成员 1」: 首次同步保留旧行为 —— 由它认领研究库的 active。
+            self._member_dir(create=True)
+        active = registry.active_id()
         changes = []
-        student_num = str(member.get('student_num') or '')
-        if student_num and identity.get('student_num') != student_num:
-            self.save_identity({
-                'name': member.get('alias') or member.get('name') or student_num,
-                'student_num': student_num,
-                'uid': member.get('uid') or '',
-                'school_id': member.get('school_id') or '',
-                'card_id': member.get('card_id') or student_num,
-            })
-            changes.append('identity')
+        for member in registry.members():
+            directory = registry.member_dir(member.id)
+            identity = self._read_path(directory / 'identity.json', {})
+            identity = identity if isinstance(identity, dict) else {}
+            known = bool(identity.get('student_num') or identity.get('uid'))
+            if not known and member.id != active:
+                continue
+            member_cfg = self._lab_member(config, identity)
+            if member_cfg is None:
+                continue
+            changes.extend(self._adopt_lab_member(member_cfg, directory,
+                                                  include_consumed=include_consumed))
+        if not changes:
+            return [], '本机凭证已是最新'
+        settings = self.settings()
+        if not settings.lab_dir:
+            self.save_settings(dataclasses.replace(settings, lab_dir=lab))
+        return changes, '已同步研究库的最新凭证'
 
-        auth = member.get('auth') or {}
-        lab_token = str(auth.get('token') or '')
-        lab_issued = str(auth.get('issued_at') or '')
-        consumed = bool(auth.get('consumed_at'))
-        if lab_token and (include_consumed or not consumed):
-            current = None
-            try:
-                current = self.token_record()
-            except OSError:
-                self.clear_token()
-            if current and current['token'] == lab_token:
-                # 同一枚号只补签发时间, 不重复落盘, 免得台账每天多一条「已同步」。
-                if lab_issued and current['issued_at'] != lab_issued:
-                    self.save_token_record(lab_token, issued_at=lab_issued,
-                                           source=current['source'] or 'lab-sync')
-            else:
-                newer = (not current) or (not current['issued_at']) \
-                    or (lab_issued and lab_issued > current['issued_at'])
-                if newer:
-                    self.save_token_record(
-                        lab_token, issued_at=lab_issued,
-                        source='lab-consumed' if consumed else 'lab-sync')
-                    changes.append('token')
-        if changes:
-            settings = self.settings()
-            if not settings.lab_dir:
-                self.save_settings(dataclasses.replace(settings, lab_dir=lab))
-            return changes, '已同步研究库的最新凭证'
-        return [], '本机凭证已是最新'
+    # ------------------------------------------------------------- 成员管理
+    def members_status(self):
+        """成员清单(给快照): 只回答「是谁、有没有凭证」, 不解密任何内容。"""
+        try:
+            registry = self._registry()
+            registry.ensure()
+        except MemberError as exc:
+            return {'error': str(exc), 'max': MAX_MEMBERS, 'active': '', 'items': []}
+        active = registry.active_id()
+        items = []
+        for member in registry.members():
+            directory = registry.member_dir(member.id)
+            identity = self._read_path(directory / 'identity.json', {})
+            identity = identity if isinstance(identity, dict) else {}
+            status = self._read_path(directory / 'status.json', {})
+            status = status if isinstance(status, dict) else {}
+            items.append({'id': member.id, 'name': member.name,
+                          'student_num': str(identity.get('student_num') or ''),
+                          'uid': str(identity.get('uid') or ''),
+                          'active': member.id == active,
+                          'has_token': (directory / 'session' / 'credential.dat').exists(),
+                          # 巡检结果: True=活 / False=死 / None=还没探过或没凭证
+                          'alive': (bool(status.get('last_probe_alive'))
+                                    if (directory / 'session' / 'credential.dat').exists()
+                                    and 'last_probe_alive' in status else None)})
+        return {'error': '', 'max': MAX_MEMBERS, 'active': active, 'items': items}
+
+    def switch_member(self, member_id):
+        return self._registry().activate(member_id)
+
+    def rename_member(self, member_id, name):
+        return self._registry().rename(member_id, name)
+
+    def remove_member(self, member_id):
+        """摘掉成员并删除其全部本机数据(退出账号的语义)。返回 (member, leftover)。"""
+        member = self._registry().remove(member_id)
+        directory = self._registry().member_dir(member.id)
+        try:
+            shutil.rmtree(directory)
+            leftover = False
+        except OSError:
+            leftover = directory.exists()
+        return member, leftover
+
+    def file_captured_credential(self, cred):
+        """把一次采集的凭证归档给正确的成员; 返回 {'id','name','activated','is_active'}。
+
+        采集链认身份不认活动指针: uid/学号对得上就覆盖那个成员, 对不上就新建
+        (名字取学号)。活动指针只在「登记表原本为空」或「活动成员还没有身份」
+        时落到新成员上 —— 替别人采集不该把已经在用的人顶掉。
+        """
+        cred = dict(cred or {})
+        registry = self._registry()
+        registry.ensure()
+        uid = str(cred.get('uid') or '')
+        student_num = str(cred.get('student_num') or '')
+        was_empty = not registry.members()
+        matched = None
+        if uid or student_num:
+            for member in registry.members():
+                existing = self._read_path(registry.member_dir(member.id) / 'identity.json', {})
+                if not isinstance(existing, dict):
+                    continue
+                if uid and str(existing.get('uid') or '') == uid:
+                    matched = member
+                    break
+                if student_num and str(existing.get('student_num') or '') == student_num:
+                    matched = member
+                    break
+        if matched is None:
+            matched = registry.add(student_num)
+        directory = registry.member_dir(matched.id)
+        existing = self._read_path(directory / 'identity.json', {})
+        existing = existing if isinstance(existing, dict) else {}
+        identity = {key: str(existing[key]) for key in
+                    ('name', 'student_num', 'uid', 'school_id', 'card_id')
+                    if existing.get(key)}
+        for key in ('student_num', 'uid', 'school_id', 'card_id'):
+            if cred.get(key):
+                identity[key] = str(cred[key])
+        identity.setdefault('name', matched.name or student_num)
+        self._write_path(directory / 'identity.json', identity)
+        self._sync_member_display_name(matched.id, identity)
+        issued_at = str(cred.get('issued_at') or '') or now().isoformat(timespec='seconds')
+        self._save_token_record_at(directory, cred['token'], issued_at=issued_at,
+                                   source=str(cred.get('source') or 'capture'))
+        activated = False
+        active = registry.active_id()
+        if was_empty:
+            registry.activate(matched.id)
+            activated = True
+        elif active and active != matched.id:
+            active_identity = self._read_path(registry.member_dir(active) / 'identity.json', {})
+            active_identity = active_identity if isinstance(active_identity, dict) else {}
+            if not (active_identity.get('uid') or active_identity.get('student_num')):
+                registry.activate(matched.id)
+                activated = True
+            active = registry.active_id()
+        label = identity.get('name') or matched.name or student_num or '成员'
+        return {'id': matched.id, 'name': label, 'activated': activated,
+                'is_active': matched.id == active}

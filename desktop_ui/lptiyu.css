@@ -218,3 +218,17 @@
 
 /* 研究库目录: 采集链不在安装包里时, 这是用户唯一能自己填的那一格。 */
 .lp-field-wide{grid-column:1/-1}
+
+/* 成员栏: 嵌在凭证卡里, 用虚线内嵌样式与卡内其他块区分, 不抢主操作的视觉权重。 */
+.lp-member-bar{
+  margin:12px 0 0;
+  padding:10px 12px;
+  background:transparent;
+  border-style:dashed;
+  box-shadow:none;
+}
+.lp-member-bar label{flex:none;color:var(--muted)}
+.lp-member-bar select{flex:1 1 170px;min-width:0}
+.lp-member-bar input{flex:0 1 132px;min-width:0}
+.lp-member-bar button{padding:6px 10px;min-height:34px;font-size:12px}
+#lp-member-state{margin-top:8px}

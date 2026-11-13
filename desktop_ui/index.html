@@ -154,6 +154,16 @@
               <span class="badge" id="lp-token-badge">待同步</span>
             </header>
             <p class="muted lp-status" id="lp-credential-line">正在读取凭证状态…</p>
+            <div class="account-bar lp-member-bar" id="lp-member-bar" hidden>
+              <label for="lp-member">跑步成员</label>
+              <select id="lp-member"></select>
+              <input type="text" id="lp-member-name" maxlength="24" placeholder="重命名用" aria-label="成员新名字">
+              <button type="button" class="secondary" id="lp-member-add" data-action="lptiyu_capture_add">添加成员</button>
+              <button type="button" class="secondary" id="lp-member-import">导入凭证</button>
+              <button type="button" class="secondary" id="lp-member-rename">重命名</button>
+              <button type="button" class="secondary danger" id="lp-member-delete">退出账号</button>
+            </div>
+            <p class="field-hint" id="lp-member-state"></p>
             <details class="lp-help" id="lp-first-use" open hidden>
               <summary>首次使用与授权</summary>
               <p>打开小程序后，进入「校园乐跑」并按提示授权。若没有弹出小程序，请在微信搜索「数体智慧体育」。</p>
@@ -315,5 +325,6 @@
 </div>
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 <dialog id="confirm-dialog"><h2 id="confirm-title"></h2><p id="confirm-text"></p><div class="dialog-actions"><button class="secondary" id="confirm-cancel">取消</button><button class="primary" id="confirm-ok">确认</button></div></dialog>
+<dialog id="prompt-dialog"><h2 id="prompt-title"></h2><p id="prompt-text"></p><input type="password" id="prompt-input" autocomplete="off"><div class="dialog-actions"><button class="secondary" id="prompt-cancel">取消</button><button class="primary" id="prompt-ok">确定</button></div></dialog>
 </body>
 </html>

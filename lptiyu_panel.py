@@ -221,6 +221,9 @@ class LptiyuController:
         self._open_applet = open_applet or open_mini_program
         self._capture_requested = False      # 某次跑批发现没凭证 → 下一拍自动采集
         self._capture_auto = False           # 这次采集是不是自动发起的
+        self._capture_switch_intent = False  # 「添加成员」发起: 抓到就切到新成员
+        self._next_sweep = time.monotonic() + 300   # 全成员巡检: 启动 5 分钟后首巡(避开开机峰值)
+        self._sweeping = False
         self._cert_cache = (0.0, None)
         self._flow_factory = flow_factory   # 测试注入; 正式路径现场构造 DailyFlow
         # 续期器也允许注入: 单测里给一个假的, 就不必碰网络和子进程。
@@ -265,13 +268,15 @@ class LptiyuController:
     # ------------------------------------------------------------- 入口
     def start(self, action):
         if action not in ('run', 'dry', 'sync', 'renew', 'renew_auto', 'zones',
-                          'capture', 'zone_apply'):
+                          'capture', 'capture_add', 'zone_apply'):
             return False
         with self._gate:
             if self.closed or self.busy:
                 return False
             self.busy = True
             self.cancel.clear()
+        # 「添加成员」是显式的人为意图: 抓到新成员就切过去, 不用再手动换档。
+        self._capture_switch_intent = (action == 'capture_add')
 
         def work():
             try:
@@ -281,7 +286,7 @@ class LptiyuController:
                     result = self._sync_zones()
                 elif action == 'zone_apply':
                     result = self._apply_zone()
-                elif action == 'capture':
+                elif action in ('capture', 'capture_add'):
                     result = self._capture_flow()
                 elif action == 'renew':
                     result = self._renew()
@@ -303,6 +308,7 @@ class LptiyuController:
                 with self._gate:
                     self.busy = False
                 self._capture_auto = False     # 自动标记只属于这一次采集
+                self._capture_switch_intent = False
 
         threading.Thread(target=work, name='youziauth-lptiyu-' + action,
                          daemon=True).start()
@@ -323,6 +329,9 @@ class LptiyuController:
             return
         if not settings.enabled:
             return
+        # 全成员保活巡检: 旁席成员的 token 死了要尽早亮出来, 别等切过去那天才发现。
+        if self._sweep_due(settings):
+            self._start_sweep()
         current = self._clock()
         try:
             in_window = (parse_time(settings.time_lo) <= current.time()
@@ -377,6 +386,67 @@ class LptiyuController:
             self.capture.stop('idle', '')
         except Exception:  # noqa: BLE001 —— 退出流程不该被采集卡住
             pass
+
+    # ------------------------------------------------------------- 成员巡检
+    def _sweep_due(self, settings):
+        if self._sweeping or self.busy or self.closed:
+            return False
+        try:
+            interval = max(60, int(settings.renew_interval_min or 180))
+        except (TypeError, ValueError):
+            interval = 180
+        if time.monotonic() >= self._next_sweep:
+            self._next_sweep = time.monotonic() + interval * 60
+            return True
+        return False
+
+    def _start_sweep(self):
+        self._sweeping = True
+
+        def work():
+            try:
+                self._sweep_members()
+            finally:
+                self._sweeping = False
+
+        threading.Thread(target=work, name='youziauth-lptiyu-sweep',
+                         daemon=True).start()
+
+    def _sweep_members(self):
+        """旁席成员保活巡检: 只读 getTermList, 结果写进各成员自己的台账。
+
+        死了只亮出来、不自动修 —— 非活动成员的凭证只能由本人重开小程序
+        (或重发一次提取文件)才有新号。链路故障不判死(与续期同一语义)。
+        """
+        store = self.store
+        try:
+            members = store.members_status()
+        except Exception:               # noqa: BLE001 —— 巡检不能拖垮主循环
+            return
+        for item in members['items']:
+            if item['active'] or not item['has_token']:
+                continue
+            record = store.member_token_record(item['id'])
+            if not record or not record.get('token'):
+                continue
+            identity = store.member_identity(item['id'])
+            try:
+                uid = int(identity.get('uid') or 0) or int(item['uid'] or 0)
+                school_id = int(identity.get('school_id') or 0)
+                student_num = str(identity.get('student_num') or item['student_num'] or '')
+            except (TypeError, ValueError):
+                continue
+            if not uid or not school_id:
+                continue
+            client = ApiClient(uid=uid, token=record['token'],
+                               school_id=school_id, student_num=student_num,
+                               card_id=str(identity.get('card_id') or student_num),
+                               pace=0.0)
+            try:
+                alive = self._probe_alive(client)
+            except Exception:           # noqa: BLE001 —— 网络类故障不判死
+                continue
+            store.record_probe(alive, member_id=item['id'])
 
     # ------------------------------------------------------------- 步骤
     def _sync(self):
@@ -566,20 +636,19 @@ class LptiyuController:
                 return self._set_latest('idle', status.get('message') or '已停止采集',
                                         record=False)
             raise LptiyuError('need_token', status.get('message') or '没有抓到凭证')
-        identity = self.store.identity()
-        student_num = str(cred.get('student_num') or identity.get('student_num') or '')
-        self.store.save_identity({
-            'name': identity.get('name') or student_num or '成员',
-            'student_num': student_num,
-            'uid': str(cred.get('uid') or identity.get('uid') or ''),
-            'school_id': str(cred.get('school_id') or identity.get('school_id') or ''),
-            'card_id': str(cred.get('card_id') or student_num
-                           or identity.get('card_id') or ''),
-        })
-        self.store.save_token_record(
-            cred['token'],
-            issued_at=cred.get('issued_at') or self._clock().isoformat(timespec='seconds'),
-            source='capture')
+        # 归档认身份不认活动指针: 抓到谁就归给谁(对不上就建新成员)。
+        filed = self.store.file_captured_credential(cred)
+        label = str(filed.get('name') or '成员')
+        if self._capture_switch_intent and not filed.get('is_active'):
+            # 「添加成员」的意图就是接下来给 TA 跑: 归档完直接切过去。
+            self.store.switch_member(filed['id'])
+            filed['is_active'] = True
+        if not filed.get('is_active'):
+            # 归档给了旁席成员: 探活属于活动成员的槽位, 不越权代查;
+            # 换到那一档时真门探活自然会确认。
+            suffix = '（自动采集）' if auto else ''
+            return self._set_latest('synced',
+                                    f'已为「{label}」归档凭证，活动成员未变{suffix}')
         client = self.slot.make_client(pace=0.0)
         try:
             alive = self._probe_alive(client)
@@ -589,8 +658,12 @@ class LptiyuController:
             self.slot.mark_dead()
             raise LptiyuError('need_token', '抓到的凭证当场失效了：在小程序里重新登录后再采集')
         self.store.record_probe(True)
-        return self._set_latest('synced', '已自动采集凭证，并确认可用' if auto
-                                else '已采集凭证，并确认可用')
+        if self._capture_switch_intent and len(self.store.members_status()['items']) > 1:
+            return self._set_latest(
+                'synced', f'已添加「{label}」的凭证并切换过去，确认可用' if auto
+                else f'已采集「{label}」的凭证并切换过去，确认可用')
+        return self._set_latest('synced', f'已自动采集「{label}」的凭证，并确认可用' if auto
+                                else f'已采集「{label}」的凭证，并确认可用')
 
     # ------------------------------------------------------------- 样本
     def _record_sample(self, summary, settings):

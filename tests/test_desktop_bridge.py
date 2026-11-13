@@ -1290,6 +1290,94 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertEqual(state['identity']['name'], '陈同学')
         self.assertIn('自动跑步', state['schedule'])
 
+    def test_snapshot_exposes_the_member_list_without_secrets(self):
+        state = self.bridge.snapshot()['lptiyu']
+        members = state['members']
+        self.assertEqual(members['error'], '')
+        self.assertEqual(len(members['items']), 1)
+        self.assertEqual(members['items'][0]['name'], '陈同学')
+        self.assertTrue(members['items'][0]['active'])
+        self.assertTrue(members['items'][0]['has_token'])
+        self.assertNotIn('LP-SECRET-TOKEN', str(members), '成员清单也不该带出凭证')
+        # 巡检结果跟着快照走: 探活一次后 alive 变成 False
+        self.store.record_probe(False)
+        item = self.bridge.snapshot()['lptiyu']['members']['items'][0]
+        self.assertIs(item['alive'], False)
+
+    def test_member_switch_changes_the_active_member(self):
+        self.store.file_captured_credential({
+            'token': 'STRANGER-TOKEN', 'uid': 17980009, 'student_num': '2025009',
+            'school_id': '837', 'card_id': '2025009', 'source': 'capture'})
+        members = self.store.members_status()
+        stranger = next(item for item in members['items'] if not item['active'])
+        result = self.bridge.dispatch('lptiyu_member_switch', {'id': stranger['id']})
+        self.assertTrue(result['ok'])
+        self.assertIn('切换', result['message'])
+        self.assertEqual(self.store.identity()['student_num'], '2025009')
+        snapshot = self.bridge.snapshot()['lptiyu']['members']
+        self.assertEqual(snapshot['active'], stranger['id'])
+
+    def test_member_rename_uses_the_cleaned_name(self):
+        member = self.store.members_status()['items'][0]
+        result = self.bridge.dispatch('lptiyu_member_rename',
+                                      {'id': member['id'], 'name': '  柚子  '})
+        self.assertTrue(result['ok'])
+        self.assertIn('柚子', result['message'])
+        self.assertEqual(self.store.members_status()['items'][0]['name'], '柚子')
+
+    def test_member_delete_requires_confirmation_and_removes_data(self):
+        member = self.store.members_status()['items'][0]
+        refused = self.bridge.dispatch('lptiyu_member_delete', {'id': member['id']})
+        self.assertFalse(refused['ok'], '没有确认就不能删成员')
+        result = self.bridge.dispatch('lptiyu_member_delete',
+                                      {'id': member['id'], 'confirmed': True})
+        self.assertTrue(result['ok'])
+        self.assertEqual(self.store.members_status()['items'], [])
+        self.assertFalse(self.store.has_token(), '删除成员 = 退出账号, 凭证一起清')
+
+    def test_member_import_requires_pin_and_a_file(self):
+        import tempfile
+        from lptiyu_credential import export_file_name, seal_credential
+        # 没有 PIN / 没有 PIN 且没文件: 都被拒
+        self.assertFalse(self.bridge.dispatch('lptiyu_member_import', {})['ok'])
+        self.assertFalse(self.bridge.dispatch('lptiyu_member_import', {'pin': 'x'})['ok'])
+
+    def test_member_import_files_the_credential(self):
+        import tempfile
+        from lptiyu_credential import export_file_name, seal_credential
+        cred = {'token': 'IMPORTED-1', 'uid': 17980009, 'student_num': '2025009',
+                'school_id': 837, 'card_id': '2025009'}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / export_file_name()
+            path.write_text(json.dumps(seal_credential(cred, '888999')),
+                            encoding='utf-8')
+            from unittest import mock
+            import lptiyu_credential as lc
+            with mock.patch.object(lc, 'candidate_dirs', lambda: [Path(tmp)]):
+                wrong = self.bridge.dispatch('lptiyu_member_import',
+                                             {'pin': '000000'})
+                self.assertFalse(wrong['ok'])
+                self.assertIn('PIN', wrong['message'])
+                result = self.bridge.dispatch('lptiyu_member_import',
+                                              {'pin': '888999'})
+            self.assertTrue(result['ok'])
+            self.assertIn('导入', result['message'])
+            members = self.store.members_status()
+            filed = next(item for item in members['items']
+                         if item['student_num'] == '2025009')
+            self.assertTrue(filed['has_token'])
+            # 新成员不顶掉活动成员
+            self.assertTrue(members['items'][0]['active'])
+            self.assertEqual(self.store.identity()['student_num'],
+                             '222025321102104')
+
+    def test_member_actions_refuse_while_the_controller_is_busy(self):
+        self.controller.busy = True
+        member = self.store.members_status()['items'][0]
+        result = self.bridge.dispatch('lptiyu_member_switch', {'id': member['id']})
+        self.assertFalse(result['ok'])
+        self.assertIn('等待', result['message'])
+
     def test_snapshot_degrades_when_the_store_is_unreadable(self):
         self.controller.store.settings = lambda: (_ for _ in ()).throw(OSError('bad'))
         state = self.bridge.snapshot()['lptiyu']

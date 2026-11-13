@@ -7,6 +7,7 @@
 import datetime as dt
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -595,6 +596,17 @@ class AutoCaptureTests(PanelTestCase):
             "school_id": "837", "card_id": "2025003",
             "issued_at": "2026-11-11T19:00:00", "source": "capture"}
 
+    def setUp(self):
+        super().setUp()
+        # 自愈采集的语义是「活动成员自己重开小程序换新号」: 种子身份与抓到的
+        # 身份对齐, 归档才会落回活动成员头上。
+        self._align_identity_with(self.CRED)
+
+    def _align_identity_with(self, cred):
+        self.store.save_identity({'name': '测试成员', 'student_num': str(cred['student_num']),
+                                  'uid': str(cred['uid']), 'school_id': str(cred['school_id']),
+                                  'card_id': str(cred['card_id'])})
+
     def test_auto_capture_needs_the_certificate(self):
         controller = self.make_controller(capture=FakeCapture(installed=False))
         self.assertFalse(controller.capture_ready())
@@ -666,6 +678,17 @@ class CaptureFlowTests(PanelTestCase):
             "school_id": "837", "card_id": "2025001",
             "issued_at": "2026-11-11T18:00:00", "source": "capture"}
 
+    def setUp(self):
+        super().setUp()
+        # 采集场景的语义是「活动成员自己重开小程序换新号」: 种子身份与抓到的
+        # 身份对齐, 归档才会落回活动成员头上。
+        self._align_identity_with(self.CRED)
+
+    def _align_identity_with(self, cred):
+        self.store.save_identity({'name': '测试成员', 'student_num': str(cred['student_num']),
+                                  'uid': str(cred['uid']), 'school_id': str(cred['school_id']),
+                                  'card_id': str(cred['card_id'])})
+
     def test_capture_opens_the_mini_program_for_the_user(self):
         opened = []
         controller = self.make_controller(
@@ -689,6 +712,84 @@ class CaptureFlowTests(PanelTestCase):
         self.assertEqual(identity["uid"], "17980001")
         self.assertEqual(identity["student_num"], "2025001")
         self.assertEqual(controller.store.token_record()["source"], "capture")
+
+    def test_capture_for_someone_else_files_a_new_member_without_switching(self):
+        # 抓到的是一个全新的人: 归档成第二个成员, 活动成员不动、也不越权代探活。
+        stranger = dict(self.CRED, token='CAPTURED-2', uid=17980009,
+                        student_num='2025009', card_id='2025009')
+        controller = self.make_controller(capture=FakeCapture(cred=stranger))
+        result = controller._capture_flow()
+        self.assertEqual(result['state'], 'synced')
+        self.assertIn('归档', result['message'])
+        members = controller.store.members_status()
+        self.assertEqual(len(members['items']), 2)
+        self.assertTrue(members['items'][0]['active'], '活动成员不该被别人顶掉')
+        self.assertTrue(members['items'][1]['has_token'])
+        self.assertEqual(controller.store.token(), 'TOKEN')
+
+    def test_capture_add_switches_to_a_newly_filed_member(self):
+        # 「添加成员」的显式意图: 抓到新成员就直接切过去, 不用再手动换档。
+        stranger = dict(self.CRED, token='ADDED-2', uid=17980009,
+                        student_num='2025009', card_id='2025009')
+        controller = self.make_controller(capture=FakeCapture(cred=stranger))
+        self.assertTrue(controller.start('capture_add'))
+        controller._wait_for_work()
+        members = controller.store.members_status()
+        self.assertEqual(len(members['items']), 2)
+        self.assertEqual(controller.store.identity()['student_num'], '2025009',
+                         '添加成员后直接切到新成员')
+        self.assertEqual(controller.store.token(), 'ADDED-2')
+        self.assertEqual(controller.latest['state'], 'synced')
+        self.assertIn('切换', controller.latest['message'])
+
+    def _second_member(self):
+        stranger = dict(self.CRED, token='STRANGER-TOKEN', uid=17980009,
+                        student_num='2025009', card_id='2025009')
+        return self.store.file_captured_credential(stranger)
+
+    def test_sweep_probes_side_members_and_records_their_ledger(self):
+        controller = self.make_controller()
+        filed = self._second_member()
+        with patch.object(LptiyuController, '_probe_alive',
+                          lambda self, client: False):
+            controller._sweep_members()
+        members = controller.store.members_status()
+        side = next(item for item in members['items']
+                    if item['student_num'] == '2025009')
+        self.assertFalse(side['alive'], '旁席成员探活结果进了 TA 的台账')
+
+    def test_sweep_skips_active_member_and_survives_network_faults(self):
+        controller = self.make_controller()
+        filed = self._second_member()
+        probed = []
+
+        def fake_probe(self, client):
+            probed.append(client.identity['uid'])
+            raise RuntimeError('链路故障')
+
+        with patch.object(LptiyuController, '_probe_alive', fake_probe):
+            controller._sweep_members()
+        # 活动成员不巡; 链路故障不判死(alive 保持 None)
+        self.assertEqual(probed, [17980009])
+        members = controller.store.members_status()
+        side = next(item for item in members['items']
+                    if item['student_num'] == '2025009')
+        self.assertIsNone(side['alive'])
+
+    def test_sweep_due_respects_interval_and_busy(self):
+        controller = self.make_controller()
+        settings = self.store.settings()
+        controller._next_sweep = 0.0          # 模拟到点
+        self.assertTrue(controller._sweep_due(settings), '到点触发')
+        self.assertFalse(controller._sweep_due(settings), '到点后进入冷却')
+        controller._sweeping = True
+        self.assertFalse(controller._sweep_due(settings), '巡检中不叠加')
+        controller._sweeping = False
+        controller.busy = True
+        self.assertFalse(controller._sweep_due(settings), '跑步操作中不巡检')
+        # 默认首巡在启动后 5 分钟, 不在第一拍
+        fresh = self.make_controller()
+        self.assertGreater(fresh._next_sweep - time.monotonic(), 240)
 
     def test_capture_timeout_asks_for_another_try(self):
         controller = self.make_controller(capture=FakeCapture(

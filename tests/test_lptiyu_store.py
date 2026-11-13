@@ -82,9 +82,10 @@ class TokenTests(unittest.TestCase):
             self.assertFalse(store.has_token())
             store.save_token_record('ABC123', issued_at='2026-11-11T01:07:18', source='test')
             self.assertTrue(store.has_token())
-            # 密文文件里绝不出现明文 token
-            blob = (store.root / 'session' / 'credential.dat').read_bytes()
-            self.assertNotIn(b'ABC123', blob)
+            # 密文文件里绝不出现明文 token(多成员后落在成员目录下)
+            blobs = list((store.root / 'members').glob('*/session/credential.dat'))
+            self.assertEqual(len(blobs), 1)
+            self.assertNotIn(b'ABC123', blobs[0].read_bytes())
             record = store.token_record()
             self.assertEqual(record['token'], 'ABC123')
             self.assertEqual(record['issued_at'], '2026-11-11T01:07:18')
@@ -484,6 +485,183 @@ class RenewalLedgerTests(unittest.TestCase):
             self.assertIn('[renewed]', store.history())
             store.record_renewal('ok', '凭证可用')
             self.assertEqual(store.history().count('[ok]'), 0)
+
+
+def _legacy_layout(root: Path):
+    """摆一个单槽位时代的成员目录, 与旧版 Store 的落盘布局一致(凭证是真 DPAPI 密文)。"""
+    from windows_credentials import CredentialStore, DpapiProtector
+    (root / 'identity.json').write_text(json.dumps(
+        {'name': '旧成员', 'student_num': '222025321102104', 'uid': '17987537',
+         'school_id': '837', 'card_id': '222025321102104'}), encoding='utf-8')
+    # 旧版凭证 payload 是裸 token 字符串(非 JSON), 走 token_record 的 legacy 分支
+    CredentialStore(root / 'session',
+                    DpapiProtector(machine_scope=False)).save_password('ZW5jcnlwdGVk')
+    (root / 'renewal.json').write_text('{"state": "ok"}', encoding='utf-8')
+
+
+class MemberStoreTests(unittest.TestCase):
+    """成员感知 Store: 迁移、采集归档、切换视图、删除、按成员认领研究库。"""
+
+    CRED = {'token': 'CAPTURED-1', 'uid': 17980001, 'student_num': '2025001',
+            'school_id': '837', 'card_id': '2025001',
+            'issued_at': '2026-11-11T18:00:00', 'source': 'capture'}
+
+    def test_legacy_store_migrates_on_first_member_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store_root = Path(tmp) / 'lptiyu'
+            store_root.mkdir(parents=True)
+            _legacy_layout(store_root)
+            store = Store(store_root)
+            self.assertTrue(store.has_token(), '迁移后的凭证立刻可用')
+            members = store.members_status()
+            self.assertEqual(len(members['items']), 1)
+            self.assertEqual(members['items'][0]['name'], '旧成员',
+                             '迁移直接继承身份里的真名')
+            self.assertTrue(members['items'][0]['has_token'])
+            self.assertEqual(members['items'][0]['student_num'], '222025321102104')
+            self.assertEqual(store.token(), 'ZW5jcnlwdGVk', '旧裸 token 格式照旧能读')
+            self.assertFalse((store_root / 'identity.json').exists(), '旧根不再残留')
+
+    def test_file_captured_credential_creates_and_activates_the_first_member(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            filed = store.file_captured_credential(self.CRED)
+            self.assertTrue(filed['is_active'])
+            self.assertTrue(filed['activated'])
+            members = store.members_status()
+            self.assertEqual(len(members['items']), 1)
+            self.assertEqual(store.token(), 'CAPTURED-1')
+            self.assertEqual(store.identity()['student_num'], '2025001')
+
+    def test_file_captured_credential_overwrites_the_matching_member(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.file_captured_credential(self.CRED)
+            again = dict(self.CRED, token='CAPTURED-2')
+            filed = store.file_captured_credential(again)
+            self.assertTrue(filed['is_active'])
+            self.assertEqual(len(store.members_status()['items']), 1, '同一人不重复建档')
+            self.assertEqual(store.token(), 'CAPTURED-2')
+
+    def test_file_captured_credential_files_a_stranger_without_switching(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.file_captured_credential(self.CRED)
+            stranger = dict(self.CRED, token='STRANGER', uid=17980009,
+                            student_num='2025009', card_id='2025009')
+            filed = store.file_captured_credential(stranger)
+            self.assertFalse(filed['is_active'], '替别人采集不顶掉活动成员')
+            members = store.members_status()
+            self.assertEqual(len(members['items']), 2)
+            self.assertTrue(members['items'][0]['active'])
+            self.assertEqual(store.token(), 'CAPTURED-1')
+            self.assertTrue(members['items'][1]['has_token'])
+            self.assertEqual(members['items'][1]['name'], '2025009', '新成员用学号命名')
+
+    def test_switch_member_changes_identity_and_token_views(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            first = store.file_captured_credential(self.CRED)
+            stranger = dict(self.CRED, token='STRANGER', uid=17980009,
+                            student_num='2025009', card_id='2025009')
+            second = store.file_captured_credential(stranger)
+            store.switch_member(second['id'])
+            self.assertEqual(store.token(), 'STRANGER')
+            self.assertEqual(store.identity()['student_num'], '2025009')
+            store.switch_member(first['id'])
+            self.assertEqual(store.token(), 'CAPTURED-1')
+            self.assertEqual(store.identity()['student_num'], '2025001')
+
+    def test_rename_and_remove_member(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            filed = store.file_captured_credential(self.CRED)
+            renamed = store.rename_member(filed['id'], '柚子')
+            self.assertEqual(renamed.name, '柚子')
+            self.assertEqual(store.members_status()['items'][0]['name'], '柚子')
+            member, leftover = store.remove_member(filed['id'])
+            self.assertEqual(member.name, '柚子')
+            self.assertFalse(leftover)
+            self.assertEqual(store.members_status()['items'], [])
+            self.assertFalse(store.has_token())
+            self.assertFalse((store.root / 'members' / filed['id']).exists(),
+                             '成员目录连同凭证一起删掉')
+
+    def test_sync_files_tokens_per_member(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lab = root / 'lab'
+            (lab / 'data').mkdir(parents=True, exist_ok=True)
+            (lab / 'lpctl.py').write_text('# lab stub\n', encoding='utf-8')
+            config = {'schema': 'lptiyu-lab/1', 'active': '2025001', 'members': {
+                '2025001': {'uid': 17980001, 'school_id': 837, 'student_num': '2025001',
+                            'card_id': '2025001', 'name': '甲', 'alias': '甲',
+                            'auth': {'token': 'LAB-A', 'issued_at': '2026-11-11T19:00:00'}},
+                '2025009': {'uid': 17980009, 'school_id': 837, 'student_num': '2025009',
+                            'card_id': '2025009', 'name': '乙', 'alias': '乙',
+                            'auth': {'token': 'LAB-B', 'issued_at': '2026-11-11T17:00:00'}},
+            }}
+            (lab / 'config.json').write_text(json.dumps(config, ensure_ascii=False),
+                                             encoding='utf-8')
+            store = Store(root / 'store')
+            store.save_settings(Settings(lab_dir=str(lab)))
+            store.file_captured_credential(self.CRED)
+            store.file_captured_credential(dict(self.CRED, token='LOCAL-B', uid=17980009,
+                                                student_num='2025009', card_id='2025009'))
+            changes, _ = store.sync_from_lab()
+            self.assertIn('token', changes)
+            store.switch_member(store.members_status()['items'][0]['id'])
+            self.assertEqual(store.token(), 'LAB-A', '甲认领甲的号')
+            store.switch_member(store.members_status()['items'][1]['id'])
+            self.assertEqual(store.token(), 'LOCAL-B', '乙本机更新, 不被旧号覆盖')
+
+    def test_member_probe_ledger_and_liveness_in_members_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.file_captured_credential(self.CRED)
+            stranger = dict(self.CRED, token='STRANGER', uid=17980009,
+                            student_num='2025009', card_id='2025009')
+            filed = store.file_captured_credential(stranger)
+            # 巡检把旁席成员的探活结果写进 TA 自己的台账
+            store.record_probe(False, member_id=filed['id'])
+            members = store.members_status()
+            items = {item['student_num']: item for item in members['items']}
+            self.assertIsNone(items['2025001']['alive'], '没探过 → None')
+            self.assertFalse(items['2025009']['alive'], '死 → False')
+            store.record_probe(True, member_id=filed['id'])
+            self.assertTrue(store.members_status()['items'][1]['alive'])
+            # member_token_record / member_identity 给巡检用
+            record = store.member_token_record(filed['id'])
+            self.assertEqual(record['token'], 'STRANGER')
+            self.assertEqual(store.member_identity(filed['id'])['student_num'], '2025009')
+            self.assertIsNone(store.member_token_record('bad id'), '坏 id 返回 None')
+
+    def test_members_status_degrades_when_registry_corrupt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.file_captured_credential(self.CRED)
+            (store.root / 'members' / 'members.json').write_text('{bad', encoding='utf-8')
+            members = store.members_status()
+            self.assertTrue(members['error'])
+            self.assertEqual(members['items'], [])
+
+    def test_member_display_name_follows_identity_until_renamed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            store.file_captured_credential(self.CRED)
+            member = store.members_status()['items'][0]
+            self.assertEqual(member['name'], '2025001', '新成员先用学号顶名')
+            store.save_identity({'name': '陈同学', 'student_num': '2025001',
+                                 'uid': '17980001', 'school_id': '837',
+                                 'card_id': '2025001'})
+            self.assertEqual(store.members_status()['items'][0]['name'], '陈同学',
+                             '身份里的真名把自动/学号名顶掉')
+            store.rename_member(member['id'], '柚子')
+            store.save_identity({'name': '另一个名字', 'student_num': '2025001',
+                                 'uid': '17980001', 'school_id': '837',
+                                 'card_id': '2025001'})
+            self.assertEqual(store.members_status()['items'][0]['name'], '柚子',
+                             '用户显式改的名不再被身份覆盖')
 
 
 if __name__ == '__main__':
