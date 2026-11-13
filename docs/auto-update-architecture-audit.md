@@ -99,8 +99,12 @@ Ed25519 公钥、安装包摘要、包元数据、HTTPS 目标约束及安装时
 
 验证范围：Python 1430 项全绿（含新增 `tests/test_update_scheduling.py` 11 项）。新增的
 调度、停滞、状态映射用例已先在修复前的源码上跑过，确认它们确实失败（6 failed + 1 error），
-不是事后写的空测试。**未**在真机安装上验证：需要下一次发布走一遍静默安装，观察 `agent.log`
-里 `(periodic)` 的间隔是否回到 6 小时附近、失败行是否带上 `detail=`。
+不是事后写的空测试。
+
+真机验证（2026-11-13）：v1.9.17 发布后由本机后台代理自动安装，结果 `code=0`，
+`healthy`/`agent_restarted`/`relaunched` 均为 true；新 agent 在安装结果写入之后 **16 分半**
+就自己跑了下一次检查（21:11:25 写入结果 → 21:27:58 `automatic update (periodic)`，
+`state=up_to_date current=1.9.17`）。修复前同一条路径会把这次检查排到 6 小时后（约 03:11）。
 
 ## 官方参考
 

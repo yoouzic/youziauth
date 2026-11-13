@@ -48,6 +48,24 @@
 
 本地证据包括 `.scratch/live-upgrade-verification-1.8.29.json`、`.scratch/live-upgrade-verification-1.8.30.json`，它们保留原始生命周期/管道/发布快照与安装结果。两轮结果另分别保存为 `.scratch/install-result-after-1.8.29.json`、`.scratch/install-result-after-1.8.30.json`，避免下一轮覆盖历史证据。逐时观测为 `.scratch/auto-update-live-evidence.jsonl` 和 `.scratch/update-process-evidence.jsonl`。
 
+## 2026-11-13 v1.9.17：调度修复的发布与真机安装验收
+
+这一版修的是后台检查的排期（逐条缺陷见 [架构审计](auto-update-architecture-audit.md) 的
+2026-11-13 追加小节）。发布与安装都走常规流程，没有绕过签名，也没有手动装包：
+
+| 项 | 结果 |
+| --- | --- |
+| 发布工作流 | [v1.9.17](https://github.com/yoouzic/youziauth/actions/runs/43430602738) 全部通过（3m46s）；`main` 的 CI 同步通过 |
+| 资产 | `youziauth.msi` 70,104,337 字节，SHA256 `5b3c56965e08954af14bc5f4c782b952d4b07c8fdd559353a1072bc43adabbde` 与 `SHA256SUMS.txt` 一致 |
+| 签名 | 用仓库内置公钥跑 `tools/sign_release.py --verify-signature-file` 复核通过 |
+| 客户端验收规则 | 把 GitHub API 的真实响应喂给 `app_update.release_assets()`：四项资产（含可选 `release-notes.md`）全部被接受；非草稿、非预发布 |
+| 更新说明 | `release-notes.md` 与 `docs/release-notes/v1.9.17.md` 只差 CI 检出的 CRLF；`app_update.read_notes` 解析出 7 条，界面实际显示的就是这 7 条 |
+| 本机安装 | 21:10:30 由固定 `check-update` 指令触发，21:11:25 写入结果：`code=0`，`healthy`/`agent_restarted`/`relaunched` 均为 true，`VERSION` 由 1.9.16 变为 1.9.17 |
+| 新排期实测 | 安装结果写入后 16 分半，新 agent 自己跑了下一次检查：21:11:25 写入 → 21:27:58 `automatic update (periodic) state=up_to_date current=1.9.17`。修复前这条路径会把它排到 6 小时后（约 03:11），正是「装完就再也轮不到」的成因 |
+
+边界：这次安装由 1.9.16 的旧 agent 执行（修复要等 1.9.17 的 agent 起来才生效），所以
+"自动安装成功"证明的是发布包可被安装；"新排期生效"由上表的最后一行单独证明。
+
 ## 证据范围
 
 本机是已有安装，未卸载或清空用户配置来伪装全新安装。首次安装分支已通过源码回归、Windows 原生权限夹具及实际 MSI 表验证；尚未在干净 Windows 环境计数 UAC 弹窗。真实连续升级结果不能替代这一独立场景。
