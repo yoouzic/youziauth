@@ -39,9 +39,20 @@ AXIS_PRIORS = {
 }
 
 # 拟合出来的真跑道中心线(参数化体育场: 两段直道 + 两个半圆)。
-# 1875 是唯一有真人轨迹可拟合的场地: 226 点、残差 RMS 5.1m、单圈 460m。
 # 有这条线就沿着它跑 —— 这才是真正的「贴着跑道」, 而不是围着打卡点绕一圈。
+#   1875 真人轨迹拟合: 226 点、残差 RMS 5.1m、单圈 460m。
+#   1874 卫星影像拟合: 1874 的打卡点在东北端挤成一团(两个点只隔 33m), 围着打卡点
+#        铺环时那段弯道弧被压成贴弦的浅弧, 轨迹从内场凹进去。没有真人轨迹, 就从
+#        高德卫星影像(z18) 按塑胶跑道颜色提取跑道外边界, 再拟合体育场参数:
+#        外边界半径 37.6m、残差 RMS 2.2m, 内收半带宽 4.5m 得中心线, 单圈 320m。
+#        东北弯道比对称模型瘦一圈(弧顶偏外 3~5m, 分道线/边界样本都指向同一侧),
+#        所以 NE 弯心单独西移: cap_u_ne=25.0(对称值是 half_s=31.2), SW 弯不动。
+#        校准: 服务端实测打卡点距中心线 1.7~13.1m, 我们这侧打卡点 3.4~14.7m,
+#        全在 40m 判定半径内; 打卡点环形状变了护栏(_checkpoints_near)会兜回旧路径。
 STADIUM_PRIORS = {
+    '1874': {'center': (29.823774, 106.430968), 'axis_deg': 42.3,
+             'half_s': 31.2, 'radius': 33.1, 'cap_u_ne': 25.0,
+             'source': 'satellite_trace'},
     '1875': {'center': (29.816262, 106.421014), 'axis_deg': 15.5,
              'half_s': 48.8, 'radius': 42.2, 'source': 'crowd_track'},
 }
@@ -542,24 +553,34 @@ def _rotate_to_start(loop, xy, start_deg):
 
 
 def stadium_line(prior, lane_m=0.0, spacing_m=12.0, direction='ccw', start_deg=None):
-    """把拟合的体育场中心线铺成闭合点列(ENU 相对中心), 车道沿外法线偏移。"""
+    """把拟合的体育场中心线铺成闭合点列(ENU 相对中心), 车道沿外法线偏移。
+
+    弯道圆心默认在 ±half_s; prior 可用 cap_u_ne/cap_u_sw 单独指定 —— 真跑道两端
+    弯道不总是一样大(1874 的东北弯就比对称模型瘦一圈), 直道端点跟弯心走, 半径
+    共用 radius 才能和两条直道保持相切。lane 只扩 radius: 圆心不动, 圆变大仍然
+    与外扩后的直道相切(旧实现连 half_s 一起加, 会让弯道顶端多飘出一个 lane)。
+    """
     axis = float(prior['axis_deg'])
-    half_s = float(prior['half_s']) + abs(lane_m)
+    half_s = float(prior['half_s'])
     radius = float(prior['radius']) + abs(lane_m)
+    cap_ne = prior.get('cap_u_ne')
+    cap_sw = prior.get('cap_u_sw')
+    u_ne = half_s if cap_ne is None else float(cap_ne)
+    u_sw = -half_s if cap_sw is None else float(cap_sw)
     step = max(3.0, float(spacing_m or 12.0))
     path = []
-    n_straight = max(2, int(round(2 * half_s / step)))
+    n_straight = max(2, int(round((u_ne - u_sw) / step)))
     for k in range(n_straight):
-        path.append((-half_s + 2 * half_s * k / n_straight, -radius))
+        path.append((u_sw + (u_ne - u_sw) * k / n_straight, -radius))
     arc = max(10, int(round(math.pi * radius / step)))
     for k in range(arc + 1):
         ang = -math.pi / 2 + math.pi * k / arc
-        path.append((half_s + radius * math.cos(ang), radius * math.sin(ang)))
+        path.append((u_ne + radius * math.cos(ang), radius * math.sin(ang)))
     for k in range(n_straight):
-        path.append((half_s - 2 * half_s * k / n_straight, radius))
+        path.append((u_ne - (u_ne - u_sw) * k / n_straight, radius))
     for k in range(arc + 1):
         ang = math.pi / 2 + math.pi * k / arc
-        path.append((-half_s + radius * math.cos(ang), radius * math.sin(ang)))
+        path.append((u_sw + radius * math.cos(ang), radius * math.sin(ang)))
     path.append(path[0])
     loop = _axis_unframe(path, axis)
     if str(direction or 'ccw').lower() == 'cw':

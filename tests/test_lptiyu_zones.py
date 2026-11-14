@@ -310,6 +310,71 @@ class StadiumPriorTests(unittest.TestCase):
         self.assertLess(len(route), 60, '别的跑区不该套用 1875 的跑道')
 
 
+class FirstFieldPriorTests(unittest.TestCase):
+    """1874 没有真人轨迹, 从卫星影像拟合出跑道中心线。
+
+    它的打卡点在东北端挤成一团(最近两点只隔 33m), 围着打卡点铺环会把那段弯道
+    压成贴弦的浅弧, 轨迹从内场凹进去; 有拟合线就必须沿真跑道跑。
+    """
+
+    POINTS = [(29.823896, 106.431411), (29.823779, 106.430558),
+              (29.824142, 106.431239), (29.823249, 106.430987)]
+
+    def route(self):
+        prof = zones.profile(self.POINTS, zone_id='1874')
+        return zones.route_points(self.POINTS, lane_m=prof['lane_m'],
+                                  direction=prof['direction'],
+                                  start_deg=prof['start_deg'],
+                                  rnd=random.Random(7), zone_id='1874')
+
+    def test_the_route_follows_the_fitted_track(self):
+        route = self.route()
+        clat = sum(p[0] for p in route) / len(route)
+        clng = sum(p[1] for p in route) / len(route)
+        rxy = [((p[1] - clng) * 111320 * math.cos(math.radians(clat)),
+                (p[0] - clat) * 110570) for p in route]
+        lap = sum(math.dist(rxy[i], rxy[i + 1]) for i in range(len(rxy) - 1))
+        self.assertAlmostEqual(lap, 320.0, delta=25.0, msg=f'单圈 {lap:.0f}m 应接近 320m')
+        theta = math.radians(42.3)
+        us = [x * math.sin(theta) + y * math.cos(theta) for x, y in rxy]
+        vs = [x * math.cos(theta) - y * math.sin(theta) for x, y in rxy]
+        self.assertAlmostEqual(max(us) - min(us), 122.4, delta=20.0)
+        self.assertAlmostEqual(max(vs) - min(vs), 66.2, delta=15.0)
+
+    def test_the_northeast_cap_is_pulled_in(self):
+        # 真跑道的东北弯比对称模型瘦一圈: cap_u_ne=25.0 要真的落到弧上,
+        # 弧顶(沿长轴最远点, 相对先验中心) = cap_u_ne+radius = 58.1m,
+        # 对称模型是 half_s+radius = 64.3m。
+        route = self.route()
+        plat, plng = zones.STADIUM_PRIORS['1874']['center']
+        rxy = [((p[1] - plng) * 111320 * math.cos(math.radians(plat)),
+                (p[0] - plat) * 110570) for p in route]
+        theta = math.radians(42.3)
+        us = [x * math.sin(theta) + y * math.cos(theta) for x, y in rxy]
+        self.assertAlmostEqual(max(us), 58.1, delta=3.0,
+                               msg=f'NE 弯弧顶 {max(us):.1f}m, cap_u_ne 没生效')
+
+    def test_every_checkpoint_sits_near_that_track(self):
+        route = self.route()
+        clat = sum(p[0] for p in self.POINTS) / len(self.POINTS)
+        clng = sum(p[1] for p in self.POINTS) / len(self.POINTS)
+        rxy = [((p[1] - clng) * 111320 * math.cos(math.radians(clat)),
+                (p[0] - clat) * 110570) for p in route]
+        for lat, lng in self.POINTS:
+            px = (lng - clng) * 111320 * math.cos(math.radians(clat))
+            py = (lat - clat) * 110570
+            nearest = min(math.hypot(x - px, y - py) for x, y in rxy)
+            self.assertLess(nearest, 25.0, f'打卡点离拟合跑道 {nearest:.1f}m, 超出判定半径')
+
+    def test_off_shape_points_fall_back_to_the_checkpoint_loop(self):
+        # flow 测试里的合成点位铺得比真场地大得多, 护栏必须兜回打卡点环
+        points = [(29.8237, 106.4302), (29.8245, 106.4315),
+                  (29.8231, 106.4318), (29.8223, 106.4305)]
+        route = zones.route_points(points, lane_m=0, direction='ccw',
+                                   rnd=random.Random(7), zone_id='1874')
+        self.assertGreater(len(route), 60, '形状对不上就该放弃拟合线, 回到打卡点环')
+
+
 class RoundedLoopTests(unittest.TestCase):
     """菱形点位(边长接近)不能走半圆弯兜底: 那样两个打卡点会漏掉。"""
 
