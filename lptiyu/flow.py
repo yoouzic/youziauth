@@ -51,7 +51,7 @@ def pace_text(seconds_per_km):
 class DailyFlow:
     def __init__(self, slot, policy=None, verbose=True, stop_event=None,
                  log_fn=None, template_path="", zone_profile=None, zone_tuning=None,
-                 zone_sink=None):
+                 zone_sink=None, progress_fn=None):
         self.slot = slot
         # zone_tuning: 该跑区的人工特调(方向/贴点半径/跑道偏移); 每次读到真机
         # 点位后由 zones.profile() 折成 zone_profile。zone_sink 让调用方留档。
@@ -66,10 +66,20 @@ class DailyFlow:
                             "dist_lo": 2.03, "dist_hi": 2.35}, **(policy or {}))
         self.v = verbose
         self.log_fn = log_fn or (lambda msg: None)   # UI/无控制台环境必须可注入
+        # 进度上报 progress_fn(stage, text): stage 是界面的固定阶段号 ——
+        # 1=准备凭证(调用方自己报) 2=生成轨迹 3=提交成绩 4=等待判定。
+        # 上报失败绝不打断主流程, 和 log_fn 同一待遇。
+        self.progress_fn = progress_fn or (lambda stage, text: None)
         self.template_path = template_path or ""
         self.rnd = random.Random()
         self.stop_event = stop_event or threading.Event()
         self.lines = []                              # 本次运行的过程日志(留档)
+
+    def _report(self, stage, text):
+        try:
+            self.progress_fn(stage, text)
+        except Exception:              # pragma: no cover —— 进度坏了不算跑步坏了
+            pass
 
     def _pace_window(self):
         """用户配速区间 (lo, hi) 秒/公里; (0, 0) = 不指定, 交给模板/默认。
@@ -214,9 +224,12 @@ class DailyFlow:
         anchor_max = float(self.zone_profile.get("anchor_m")
                            or self.policy.get("anchor_max_m",
                                               spec.CHECKIN_RADIUS_M))
+        self._report(2, '正在生成跑步轨迹…')
         if style == "template":
             try:
                 for attempt in range(10):
+                    if attempt:
+                        self._report(2, f'轨迹参数未达标，重新生成（第 {attempt + 1} 次尝试）…')
                     target = self.rnd.uniform(lo, hi)
                     anchor_dicts = [{"point_id": p[2], "latitude": p[0],
                                      "longtitude": p[1]} for p in rule["pts"]]
@@ -246,6 +259,8 @@ class DailyFlow:
                 self.log("[4] 模板缺失 → 自动改用 ring 引擎")
             style = "ring"
         for attempt in range(12):
+            if attempt:
+                self._report(2, f'轨迹参数未达标，重新生成（第 {attempt + 1} 次尝试）…')
             target_m = self.rnd.uniform(lo, hi) * 1000
             track, crossings, used, dist_km = TRK.ring_track(
                 rule["pts"], target_m, self.rnd, profile=self.zone_profile)
@@ -276,6 +291,7 @@ class DailyFlow:
         | 3 额度满 | 4 其他失败 | 5 受理但判无效 | 9 中断。"""
         client = self.slot.make_client(pace=0.8)
         try:
+            self._report(2, '正在连接小程序并读取跑区…')
             self._gate(client)
             rule = self._zone_rule(client)
             if zone_override and zone_override != rule["zone"]:
@@ -353,6 +369,7 @@ class DailyFlow:
                 return out, 0
 
             self._sleep(self.rnd.uniform(0.4, 1.2))
+            self._report(3, '正在上传轨迹数据…')
             sts = client.oss_sts()
             if not isinstance(sts, dict) or "AccessKeySecret" not in sts:
                 raise ApiError(4, f"getOssSts 异常: {str(sts)[:200]}")
@@ -363,6 +380,7 @@ class DailyFlow:
                 raise ApiError(4, f"OSS 上传失败: {rbody[:600]}")
 
             self._sleep(self.rnd.uniform(0.8, 2.4))
+            self._report(3, '正在提交跑步成绩…')
             self.log(f"[7] stopRun 距离={dist_km}km 用时={used}s "
                      f"步数={step_num} 配速={int(used / dist_km)}s/km")
             resp = client.stop_run(biz)
@@ -370,6 +388,7 @@ class DailyFlow:
 
             detail = None
             if isinstance(resp, dict) and resp.get("record_id"):
+                self._report(4, '成绩已提交，等待学校判定…')
                 self._sleep(self.rnd.uniform(2.5, 6.0))
                 detail = client.record_detail(resp["record_id"])
                 if isinstance(detail, dict):

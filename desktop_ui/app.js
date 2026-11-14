@@ -8,6 +8,7 @@ let sourceDirty = false, sourceRevision = 0;
 let api;
 let mapState = null;
 let mapDrag = null, mapSuppressPick = false, mapNameFor = null, accountNameFor = null, memberNameFor = null;
+let lpMemberShown = null, lpMemberFlip = false;   // 主卡成员标记: 换人时闪一下
 const MAP_TILE = 256, MAP_MIN_ZOOM = 13, MAP_MAX_ZOOM = 19;
 const MAP_TILE_TRIES = 3, MAP_TILE_BACKOFF = [1200, 4000];  // ms before each retry of one tile
 const MAP_TILE_STALL = 8000;   // ms with nothing drawn before the next provider takes the frame
@@ -801,11 +802,17 @@ function renewalText(lp,rn){
 function renderRunStatus(lp,s){
   const label=lp.busy?'正在处理…':(LP_NAMES[lp.state]||'请查看任务状态');
   const tone=lp.state==='signed'?'success':['need_token','error','uncertain','quota'].includes(lp.state)?'warning':'';
+  const member=activeMember();
+  const who=(member&&member.name)||(lp.identity&&lp.identity.name)||'';
   badge('lp-badge',label,tone);badge('lp-task-badge',label,tone);
   $('lp-headline').textContent=label;
-  $('lp-summary').textContent=lp.message;
-  const message=lp.busy?'正在处理，请稍候。':lp.message;
+  // 首页「今日乐跑」卡把跑步的人放在最前面: 换了号一眼就能看出来。
+  $('lp-summary').textContent=(who?who+' · ':'')+lp.message;
+  // busy 时状态行跟着当前阶段的文案走: 后端把阶段文案放在 message 里,
+  // 有 progress 就直接用它; 老后端没有 progress, 退回通用文案。
+  const message=lp.busy?(lp.progress?lp.message:'正在处理，请稍候。'):lp.message;
   if($('lp-message').textContent!==message)$('lp-message').textContent=message;
+  renderLpSteps(lp);
   $('lp-details').hidden=!s.run_time;
   if(s.run_time){
     // 名称以zone区块为准(它按跑区目录校正过); 只有拿不到名字才退到 id。
@@ -907,7 +914,60 @@ function renderLptiyu(){
   renderRunStatus(lp,settings);
   renderRunCredential(lp);
   renderMembers(lp);
+  renderActiveMemberChip(lp);
   renderRunSettings(lp,settings);
+}
+/* 跑步进度: 后端在 busy 期间给 progress={step,total,labels,text}, 这里画成分段
+   进度条 —— 每段是固定阶段(准备凭证/生成轨迹/提交成绩/等待判定), 做完的填实,
+   在做的描蓝脉冲。收尾状态和老快照没有 progress, 整条隐藏。 */
+function renderLpSteps(lp){
+  const strip=$('lp-steps');
+  if(!strip)return;
+  const progress=lp.busy?lp.progress:null;
+  const labels=progress&&Array.isArray(progress.labels)?progress.labels:null;
+  if(!labels||!progress.total){
+    strip.hidden=true;
+    if(strip.children.length)strip.replaceChildren();
+    strip.dataset.signature='';
+    return;
+  }
+  const signature=labels.join('|')+'#'+progress.step+'#'+progress.total;
+  if(strip.dataset.signature!==signature){
+    strip.dataset.signature=signature;
+    strip.replaceChildren(...labels.map((label,index)=>{
+      const item=document.createElement('li');
+      const step=index+1;
+      item.textContent=label;
+      item.className=step<progress.step?'done':(step===progress.step?'active':'');
+      return item;
+    }));
+  }
+  strip.hidden=false;
+}
+/* 主卡成员标记: 成员栏在下卡的凭证区, 跑步的人不在上卡根本看不见 —— 换号
+   成不成功全靠 toast 一闪。这里把「当前成员」常驻在主卡, 换人时闪一下。 */
+function renderActiveMemberChip(lp){
+  const chip=$('lp-active-member');
+  if(!chip)return;
+  const member=activeMember();
+  const name=(member&&member.name)||(lp.identity&&lp.identity.name)||'';
+  const num=(member&&member.student_num)||(lp.identity&&lp.identity.student_num)||'';
+  if(!name){
+    chip.hidden=true;
+    $('lp-active-member-name').textContent='';
+    lpMemberShown=null;
+    return;
+  }
+  const text=`当前成员：${name}`+(num?` · ${num}`:'');
+  $('lp-active-member-name').textContent=text;
+  chip.hidden=false;
+  if(lpMemberShown!==null&&lpMemberShown!==text){
+    // 两个动画类交替着加, CSS 动画才会真的重放(同一家不加不减是不会重播的)。
+    lpMemberFlip=!lpMemberFlip;
+    chip.classList.toggle('flash-a',lpMemberFlip);
+    chip.classList.toggle('flash-b',!lpMemberFlip);
+  }
+  lpMemberShown=text;
 }
 /* 乐跑成员 -----------------------------------------------------------------------------------
    成员清单与打卡账号同一套交互: 下拉切换、添加(= 采集, 抓到谁归档给谁)、重命名、删除(= 退出账号)。

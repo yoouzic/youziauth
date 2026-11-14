@@ -1290,6 +1290,20 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertEqual(state['identity']['name'], '陈同学')
         self.assertIn('自动跑步', state['schedule'])
 
+    def test_snapshot_carries_run_progress_for_the_ui(self):
+        self.controller._progress(2, 4,
+                                  ['准备凭证', '生成轨迹', '提交成绩', '等待判定'],
+                                  '正在生成跑步轨迹…')
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertEqual(state['state'], 'running')
+        self.assertEqual(state['progress'], {'step': 2, 'total': 4,
+                                             'labels': ['准备凭证', '生成轨迹',
+                                                        '提交成绩', '等待判定']})
+        # 收尾状态把进度摘掉, 界面的进度条才不会挂在结果上
+        self.controller._set_latest('signed', '今日跑步已完成')
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertIsNone(state['progress'])
+
     def test_snapshot_exposes_the_member_list_without_secrets(self):
         state = self.bridge.snapshot()['lptiyu']
         members = state['members']

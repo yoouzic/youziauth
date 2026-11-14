@@ -30,6 +30,12 @@ class FakeFlow:
 
     def run(self, submit, zone_override=None):
         self.calls.append({'submit': submit, 'zone': zone_override})
+        # 真 DailyFlow 在这些阶段会上报进度; 假流程照搬, 让面板的接线可被断言。
+        if getattr(self, 'progress_fn', None):
+            self.progress_fn(2, '正在生成跑步轨迹…')
+            if submit:
+                self.progress_fn(3, '正在提交跑步成绩…')
+                self.progress_fn(4, '成绩已提交，等待学校判定…')
         return (self.summary if self.code in (0, 5) else None), self.code
 
 
@@ -100,6 +106,39 @@ class ExecuteTests(PanelTestCase):
         self.assertTrue(controller.store.is_signed_today())
         self.assertTrue(controller.store.has_token(), '提交成功后凭证必须保留给下一次')
         self.assertEqual(controller.store.daily().get('run'), 1)
+
+    def test_run_reports_stage_progress_and_clears_it_at_the_end(self):
+        controller = self.make_controller(code=0)
+        seen = []
+        original = LptiyuController._progress
+
+        def spy(step, total, labels, text):
+            seen.append((step, total, tuple(labels), text))
+            return original(controller, step, total, labels, text)
+
+        with patch.object(LptiyuController, '_progress', side_effect=spy):
+            result = controller._execute(submit=True)
+        self.assertEqual(result['state'], 'signed')
+        self.assertIsNone(result['progress'], '收尾状态不能还挂着进度条')
+        # 1 凭证(两拍) → 2 生成 → 3 提交 → 4 等待判定: 每个阶段都要有一拍
+        self.assertEqual([row[0] for row in seen], [1, 1, 2, 3, 4])
+        self.assertEqual(seen[0][2], ('准备凭证', '生成轨迹', '提交成绩', '等待判定'))
+        self.assertIn('正在生成跑步轨迹…', [row[3] for row in seen])
+
+    def test_dry_run_progress_has_three_stages(self):
+        controller = self.make_controller(code=0)
+        seen = []
+        original = LptiyuController._progress
+
+        def spy(step, total, labels, text):
+            seen.append((step, total, tuple(labels)))
+            return original(controller, step, total, labels, text)
+
+        with patch.object(LptiyuController, '_progress', side_effect=spy):
+            result = controller._execute(submit=False)
+        self.assertEqual(result['state'], 'checked')
+        self.assertEqual([row[0] for row in seen], [1, 1, 2], '验证不提交, 没有第三/四段')
+        self.assertEqual(seen[0][2], ('准备凭证', '生成轨迹', '本地校验'))
 
     def test_zone_override_comes_from_settings(self):
         controller = self.make_controller(code=0, settings=Settings(zone_id='1873'))

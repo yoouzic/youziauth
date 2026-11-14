@@ -98,6 +98,13 @@ function harness(source='windows',extras={}){
     calls.push({action,payload});
     if(action==='dorm_save')Object.assign(data.dorm.settings,payload);
     if(action==='lptiyu_save')Object.assign(data.lptiyu.settings,payload);
+    if(action==='lptiyu_member_switch'){
+      const items=(data.lptiyu.members?.items||[]).map(item=>({...item,active:item.id===payload.id}));
+      const picked=items.find(item=>item.active);
+      data.lptiyu.members={...(data.lptiyu.members||{max:5,items:[]}),active:payload.id,items};
+      data.lptiyu.identity={name:picked?.name||'',student_num:picked?.student_num||''};
+      return {ok:true,message:`已切换到「${picked?.name||payload.id}」`};
+    }
     if(action==='location_source_save')data.dorm.settings.location_source=payload.location_source;
     if(action==='simulation_point_save'){
       if(payload.latitude===null||typeof payload.latitude!=='number')return {ok:false,message:'选点坐标无效，请在地图上重新选择。'};
@@ -2087,12 +2094,55 @@ test('lptiyu states read as their own words on the overview card and the page',a
   const h=await lptiyuPage({state:'signed',message:"今日跑步已完成 · 2.98km · 配速 4'02\"/km",
     has_token:true,token_age_hours:3.2,identity:{name:'陈同学',student_num:'222025321102104'}});
   assert.equal(h.el('lp-badge').textContent,'今日已完成');
-  assert.equal(h.el('lp-summary').textContent,"今日跑步已完成 · 2.98km · 配速 4'02\"/km");
+  // 首页卡把跑步的人放在最前面: 换号成没成功, 在主卡上就能直接看出来。
+  assert.equal(h.el('lp-summary').textContent,"陈同学 · 今日跑步已完成 · 2.98km · 配速 4'02\"/km");
   assert.equal(h.el('lp-token-badge').textContent,'凭证就绪');
   assert.match(h.el('lp-credential-line').textContent,/3\.2 小时前同步/);
   assert.equal(h.el('lp-first-use').hidden,true);
   assert.equal(h.el('lp-identity-line').textContent,'当前成员：陈同学');
+  assert.match(h.el('lp-active-member-name').textContent,/当前成员：陈同学 · 222025321102104/);
+  assert.equal(h.el('lp-active-member').classList.contains('flash-a'),false,'首屏不闪, 换人才闪');
   assert.equal(h.el('lp-submit').disabled,true,'今日已完成时不再提供第二次提交');
+});
+
+test('run progress renders as staged steps while busy and clears when done',async()=>{
+  const h=await lptiyuPage({state:'running',busy:true,message:'正在生成跑步轨迹…',
+    progress:{step:2,total:4,labels:['准备凭证','生成轨迹','提交成绩','等待判定']}});
+  const strip=h.el('lp-steps');
+  assert.equal(strip.hidden,false);
+  assert.equal(strip.children.length,4);
+  assert.equal(strip.children[0].className,'done');
+  assert.equal(strip.children[1].className,'active');
+  assert.equal(strip.children[2].className,'');
+  assert.equal(strip.children[3].className,'');
+  // 页面状态行跟着当前阶段的文案走, 不再是千篇一律的「正在处理」
+  assert.match(h.el('lp-message').textContent,/正在生成跑步轨迹/);
+  assert.match(h.el('lp-summary').textContent,/正在生成跑步轨迹/);
+  const done=await lptiyuPage({state:'signed',busy:false,message:'今日跑步已完成'});
+  assert.equal(done.el('lp-steps').hidden,true);
+});
+
+test('a busy snapshot without progress keeps the strip hidden for old backends',async()=>{
+  const h=await lptiyuPage({state:'running',busy:true,message:'正在处理今天的跑步…'});
+  assert.equal(h.el('lp-steps').hidden,true);
+});
+
+test('switching members updates the main card chip and flashes it',async()=>{
+  const h=await lptiyuPage({members:{max:5,active:'m1',error:'',items:[
+    {id:'m1',name:'张三',student_num:'2025001',uid:'u1',active:true,has_token:true,alive:true},
+    {id:'m2',name:'李四',student_num:'2025002',uid:'u2',active:false,has_token:true,alive:true}]}});
+  const chip=h.el('lp-active-member');
+  assert.equal(chip.hidden,false);
+  assert.match(h.el('lp-active-member-name').textContent,/当前成员：张三 · 2025001/);
+  assert.equal(chip.classList.contains('flash-a'),false);
+  assert.equal(chip.classList.contains('flash-b'),false,'首屏不闪, 换人才闪');
+  h.el('lp-member').value='m2';
+  h.el('lp-member').fire('change');
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(h.calls.at(-1).action,'lptiyu_member_switch');
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1).payload)),{id:'m2'});
+  assert.match(h.el('lp-active-member-name').textContent,/当前成员：李四 · 2025002/);
+  assert.equal(chip.classList.contains('flash-a'),true,'换人要闪一下给出反馈');
 });
 
 test('lptiyu without a credential shows the official first-use guide',async()=>{

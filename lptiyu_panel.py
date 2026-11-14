@@ -242,9 +242,10 @@ class LptiyuController:
         self._set_latest('idle', '尚未开始今天的跑步', record=False)
 
     # ------------------------------------------------------------- 状态
-    def _set_latest(self, state, message, detail='', record=True):
+    def _set_latest(self, state, message, detail='', record=True, progress=None):
         result = {'state': state, 'message': message, 'detail': detail,
-                  'at': self._clock().isoformat(timespec='seconds')}
+                  'at': self._clock().isoformat(timespec='seconds'),
+                  'progress': progress if isinstance(progress, dict) else None}
         self.latest = result
         if record:
             try:
@@ -252,6 +253,16 @@ class LptiyuController:
             except Exception:  # noqa: BLE001 —— 状态记录失败不影响主流程
                 pass
         return result
+
+    def _progress(self, step, total, labels, text):
+        """跑步进行中的一拍进度: 只刷 latest, 不写运行记录(历史留给结果)。
+
+        step/total 给界面画分段进度条, labels 是每段的固定叫法, text 是这一拍
+        的具体动作。收尾状态(signed/error/…)不带 progress, 进度条自然消失。
+        """
+        return self._set_latest('running', text, record=False,
+                                progress={'step': int(step), 'total': int(total),
+                                          'labels': [str(x) for x in labels]})
 
     def _push(self, result):
         self.events.put(result)
@@ -934,9 +945,12 @@ class LptiyuController:
             raise                     # 网络类故障不判死, 让上层按 error 呈现
         return True
 
-    def _flow(self, settings):
+    def _flow(self, settings, progress_fn=None):
         if self._flow_factory is not None:
-            return self._flow_factory(self.slot, settings)
+            flow = self._flow_factory(self.slot, settings)
+            # 测试/注入的流程对象没有 progress_fn 形参, 统一按属性挂上。
+            flow.progress_fn = progress_fn or (lambda stage, text: None)
+            return flow
         pace_lo, pace_hi = settings.pace_range()
         policy = {
             'max_per_day': settings.max_per_day,
@@ -959,9 +973,17 @@ class LptiyuController:
                                      log_fn=lambda message: None,
                                      template_path=template_path,
                                      zone_tuning=self.store.zone_tuning(settings.zone_id),
-                                     zone_sink=self._zone_sink)
+                                     zone_sink=self._zone_sink,
+                                     progress_fn=progress_fn)
 
     def _execute(self, submit):
+        # 界面的分段进度条: 提交跑 4 段, 本地验证不提交只有 3 段。
+        labels = ['准备凭证', '生成轨迹', '提交成绩', '等待判定'] if submit \
+            else ['准备凭证', '生成轨迹', '本地校验']
+        total = len(labels)
+        self._progress(1, total, labels,
+                       '开始今天的跑步：正在检查凭证与账号状态…' if submit
+                       else '开始验证：正在检查凭证与账号状态…')
         settings = self.store.settings()
         try:
             record = self._ensure_credentials()
@@ -973,8 +995,7 @@ class LptiyuController:
                     'need_token',
                     '本机没有可用凭证：正在自动采集，微信打开小程序后就会继续') from None
             raise
-        self._set_latest('running', '正在处理今天的跑步…' if submit else '正在验证全链路…',
-                         record=False)
+        self._progress(1, total, labels, '凭证就绪，正在确认账号状态…')
         client = self.slot.make_client(pace=0.8)
         if not self._probe_alive(client):
             self.slot.mark_dead()
@@ -992,7 +1013,8 @@ class LptiyuController:
                 raise LptiyuError('need_token', outcome.message)
             client = self.slot.make_client(pace=0.8)
 
-        flow = self._flow(settings)
+        flow = self._flow(settings, progress_fn=lambda stage, text:
+                          self._progress(stage, total, labels, text))
         summary, code = flow.run(submit=submit, zone_override=settings.zone_id or None)
         if submit and isinstance(summary, dict):
             self._record_sample(summary, settings)

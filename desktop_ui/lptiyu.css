@@ -232,3 +232,130 @@
 .lp-member-bar input{flex:0 1 132px;min-width:0}
 .lp-member-bar button{padding:6px 10px;min-height:34px;font-size:12px}
 #lp-member-state{margin-top:8px}
+
+/* 跑步进度: busy 期间的分段进度条, 每段一个固定阶段 ------------------------- */
+.lp-steps {
+  list-style: none;
+  display: flex;
+  gap: 8px;
+  padding: 0;
+  margin: 0 0 12px;
+}
+
+.lp-steps li {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+  padding: 7px 10px 7px 14px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: rgba(232, 236, 240, .4);
+  white-space: nowrap;
+  transition: color .2s, border-color .2s, background .2s;
+}
+
+.lp-steps li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--border);
+  transition: background .2s;
+}
+
+.lp-steps li.done {
+  color: var(--green);
+  border-color: #ced9ca;
+  background: #e2e9df66;
+}
+
+.lp-steps li.done::before {
+  background: var(--green);
+}
+
+.lp-steps li.active {
+  color: var(--strong);
+  font-weight: 600;
+  border-color: var(--blue);
+  background: #fffefa;
+}
+
+.lp-steps li.active::before {
+  background: var(--blue);
+  animation: lp-step-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes lp-step-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .3; }
+}
+
+/* 主卡成员标记: 常驻显示当前跑步的人, 换号时闪一下给出明确反馈 -------------- */
+.lp-member-now {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 6px 13px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--soft);
+  color: var(--blue);
+  font-size: 12px;
+  width: fit-content;
+}
+
+.lp-member-now .bi {
+  font-size: 13px;
+  color: var(--green);
+}
+
+.lp-member-now::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  flex-shrink: 0;
+}
+
+/* flash-a / flash-b 指向同一组关键帧: 交替加类才能让动画在每次换人时重放 */
+.lp-member-now.flash-a {
+  animation: lp-member-flash 1.5s ease;
+}
+
+.lp-member-now.flash-b {
+  animation: lp-member-flash 1.5s ease;
+}
+
+@keyframes lp-member-flash {
+  0% {
+    background: #e2e9df;
+    border-color: #ced9ca;
+    color: var(--green);
+    transform: translateY(-1px);
+  }
+  55% {
+    background: #e2e9df;
+    border-color: #ced9ca;
+    color: var(--green);
+  }
+  100% {
+    background: var(--soft);
+    border-color: var(--border);
+    color: var(--blue);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lp-steps li.active::before,
+  .lp-member-now.flash-a,
+  .lp-member-now.flash-b {
+    animation: none;
+  }
+}

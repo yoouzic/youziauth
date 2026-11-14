@@ -388,7 +388,7 @@ class DesktopBridge(LocationProbe):
                  'available': False, 'settings': None, 'schedule': '',
                  'identity': {}, 'has_token': False, 'token_age_hours': None,
                  'zone': {'id': '', 'name': ''}, 'today_done': 0, 'today_max': 1,
-                 'last': None,
+                 'last': None, 'progress': None,
                  'pace_range': {'lo': 0, 'hi': 0},
                  'capture': {'state': 'idle', 'message': '', 'remaining_s': 0,
                              'cert_installed': False, 'fingerprint': '',
@@ -409,6 +409,11 @@ class DesktopBridge(LocationProbe):
             status = store.status()
             state = latest.get('state') or 'idle'
             message = latest.get('message') or ''
+            # 跑步进行中的一拍进度(step/total/labels): 原样透传, 界面画分段进度条。
+            # 收尾状态没有 progress, 老快照也没有 —— 界面按缺席处理。
+            progress = latest.get('progress')
+            if not isinstance(progress, dict):
+                progress = None
             if state == 'idle' and status.get('state'):
                 state = status['state']
                 message = status.get('message') or message
@@ -449,7 +454,7 @@ class DesktopBridge(LocationProbe):
             default_name = next((z['name'] for z in zones if z['default']), '')
             return {
                 'state': state, 'message': message, 'busy': bool(controller.busy),
-                'available': True,
+                'available': True, 'progress': progress,
                 'settings': dataclasses.asdict(settings),
                 'schedule': controller.schedule_text(),
                 'identity': {'name': identity.get('name', ''),
@@ -946,6 +951,10 @@ class DesktopBridge(LocationProbe):
                 return '正在读取每个跑区的打卡点，请稍候'
             if action == 'lptiyu_zone_apply':
                 return '正在把选中的跑区同步到小程序，请稍候'
+            if action == 'lptiyu_run':
+                return '开始今天的跑步：正在检查凭证与账号状态…'
+            if action == 'lptiyu_dry':
+                return '开始全链验证：正在检查凭证与账号状态…'
             return '操作已开始，请查看任务状态'
         if action in ('lptiyu_member_switch', 'lptiyu_member_rename', 'lptiyu_member_delete'):
             return self._lptiyu_member_action(action, payload)
