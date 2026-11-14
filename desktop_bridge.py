@@ -174,6 +174,7 @@ def lptiyu_settings(payload, previous=None):
         auto_renew=_flag('auto_renew'),
         renew_lead_min=_int('renew_lead_min', 45),
         renew_interval_min=_int('renew_interval_min', 180),
+        run_all_members=_flag('run_all_members'),
     ).validate()
 
 

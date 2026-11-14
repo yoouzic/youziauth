@@ -16,7 +16,7 @@ import lptiyu_panel
 from lptiyu_panel import LptiyuController, LptiyuError, TokenSlot, MAX_DAILY_AUTO_ATTEMPTS
 from lptiyu.client import ApiError
 from lptiyu_renew import CredentialRenewer, RenewOutcome
-from lptiyu_store import Settings, Store
+from lptiyu_store import Settings, Store, now
 
 CLOCK = lambda: dt.datetime(2026, 11, 11, 7, 0)  # noqa: E731 —— 有效时段内、run_time 之后
 
@@ -223,7 +223,8 @@ class PollTests(PanelTestCase):
                 started.set()
             return original(self, action)
 
-        controller = self.make_controller(settings=Settings(enabled=True, run_time='06:30'))
+        controller = self.make_controller(settings=Settings(enabled=True, run_time='06:30',
+                                                            run_all_members=False))
         with patch.object(LptiyuController, 'start', spy):
             controller.poll()
         self.assertTrue(started.wait(3.0), '到点且开启时必须自动起跑')
@@ -299,7 +300,7 @@ class PollTests(PanelTestCase):
 
     def test_poll_skips_when_signed_today(self):
         controller = self.make_controller(settings=Settings(enabled=True))
-        controller.store.mark_signed(controller._clock().date().isoformat())
+        controller.store.mark_signed(now().date().isoformat())
         controller.poll()
         self.assertFalse(controller.busy)
 
@@ -309,6 +310,91 @@ class PollTests(PanelTestCase):
             controller.store.bump_daily(kind='auto')
         controller.poll()
         self.assertFalse(controller.busy, '每天自动尝试有硬上限')
+
+    def test_poll_triggers_the_member_sweep_when_someone_is_pending(self):
+        controller = self.make_controller(settings=Settings(enabled=True, run_time='06:30'))
+        # 活动成员有凭证、今天没跑: poll 应该直接走多成员轮跑, 不再经过 start()
+        def refuse_start(self, action):
+            raise AssertionError('多成员轮跑不该走 start()')
+        with patch('lptiyu_panel.random.uniform', return_value=0.0),              patch.object(LptiyuController, 'start', refuse_start):
+            controller.poll()
+        controller._wait_for_work(30)
+        self.assertTrue(self.flows, '轮跑直接执行成员流程')
+        self.assertEqual(controller.store.daily().get('auto'), 1)
+        # 轮跑结束设了冷却: 冷却期内再 poll 不重复起跑
+        flows_before = len(self.flows)
+        controller.poll()
+        controller._wait_for_work(30)
+        self.assertEqual(len(self.flows), flows_before)
+
+
+class RunAllMembersTests(PanelTestCase):
+    # 多成员自动跑步: 逐个激活→跑→记台账→还原活动指针。
+
+    def _add_members(self, count):
+        for index in range(count):
+            self.store.file_captured_credential({
+                'token': f'TOKEN-{index}', 'uid': 17980000 + index,
+                'student_num': f'202500{index}', 'school_id': '837',
+                'card_id': f'202500{index}', 'source': 'capture'})
+        return self.store.members_status()['items']
+
+    def test_sweep_runs_every_pending_member_and_restores_active(self):
+        items = self._add_members(3)
+        original = self.store.members_status()['active']
+        controller = self.make_controller(code=0)
+        with patch('lptiyu_panel.random.uniform', return_value=0.0):
+            self.assertTrue(controller._start_run_all(items))
+            controller._wait_for_work(30)
+        self.assertEqual(len(self.flows), len(items), '每个待跑成员都要起一次流程')
+        self.assertTrue(all(flow.calls for flow in self.flows))
+        self.assertEqual(controller.store.members_status()['active'], original,
+                         '轮跑结束要回到原来的活动成员')
+        day = now().date().isoformat()
+        for item in items:
+            self.assertEqual(controller.store.member_signed_record(item['id']).get('date'), day,
+                             '每个成员的结果要落进自己的台账')
+            self.assertEqual(controller.store.member_daily(item['id']).get(day, {}).get('auto'), 1)
+
+    def test_sweep_skips_members_already_signed(self):
+        items = self._add_members(2)
+        controller = self.make_controller(code=0)
+        day = now().date().isoformat()
+        self.store.switch_member(items[0]['id'])
+        self.store.mark_signed(day)
+        self.store.switch_member(items[-1]['id'])
+        pending = controller._pending_members()
+        self.assertEqual([item['id'] for item in pending], [items[1]['id'], items[2]['id']],
+                         '预签名/活动成员之外只剩两个待跑')
+        with patch('lptiyu_panel.random.uniform', return_value=0.0):
+            controller._start_run_all(pending)
+            controller._wait_for_work(30)
+        self.assertEqual(len(self.flows), len(pending), '已打卡的成员不再跑')
+        self.assertEqual(controller.store.member_signed_record(items[0]['id']).get('date'), day)
+
+    def test_sweep_records_dead_token_member_and_continues(self):
+        items = self._add_members(2)
+        original = self.store.members_status()['active']
+        dead_uid = 17980001
+        controller = self.make_controller(code=0)
+
+        def probe(client):
+            return (getattr(client, 'identity', {}) or {}).get('uid') != dead_uid
+
+        with patch('lptiyu_panel.random.uniform', return_value=0.0),              patch.object(controller, '_probe_alive', probe):
+            controller._start_run_all(items)
+            controller._wait_for_work(30)
+        day = now().date().isoformat()
+        dead = next(item for item in items if item['uid'] == '17980001')
+        self.assertIsNone(controller.store.member_signed_record(dead['id']).get('date'),
+                          '号死了不打卡, 但也不能挡住别人')
+        self.assertEqual(controller.store.member_daily(dead['id']).get(day, {}).get('auto'), 1)
+        alive = next(item for item in items if item['uid'] != '17980001')
+        self.assertEqual(controller.store.member_signed_record(alive['id']).get('date'), day)
+        self.assertEqual(self.renewer.calls, [], '轮跑中绝不开续期阶梯去拖队列')
+        self.assertIn('凭证已失效', controller.latest['message'])
+        self.assertEqual(controller.store.members_status()['active'], original,
+                         '轮跑结束要回到原来的活动成员')
 
 
 class RenewActionTests(PanelTestCase):

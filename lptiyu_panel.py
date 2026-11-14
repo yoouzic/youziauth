@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import random
 import queue
 import shutil
 import subprocess
@@ -28,6 +29,7 @@ from lptiyu import flow as lptiyu_flow
 from lptiyu.client import ApiClient, ApiError
 from lptiyu_capture import CaptureError, CaptureSession
 from lptiyu_renew import CredentialRenewer
+from lptiyu_members import MemberError
 from lptiyu_store import Store, Settings, now, parse_time
 
 # 微信注册的 weixin:// 协议: 直接拉起乐跑小程序(与研究库一致的那个 appid)。
@@ -237,6 +239,10 @@ class LptiyuController:
         self._poll_at = 0.0
         self.cancel = threading.Event()
         self.latest = None
+        # 多成员轮跑: 前缀贴到每个进度文案上, 告诉界面现在跑的是谁。
+        self._run_member_prefix = ''
+        self._sweeping_run = False   # 轮跑中不给单个成员走续期/采集阶梯
+        self._next_run_all = 0.0     # 两轮轮跑之间的间隔, 失败重试不轰炸
         # 初始状态不是「发生过的事」: 每造一个控制器就往历史里写一行, 记录页会被
         # 「尚未开始今天的跑步」刷满(测试和预览尤其明显)。
         self._set_latest('idle', '尚未开始今天的跑步', record=False)
@@ -260,6 +266,8 @@ class LptiyuController:
         step/total 给界面画分段进度条, labels 是每段的固定叫法, text 是这一拍
         的具体动作。收尾状态(signed/error/…)不带 progress, 进度条自然消失。
         """
+        if self._run_member_prefix:
+            text = f'{self._run_member_prefix}{text}'
         return self._set_latest('running', text, record=False,
                                 progress={'step': int(step), 'total': int(total),
                                           'labels': [str(x) for x in labels]})
@@ -357,19 +365,35 @@ class LptiyuController:
         if self._renewal_due(settings):
             self.start('renew_auto')
             return
-        if not in_window or self.store.is_signed_today(current.date()):
+        if not in_window:
             return
-        if self.store.daily().get('auto', 0) >= MAX_DAILY_AUTO_ATTEMPTS:
+        if not settings.run_all_members:
+            # 单成员(旧行为): 只跑活动成员这一个账号。
+            if self.store.is_signed_today(current.date()):
+                return
+            if self.store.daily().get('auto', 0) >= MAX_DAILY_AUTO_ATTEMPTS:
+                return
+            if not run_ready:
+                return
+            if not self.store.has_token() and self.auto_capture():
+                return
+            self.start('run')
+            try:
+                self.store.bump_daily(kind='auto')
+            except Exception:  # noqa: BLE001
+                pass
             return
-        if not run_ready:
+        # 多成员轮跑: 任何一个已添加、有凭证、今天还没跑完的账号都轮到。
+        if not run_ready or time.monotonic() < self._next_run_all:
             return
-        if not self.store.has_token() and self.auto_capture():
+        pending = self._pending_members()
+        if not pending:
             return
-        self.start('run')
-        try:
-            self.store.bump_daily(kind='auto')
-        except Exception:  # noqa: BLE001
-            pass
+        if not any(item.get('has_token') for item in pending):
+            # 一个有凭证的都没有: 走原本的采集兜底, 不空跑一轮。
+            if not self.store.has_token() and self.auto_capture():
+                return
+        self._start_run_all(pending)
 
     def drain(self):
         values = []
@@ -458,6 +482,106 @@ class LptiyuController:
             except Exception:           # noqa: BLE001 —— 网络类故障不判死
                 continue
             store.record_probe(alive, member_id=item['id'])
+
+    # ------------------------------------------------- 多成员自动跑步
+    def _pending_members(self):
+        """今天还没跑完、凭证还在、自动尝试次数没用完的成员清单。
+
+        「今天」统一按 store 自己的时钟算 —— mark_signed/bump_daily 落盘用的
+        都是它, 检查也用同一把尺, 免得两个时钟在跨零点时对不上号。
+        """
+        try:
+            members = self.store.members_status()
+        except Exception:               # noqa: BLE001 —— 读不动就不轮跑这拍
+            return []
+        day = now().date().isoformat()
+        pending = []
+        for item in members.get('items') or []:
+            if not item.get('has_token'):
+                continue
+            signed = self.store.member_signed_record(item['id'])
+            if signed.get('date') == day:
+                continue
+            daily = self.store.member_daily(item['id']).get(day)
+            attempts = int(daily.get('auto', 0) or 0) if isinstance(daily, dict) else 0
+            if attempts >= MAX_DAILY_AUTO_ATTEMPTS:
+                continue
+            pending.append(item)
+        return pending
+
+    def _start_run_all(self, pending):
+        with self._gate:
+            if self.closed or self.busy:
+                return False
+            self.busy = True
+            self.cancel.clear()
+
+        def work():
+            try:
+                self._run_all_members(pending)
+            except LptiyuError as exc:
+                self._set_latest(exc.state, exc.message)
+            except Exception:  # noqa: BLE001
+                self._set_latest('error', '跑步操作未完成，请稍后重试')
+            finally:
+                with self._gate:
+                    self.busy = False
+                self._capture_auto = False
+                self._capture_switch_intent = False
+                self._next_run_all = time.monotonic() + 120
+
+        threading.Thread(target=work, name='youziauth-lptiyu-run-all',
+                         daemon=True).start()
+        return True
+
+    def _run_all_members(self, pending):
+        """把每个待跑成员轮着跑一遍: 顺序激活 → 跑 → 记台账 → 回到原活动成员。
+
+        整条跑步链(凭证/续期/轨迹/提交/留档)都读写「活动成员」的目录 —— 与其复制
+        一条旁路, 不如顺序激活每个成员让现有链路原样工作, 跑完把活动指针放回
+        原处。谁的号死了记谁的台账然后跳过, 不拖垮队列; 全程可取消。
+        """
+        store = self.store
+        original = ''
+        try:
+            original = store.members_status().get('active') or ''
+        except Exception:               # noqa: BLE001
+            return
+        self._sweeping_run = True
+        try:
+            for index, item in enumerate(pending):
+                if self.cancel.is_set():
+                    break
+                name = item.get('name') or item['id']
+                self._run_member_prefix = f'「{name}」 '
+                try:
+                    store.switch_member(item['id'])
+                except MemberError:
+                    continue              # 成员中途被删: 跳过
+                self._set_latest('running',
+                                 f'自动跑步：正在为「{name}」打卡（{index + 1}/{len(pending)}）…',
+                                 record=False)
+                try:
+                    self._execute(submit=True)
+                except LptiyuError as exc:
+                    self._set_latest(exc.state, f'「{name}」{exc.message}')
+                except Exception:  # noqa: BLE001
+                    self._set_latest('error', f'「{name}」跑步操作未完成，请稍后重试')
+                try:
+                    store.bump_daily(kind='auto')
+                except Exception:       # noqa: BLE001
+                    pass
+                if index + 1 < len(pending):
+                    # 成员之间歇一歇: 几个账号背靠背连着提交不像人
+                    self.cancel.wait(random.uniform(20.0, 60.0))
+        finally:
+            self._sweeping_run = False
+            self._run_member_prefix = ''
+            try:
+                if original and store.members_status().get('active') != original:
+                    store.switch_member(original)
+            except Exception:           # noqa: BLE001 —— 还原失败不掩盖跑步结果
+                pass
 
     # ------------------------------------------------------------- 步骤
     def _sync(self):
@@ -873,14 +997,17 @@ class LptiyuController:
             return self._set_latest('need_token', outcome.message, record=False)
         return None
 
-    def _ensure_credentials(self):
+    def _ensure_credentials(self, renew=True):
         """返回可用凭证; 拿不到就抛 LptiyuError(need_token)。
 
         阶梯统一交给 renewer: 探活 → 研究库 → 主动采集(借用研究库采集链),
         每一步都用真门探活收尾。到点自动跑或用户手动点, 都按 force=True 走 ——
         用户/日程已经表达了「现在要用凭证」, 不该再被台账冷却挡回去。
+        多成员轮跑传 renew=False: 台账/采集阶梯是为「当前活动成员」设计的,
+        轮跑里给旁席成员跑一遍会把队列挂在没人打开的小程序上 —— 凭证是否
+        还活着交给 _execute 里那一拍探活, 死号记台账跳过。
         """
-        outcome = self.renewer.renew(force=True)
+        outcome = self.renewer.renew(force=True) if renew else None
         record = None
         try:
             record = self.store.token_record()
@@ -888,7 +1015,8 @@ class LptiyuController:
             self.store.clear_token()
         if record and record.get('token'):
             return record
-        raise LptiyuError('need_token', outcome.message)
+        raise LptiyuError('need_token',
+                          outcome.message if outcome is not None else '没有可用凭证')
 
     def _grab_via_lab(self):
         """借用研究库的采集链抓一次凭证(需要小程序冷启动一次)。
@@ -986,7 +1114,7 @@ class LptiyuController:
                        else '开始验证：正在检查凭证与账号状态…')
         settings = self.store.settings()
         try:
-            record = self._ensure_credentials()
+            record = self._ensure_credentials(renew=not self._sweeping_run)
         except LptiyuError as exc:
             # 没有凭证但有采集能力: 交给下一拍自己采, 不用人点「同步凭证」。
             if exc.state == 'need_token' and self._auto_capture_due():
@@ -999,6 +1127,14 @@ class LptiyuController:
         client = self.slot.make_client(pace=0.8)
         if not self._probe_alive(client):
             self.slot.mark_dead()
+            if self._sweeping_run:
+                # 多成员轮跑绝不中途开续期/采集阶梯: 那会挂起整个队列去等一个
+                # 不会有人打开的小程序。谁的号死了记下来跳过, 让本人重开小程序
+                # 或导入新文件后再说。
+                if submit:
+                    self.store.bump_daily(kind='run')
+                raise LptiyuError('need_token',
+                                  f'{self.slot.label} 的凭证已失效，跳过（让本人重开一次小程序再导入）')
             # 续期刚过、起跑前这半秒号又死了(小程序那边刚重登): 再走一遍续期阶梯,
             # 拿到新号就直接继续, 不让这一拍白跑。
             outcome = self.renewer.renew(force=True)

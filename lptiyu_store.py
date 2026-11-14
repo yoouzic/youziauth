@@ -65,6 +65,7 @@ class Settings:
     auto_renew: bool = True      # 自动续期: 后台把凭证保活, 不等到跑步那一刻才发现失效
     renew_lead_min: int = 45     # 跑步前多久做一次「今天必过」的保活
     renew_interval_min: int = 180  # 低频探活间隔(token 没有绝对过期时间, 只需确认还活着)
+    run_all_members: bool = True   # 多成员自动跑步: 到点后把每个已添加的账号都跑一遍
 
     def pace_range(self):
         """有效的配速区间 (lo, hi) 秒/公里; (0, 0) = 交给模板。
@@ -377,6 +378,24 @@ class Store:
         try:
             directory = self._registry().member_dir(str(member_id))
             value = self._read_path(directory / 'identity.json', {})
+        except MemberError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def member_daily(self, member_id):
+        """读某个成员的每日台账(自动尝试次数这些); 没有返回空 dict。"""
+        try:
+            directory = self._registry().member_dir(str(member_id))
+            value = self._read_path(directory / 'daily.json', {})
+        except MemberError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def member_signed_record(self, member_id):
+        """读某个成员的打卡结果(自动跑步判断今天跑没跑过); 没有返回空 dict。"""
+        try:
+            directory = self._registry().member_dir(str(member_id))
+            value = self._read_path(directory / 'signed.json', {})
         except MemberError:
             return {}
         return value if isinstance(value, dict) else {}
@@ -858,10 +877,15 @@ class Store:
             identity = identity if isinstance(identity, dict) else {}
             status = self._read_path(directory / 'status.json', {})
             status = status if isinstance(status, dict) else {}
+            signed = self._read_path(directory / 'signed.json', {})
             items.append({'id': member.id, 'name': member.name,
                           'student_num': str(identity.get('student_num') or ''),
                           'uid': str(identity.get('uid') or ''),
                           'active': member.id == active,
+                          # 给界面看「这个人今天跑没跑过」: 多成员自动跑步时一眼
+                          # 分辨谁还轮着、谁已经完成。
+                          'signed_today': (isinstance(signed, dict)
+                                           and signed.get('date') == now().date().isoformat()),
                           'has_token': (directory / 'session' / 'credential.dat').exists(),
                           # 巡检结果: True=活 / False=死 / None=还没探过或没凭证
                           'alive': (bool(status.get('last_probe_alive'))

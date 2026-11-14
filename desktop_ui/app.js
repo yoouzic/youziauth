@@ -630,7 +630,7 @@ $('lptiyu-form').addEventListener('submit',async event=>{
     notify('配速请写成 4\'05" 这样（分钟\'秒"），留空为自动。',true);return;}
   if((paceLo>0)!==(paceHi>0)){notify('配速区间要么上下限都填，要么都留空。',true);return;}
   if(paceLo&&paceLo>paceHi){notify('配速下限要比上限快（4\'05" 在 4\'30" 前面）。',true);return;}
-  const payload={enabled:$('lp-enabled').checked,run_time:$('lp-run-time').value,
+  const payload={enabled:$('lp-enabled').checked,run_all_members:$('lp-run-all').checked,run_time:$('lp-run-time').value,
     dist_lo:Number($('lp-dist-lo').value),dist_hi:Number($('lp-dist-hi').value),
     pace_lo:paceLo,pace_hi:paceHi,anchor_max_m:Number($('lp-anchor').value),
     auto_renew:$('lp-auto-renew').checked,lab_dir:$('lp-lab').value.trim(),
@@ -831,6 +831,8 @@ function renderRunStatus(lp,s){
 function renderRunSettings(lp,s){
   if(dirty.lptiyu)return;
   $('lp-enabled').checked=!!s.enabled;
+  $('lp-run-all').checked=s.run_all_members!==false;
+  $('lp-run-all').disabled=pending;
   $('lp-run-time').value=s.run_time||'06:30';
   $('lp-dist-lo').value=s.dist_lo??2.03;
   $('lp-dist-hi').value=s.dist_hi??2.35;
@@ -980,6 +982,7 @@ function activeMember(){
 }
 function memberLabel(member){
   return member.name+(member.student_num?` · ${member.student_num}`:'')
+    +(member.signed_today?' · 今日已跑':'')
     +(member.alive===false?' · 凭证已失效':member.has_token?'':' · 无凭证');
 }
 function requireLptiyuSync(){
@@ -1013,7 +1016,8 @@ function renderMembers(lp){
   const dead = items.filter(member=>member.alive===false).map(member=>member.name);
   $('lp-member-state').textContent=error
     ||(full?`最多 ${max} 个成员。`
-      :'添加成员：让对方用微信多开（或临时登录）打开一次小程序，凭证会自动归档并切换过去。')
+      :'添加成员：让对方用微信多开（或临时登录）打开一次小程序，凭证会自动归档并切换过去。'
+      +' 自动跑步开启时，到点会按成员逐个打卡，谁今天没跑才跑谁。')
     +(dead.length?` 「${dead.join('、')}」的凭证已失效：让 TA 重跑一次提取器，新文件发来后点「导入凭证」。`:'');
   // 名字框只在真的换了活动成员时回写：它同时是重命名的输入框, 不能被后台重绘冲掉。
   if(memberNameFor!==activeId){

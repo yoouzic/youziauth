@@ -359,3 +359,29 @@
     animation: none;
   }
 }
+
+/* 跑完全部成员: 设置卡头部的第二个开关, 附一句说明 ------------------------- */
+.lp-toggle.lp-run-all {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+.lp-toggle.lp-run-all span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-weight: 600;
+}
+
+.lp-toggle.lp-run-all small {
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--muted);
+}

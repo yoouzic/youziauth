@@ -2145,6 +2145,15 @@ test('switching members updates the main card chip and flashes it',async()=>{
   assert.equal(chip.classList.contains('flash-a'),true,'换人要闪一下给出反馈');
 });
 
+test('member labels mark who already ran today',async()=>{
+  const h=await lptiyuPage({members:{max:5,active:'m1',error:'',items:[
+    {id:'m1',name:'张三',student_num:'2025001',uid:'u1',active:true,has_token:true,alive:true,signed_today:true},
+    {id:'m2',name:'李四',student_num:'2025002',uid:'u2',active:false,has_token:true,alive:true,signed_today:false}]}});
+  const select=h.el('lp-member');
+  assert.match(select.options[0].textContent,/张三 · 2025001 · 今日已跑/);
+  assert.doesNotMatch(select.options[1].textContent,/今日已跑/);
+});
+
 test('lptiyu without a credential shows the official first-use guide',async()=>{
   const h=await lptiyuPage({state:'need_token',message:'还没有可用的跑步凭证',has_token:false});
   assert.equal(h.el('lp-badge').textContent,'等待凭证');
@@ -2171,7 +2180,8 @@ test('lptiyu settings sync from the snapshot and save through the bridge',async(
   h.el('lp-dist-hi').value='3.2';
   await h.el('lptiyu-form').fire('submit');
   await new Promise(resolve=>setTimeout(resolve,0));
-  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1))),{action:'lptiyu_save',payload:{enabled:true,run_time:'06:30',
+  assert.equal(h.el('lp-run-all').checked,true,'老快照没有该字段时默认开启跑完全部成员');
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1))),{action:'lptiyu_save',payload:{enabled:true,run_all_members:true,run_time:'06:30',
     dist_lo:2.9,dist_hi:3.2,pace_lo:245,pace_hi:280,anchor_max_m:20,auto_renew:true,
     lab_dir:'',zone_id:'',zone_name:''}},
     '合法修改按表单内容发往后台');

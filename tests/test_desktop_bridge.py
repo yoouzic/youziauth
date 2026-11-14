@@ -1290,6 +1290,18 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertEqual(state['identity']['name'], '陈同学')
         self.assertIn('自动跑步', state['schedule'])
 
+    def test_run_all_members_setting_round_trips(self):
+        result = self.bridge.dispatch('lptiyu_save', {'enabled': True,
+                                                      'run_time': '06:30',
+                                                      'run_all_members': False})
+        self.assertTrue(result['ok'])
+        self.assertFalse(self.controller.store.settings().run_all_members)
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertIs(state['settings']['run_all_members'], False)
+        # 缺席时不回退默认: 沿用上一份设置
+        self.bridge.dispatch('lptiyu_save', {'enabled': True, 'run_time': '06:30'})
+        self.assertFalse(self.controller.store.settings().run_all_members)
+
     def test_snapshot_carries_run_progress_for_the_ui(self):
         self.controller._progress(2, 4,
                                   ['准备凭证', '生成轨迹', '提交成绩', '等待判定'],
