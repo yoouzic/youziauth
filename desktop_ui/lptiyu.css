@@ -360,11 +360,12 @@
   }
 }
 
-/* 跑完全部成员: 设置卡头部的第二个开关, 附一句说明 ------------------------- */
+/* 跑完全部成员: 设置卡头部的第二个开关, 附一句说明 -------------------------
+   开关对齐标题那一行, 说明文字可换行并让出宽度 —— 窄窗口下长提示语
+   不能顶到开关上。 */
 .lp-toggle.lp-run-all {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   gap: 16px;
   margin: 0 0 14px;
   padding: 10px 14px;
@@ -374,14 +375,22 @@
 }
 
 .lp-toggle.lp-run-all span {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 2px;
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
-.lp-toggle.lp-run-all small {
+.lp-toggle.lp-run-all span small {
   font-weight: 400;
   font-size: 11px;
   color: var(--muted);
+}
+
+.lp-toggle.lp-run-all input {
+  flex-shrink: 0;
+  margin-top: 2px;
 }
