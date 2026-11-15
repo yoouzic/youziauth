@@ -228,6 +228,56 @@ class LabSyncTests(unittest.TestCase):
             self.assertEqual(store.token(), 'LABTOKEN')
             self.assertEqual(store.token_record()['source'], 'lab-consumed')
 
+    def test_sync_never_clobbers_members_missing_from_the_lab(self):
+        # 2026-11-14 现场: 研究库基线里只有机主一个人, 一次「同步凭证」把每个
+        # 认领不到的旁席成员都写成了机主的身份和 token。认领不到就必须跳过。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lab = self._lab(root)
+            store = Store(root / 'store')
+            store.save_settings(Settings(lab_dir=str(lab)))
+            # 机主(活动成员, 能认领) + 两个不在研究库白名单里的旁席成员
+            store.save_identity({'name': '陈同学', 'student_num': '222025321102104',
+                                 'uid': '17987537', 'school_id': '837',
+                                 'card_id': '222025321102104'})
+            import lptiyu_members
+            registry = store._registry()
+            other_a = registry.add('红兔')
+            other_b = registry.add('小猪')
+            for member, token in ((other_a, 'HONGTU-TOKEN'), (other_b, 'XIAOZHU-TOKEN')):
+                store.switch_member(member.id)
+                store.save_identity({'name': member.name, 'student_num': f'2025{member.id[:6]}',
+                                     'uid': f'99{member.id[:6]}', 'school_id': '837',
+                                     'card_id': f'2025{member.id[:6]}'})
+                store.save_token_record(token, issued_at='2026-11-11T01:07:18',
+                                        source='capture')
+            # 还原活动指针为机主
+            owner = next(m for m in registry.members()
+                         if (store._read_path(registry.member_dir(m.id) / 'identity.json', {})
+                             or {}).get('uid') == '17987537')
+            registry.activate(owner.id)
+            changes, _ = store.sync_from_lab()
+            self.assertIn('token', changes, '机主仍应正常认领研究库凭证')
+            for member, token in ((other_a, 'HONGTU-TOKEN'), (other_b, 'XIAOZHU-TOKEN')):
+                identity = store.member_identity(member.id)
+                self.assertEqual(identity.get('student_num'), f'2025{member.id[:6]}',
+                                 '旁席成员的身份绝不能被研究库基线覆盖')
+                self.assertEqual(store.member_token_record(member.id)['token'], token,
+                                 '旁席成员的凭证绝不能被研究库基线覆盖')
+            # 机主仍被正常认领(拿研究库的 LABTOKEN)
+            self.assertEqual(store.member_token_record(owner.id)['token'], 'LABTOKEN')
+
+    def test_sync_fallback_still_works_for_the_empty_active_member(self):
+        # 首次同步的旧行为: 空库先落「成员 1」, 由没有身份的活动成员认领研究库 active。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lab = self._lab(root)
+            store = Store(root / 'store')
+            store.save_settings(Settings(lab_dir=str(lab)))
+            changes, _ = store.sync_from_lab()
+            self.assertIn('token', changes)
+            self.assertEqual(store.identity().get('student_num'), '222025321102104')
+
     def test_sync_picks_the_member_matching_the_local_identity(self):
         # 研究库是多成员白名单, active 只是「上次在用的那个」; 按 active 取会把
         # 别人的号装进来。

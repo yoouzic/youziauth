@@ -742,11 +742,14 @@ class Store:
 
     # ------------------------------------------------------------- 研究库同步
     @staticmethod
-    def _lab_member(config, identity):
-        """按身份挑研究库成员: 学号 → uid → active → 第一个。
+    def _lab_member(config, identity, allow_fallback=False):
+        """按身份挑研究库成员: 学号 → uid → (仅允许时) active → 第一个。
 
         研究库是多成员白名单, `active` 只是「上次在用的那个」。直接按 active 取,
         在换过成员的机器上会把别人的号装进来 —— 凭证是认人的, 这里必须先认身份。
+        认领不到一律返回 None: 回落到 active/第一个只留给「没有身份的活动成员」
+        (首次同步的旧行为)。有身份但对不上白名单的成员绝不能被基线那一份覆盖 ——
+        2026-11-14 现场就是这一格把旁席成员全写成了机主。
         """
         members = config.get('members') or {}
         if not isinstance(members, dict):
@@ -760,6 +763,8 @@ class Store:
                 keys = {str(member.get('student_num') or ''), str(member.get('uid') or '')}
                 if wanted & keys:
                     return member
+        if not allow_fallback:
+            return None
         active = config.get('active')
         if isinstance(members.get(active), dict):
             return members[active]
@@ -849,7 +854,12 @@ class Store:
             known = bool(identity.get('student_num') or identity.get('uid'))
             if not known and member.id != active:
                 continue
-            member_cfg = self._lab_member(config, identity)
+            # 回落(认领研究库 active/第一个)只留给「无身份的活动成员」—— 首次
+            # 同步的旧行为。有身份但对不上白名单的成员跳过: 他们的凭证认自己,
+            # 一次同步不能把机主那一份盖到他们头上。
+            member_cfg = self._lab_member(
+                config, identity,
+                allow_fallback=(member.id == active and not known))
             if member_cfg is None:
                 continue
             changes.extend(self._adopt_lab_member(member_cfg, directory,
