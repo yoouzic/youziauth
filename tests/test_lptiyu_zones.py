@@ -311,10 +311,11 @@ class StadiumPriorTests(unittest.TestCase):
 
 
 class FirstFieldPriorTests(unittest.TestCase):
-    """1874 没有真人轨迹, 从卫星影像拟合出跑道中心线。
+    """1874 是标准 400m 田径场(用户实测一圈 400m), 圆心在打卡点质心沿长轴
+    往西南 20m 处 —— 打卡环整体偏在场地东北侧, 西/南两个打卡点正好压在跑线上。
 
     它的打卡点在东北端挤成一团(最近两点只隔 33m), 围着打卡点铺环会把那段弯道
-    压成贴弦的浅弧, 轨迹从内场凹进去; 有拟合线就必须沿真跑道跑。
+    压成贴弦的浅弧, 轨迹从内场凹进去; 有先验线就必须沿真跑道跑。
     """
 
     POINTS = [(29.823896, 106.431411), (29.823779, 106.430558),
@@ -334,25 +335,24 @@ class FirstFieldPriorTests(unittest.TestCase):
         rxy = [((p[1] - clng) * 111320 * math.cos(math.radians(clat)),
                 (p[0] - clat) * 110570) for p in route]
         lap = sum(math.dist(rxy[i], rxy[i + 1]) for i in range(len(rxy) - 1))
-        self.assertAlmostEqual(lap, 320.0, delta=25.0, msg=f'单圈 {lap:.0f}m 应接近 320m')
+        self.assertAlmostEqual(lap, 400.0, delta=15.0, msg=f'单圈 {lap:.0f}m 应接近 400m')
         theta = math.radians(42.3)
         us = [x * math.sin(theta) + y * math.cos(theta) for x, y in rxy]
         vs = [x * math.cos(theta) - y * math.sin(theta) for x, y in rxy]
-        self.assertAlmostEqual(max(us) - min(us), 122.4, delta=20.0)
-        self.assertAlmostEqual(max(vs) - min(vs), 66.2, delta=15.0)
+        # 标准跑道: 全长 2S+2R = 158.4m, 全宽 2R = 73.6m
+        self.assertAlmostEqual(max(us) - min(us), 158.0, delta=15.0)
+        self.assertAlmostEqual(max(vs) - min(vs), 73.6, delta=12.0)
 
-    def test_the_northeast_cap_is_pulled_in(self):
-        # 真跑道的东北弯比对称模型瘦一圈: cap_u_ne=25.0 要真的落到弧上,
-        # 弧顶(沿长轴最远点, 相对先验中心) = cap_u_ne+radius = 58.1m,
-        # 对称模型是 half_s+radius = 64.3m。
+    def test_the_route_uses_the_standard_symmetric_track(self):
+        # 1874 改用标准 400m 几何(对称弯道): 弧顶(相对先验中心) = half_s+radius
         route = self.route()
         plat, plng = zones.STADIUM_PRIORS['1874']['center']
         rxy = [((p[1] - plng) * 111320 * math.cos(math.radians(plat)),
                 (p[0] - plat) * 110570) for p in route]
         theta = math.radians(42.3)
         us = [x * math.sin(theta) + y * math.cos(theta) for x, y in rxy]
-        self.assertAlmostEqual(max(us), 58.1, delta=3.0,
-                               msg=f'NE 弯弧顶 {max(us):.1f}m, cap_u_ne 没生效')
+        self.assertAlmostEqual(max(us), 79.0, delta=4.0,
+                               msg=f'NE 弯弧顶 {max(us):.1f}m, 先验尺寸不对')
 
     def test_every_checkpoint_sits_near_that_track(self):
         route = self.route()
