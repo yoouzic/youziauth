@@ -1347,7 +1347,12 @@ def _run_elevated_startup_configuration(value: str) -> int:
 
 def main() -> int:
     argv = sys.argv[1:]
-    if "--legacy-ui" not in argv:
+    if argv[:1] == ["--proxy-guard"]:
+        # 采集代理看门狗: 冻结包由自身 exe 再起一个独立进程来跑。必须先于单实例
+        # 锁和界面初始化 —— 主程序被强杀后, 这条路径是唯一还会执行的东西。
+        import proxy_guard
+        return proxy_guard.main(argv[1:])
+    if not "--legacy-ui" in argv:
         from campus_auth_desktop import main as desktop_main
         return desktop_main(argv)
     if len(argv) == 2 and argv[0] in ("--dorm-self-test", "--dorm-login-probe"):

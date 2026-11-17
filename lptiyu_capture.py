@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import atexit
 import base64
 import datetime as dt
 import http.client
@@ -34,6 +35,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import proxy_guard
 from lptiyu.cipher import CipherError, unseal
 
 CAPTURE_HOST_SUFFIX = "lptiyu.com"
@@ -429,17 +431,35 @@ class SystemProxy:
             pass
 
     def point_at(self, port):
-        """把系统代理指到本机采集端口, 并先把原值备份下来。"""
+        """把系统代理指到本机采集端口, 并先把原值备份下来。
+
+        备份必须真的落盘才允许改代理: 以前写失败只是 `pass`, 于是进程一旦被杀
+        就没有任何东西能还原 —— 浏览器被留在死端口上, 整台机器看起来断网。
+        """
         if self._saved is None:
             self._saved = self.read()
-            try:
-                self.backup_path.parent.mkdir(parents=True, exist_ok=True)
-                self.backup_path.write_text(json.dumps(
-                    {"enable": self._saved[0], "server": self._saved[1],
-                     "override": self._saved[2]}), encoding="utf-8")
-            except OSError:
-                pass
+        try:
+            proxy_guard.write_backup(self.backup_path, {
+                "enable": int(self._saved[0]),
+                "server": str(self._saved[1]),
+                "override": str(self._saved[2]),
+                "pid": os.getpid(),
+                "port": int(port),
+                "created": time.time(),
+            })
+        except OSError as exc:
+            raise CaptureError(
+                f"无法备份系统代理（{exc}）；为避免采集失败后断网，本次采集没有开始"
+            ) from exc
         self.write(1, f"127.0.0.1:{port}", self._saved[2])
+
+    def restore_stale(self):
+        """收拾上次崩溃留下的备份: 确认没有别的采集进程还在用才动注册表。
+
+        与 `restore()` 的区别: 这个只用于「启动时先清场」, 不会去覆盖一份仍然
+        属于活进程的备份(例如另一个提取器正在采集)。
+        """
+        return proxy_guard.recover_stale_backup(self.backup_path, self.reg_path)
 
     def restore(self):
         """还原系统代理; 有崩溃遗留的备份也能收拾。"""
@@ -698,7 +718,7 @@ class CaptureSession:
     """一次采集: 起代理 → 等 token → 收尾。状态机对外只暴露 status()。"""
 
     def __init__(self, root: Path, clock=None, proxy_factory=None, ca=None,
-                 timeout_s=DEFAULT_TIMEOUT_S, server_factory=None):
+                 timeout_s=DEFAULT_TIMEOUT_S, server_factory=None, guard_factory=None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._clock = clock or _now
@@ -707,14 +727,17 @@ class CaptureSession:
                       (lambda: SystemProxy(self.root / BACKUP_NAME)))()
         self.timeout_s = int(timeout_s)
         self._server_factory = server_factory or _ProxyServer
+        self._guard_factory = guard_factory
         self._server = None
         self._thread = None
+        self._guard = None
         self._tokens = queue.Queue()
         self._lock = threading.Lock()
         self._state = "idle"
         self._message = ""
         self._port = 0
         self._deadline = 0.0
+        self._atexit_callback = None
         self.identity = {}
         self.connects = 0
         self.requests = 0
@@ -746,10 +769,24 @@ class CaptureSession:
     def cert_status(self):
         return {"installed": self.ca.installed(), "fingerprint": self.ca.fingerprint()}
 
+    def recover_stale_proxy(self):
+        """启动时先收拾上次崩溃留下的代理(不会碰仍在运行的采集)。"""
+        path = getattr(self.proxy, "backup_path", None) or (self.root / BACKUP_NAME)
+        reg_path = getattr(self.proxy, "reg_path", proxy_guard.REG_PATH)
+        try:
+            return proxy_guard.recover_stale_backup(path, reg_path)
+        except Exception:              # noqa: BLE001 —— 清场失败不该拦住界面启动
+            return False
+
     # ---------------------------------------------------------- 生命周期
     def start(self):
         if self.proxy.stale_backup():
-            self.proxy.restore()           # 上次崩溃留下的代理, 先还原
+            # 上次崩溃留下的代理, 先还原再开始; 别的进程还在采集时不动它。
+            restore_stale = getattr(self.proxy, "restore_stale", None)
+            if callable(restore_stale):
+                restore_stale()
+            else:
+                self.proxy.restore()
         if not self.ca.installed():
             # 装证书是明确的用户动作(界面上有按钮), 采集本身不替用户做主。
             raise CaptureError('还没有安装采集证书：先点「安装采集证书」，再开始采集')
@@ -757,31 +794,112 @@ class CaptureSession:
         self._server = server
         port = server.server_address[1]
         self._port = port
-        self.proxy.point_at(port)
+        try:
+            self.proxy.point_at(port)
+        except Exception:              # noqa: BLE001 —— 备份没落盘就不能把代理留在我们手里
+            self._server = None
+            try:
+                server.server_close()
+            except OSError:
+                pass
+            try:
+                self.proxy.restore()   # 可能已经写了一半的注册表, 尽力还原
+            except Exception:          # noqa: BLE001
+                pass
+            raise
         self._deadline = time.time() + self.timeout_s
-        self._thread = threading.Thread(target=server.serve_forever,
+
+        def serve():
+            try:
+                server.serve_forever()
+            except Exception:          # noqa: BLE001 —— 收尾时关端口会让循环抛异常
+                pass
+
+        self._thread = threading.Thread(target=serve,
                                         name="youziauth-lptiyu-capture", daemon=True)
         self._thread.start()
+        self._arm_exit_restore()
+        self._start_proxy_guard(port)
         self.log(f"采集开始 127.0.0.1:{port}")
         self._set("waiting", "等待小程序请求：在微信里打开「数体智慧体育」并进入跑步首页")
         return self.status()
 
-    def stop(self, state=None, message=None):
-        if self._server is not None:
-            server, self._server = self._server, None
+    def _arm_exit_restore(self):
+        """最后一道兜底: 解释器正常退出(包括未处理异常)时也必须还原代理。"""
+        if self._atexit_callback is not None:
+            return
+        self._atexit_callback = self._restore_on_exit
+        atexit.register(self._atexit_callback)
+
+    def _disarm_exit_restore(self):
+        callback, self._atexit_callback = self._atexit_callback, None
+        if callback is not None:
             try:
-                server.shutdown()
-            except Exception:              # noqa: BLE001 —— 卡住的 serve_forever 也要收尾
+                atexit.unregister(callback)
+            except Exception:          # noqa: BLE001
                 pass
-            finally:
-                try:
-                    server.server_close()  # 端口必须真的放掉, 否则下次换端口重来
-                except OSError:
-                    pass
+
+    def _restore_on_exit(self):
         try:
             self.proxy.restore()
-        except Exception:                  # noqa: BLE001 —— 收尾必须尽力
+        except Exception:              # noqa: BLE001 —— 退出路径只能尽力
             pass
+
+    def _start_proxy_guard(self, port):
+        """起一个独立看门狗: 进程被强杀时由它还原系统代理, 避免浏览器断网。
+
+        `server.shutdown()` 卡住、任务管理器结束任务、卡死对话框的「关闭程序」
+        都不会执行 finally/atexit, 只有另一个进程能收拾。
+        """
+        factory = self._guard_factory
+        if factory is None:
+            if not isinstance(self.proxy, SystemProxy):
+                return              # 测试注入的假代理没有真实备份路径
+            factory = proxy_guard.spawn_guard
+        path = getattr(self.proxy, "backup_path", None) or (self.root / BACKUP_NAME)
+        reg_path = getattr(self.proxy, "reg_path", proxy_guard.REG_PATH)
+        try:
+            self._guard = factory(path, os.getpid(), reg_path)
+            if self._guard is not None:
+                self.log(f"代理看门狗已启动 pid={getattr(self._guard, 'pid', '?')} "
+                         f"(端口 {port})")
+        except Exception:              # noqa: BLE001 —— 看门狗起不来还有 atexit 与启动清场
+            self._guard = None
+
+    def _stop_server(self, timeout=5.0):
+        """关掉采集代理端口; shutdown 最多等几秒, 绝不让停采集把界面挂住。"""
+        server, self._server = self._server, None
+        if server is None:
+            return
+        done = threading.Event()
+
+        def shutdown():
+            try:
+                server.shutdown()
+            except Exception:          # noqa: BLE001 —— 卡住的 serve_forever 也要收尾
+                pass
+            finally:
+                done.set()
+
+        threading.Thread(target=shutdown, name="youziauth-lptiyu-stop",
+                         daemon=True).start()
+        if not done.wait(timeout):
+            self.log(f"代理服务 {timeout:.0f} 秒内没有停住, 直接关闭监听端口")
+        try:
+            server.server_close()      # 端口必须真的放掉, 否则下次换端口重来
+        except OSError:
+            pass
+
+    def stop(self, state=None, message=None):
+        self._stop_server()
+        try:
+            self.proxy.restore()
+        except Exception:              # noqa: BLE001 —— 收尾必须尽力
+            pass
+        self._disarm_exit_restore()
+        if self._guard is not None:
+            # 看门狗自己会发现备份已删除并在几秒内退出; 这里只放掉句柄。
+            self._guard = None
         if state:
             self.log(f"采集结束 {state} {message or ''}".strip())
         if state:

@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import os
 import queue
 import sys
 import threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import agent_ipc
 import campus_auth_gui as gui
@@ -206,11 +208,23 @@ def preview_server(port):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ['--proxy-guard']:
+        # 采集代理看门狗: 必须以自身 exe 再起一个独立进程。必须先于任何界面/加密
+        # 组件初始化——主程序崩溃时, 这条路径是唯一还会执行的东西。
+        import proxy_guard
+        return proxy_guard.main(argv[1:])
+    if argv[:1] == ['--recover-proxy']:
+        # 支持/修复入口: 终端里跑一次, 把上次采集遗留的系统代理还原掉。
+        import proxy_guard
+        root = (Path(os.environ.get('LOCALAPPDATA', str(Path.home() / 'AppData' / 'Local')))
+                / 'youziauth' / 'lptiyu' / 'capture')
+        restored = proxy_guard.recover_stale_backup(root / proxy_guard.BACKUP_NAME)
+        print('restored the system proxy' if restored else 'no leftover capture proxy')
+        return 0 if restored else 1
     if '--verify-update' in argv:
         # Update verifier. This must dispatch before any GUI setup: a windowed
         # build has no console, the caller reads only the exit code, and a
         # malformed invocation must fail fast instead of opening a window.
-        from pathlib import Path
         from windows_update import verifier_main
         if len(argv) == 2 and argv[0] == '--verify-update':
             request = Path(argv[1])
@@ -218,7 +232,6 @@ def main(argv=None):
         return 21  # unusable request; the caller reports a generic verification failure
     if len(argv) == 2 and argv[0] == '--location-self-test':
         # Explicit diagnostic: real local positioning only; no controller/school API.
-        from pathlib import Path
         from dorm_location import probe_location
         result = probe_location()
         output = Path(argv[1])

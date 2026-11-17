@@ -304,10 +304,29 @@ class LocationProbe:
         return '正在检测所选定位来源；本次不会提交打卡。'
 
 
+def recover_leftover_capture_proxy():
+    """启动时收拾上次采集崩溃留下的系统代理。
+
+    采集会把当前用户的代理临时指到 127.0.0.1:<端口>。正常收尾会还原, 但进程被
+    强杀(卡死对话框「关闭程序」、任务管理器结束任务)时没有 finally 可走 —— 浏览器
+    就会一直连那个死端口, 看起来像整台机器断网。看门狗进程是第一道兜底, 这里在
+    界面启动时再清一次场。
+    """
+    try:
+        import proxy_guard
+
+        root = (Path(os.environ.get('LOCALAPPDATA', str(Path.home() / 'AppData' / 'Local')))
+                / 'youziauth' / 'lptiyu' / 'capture')
+        return proxy_guard.recover_stale_backup(root / proxy_guard.BACKUP_NAME)
+    except Exception:                  # noqa: BLE001 —— 清场失败不能拦住界面启动
+        return False
+
+
 class DesktopBridge(LocationProbe):
     def __init__(self, config_path=None, dorm=None, startup_mode=False, accounts=None,
                  lptiyu=None):
         self._init_location()
+        recover_leftover_capture_proxy()
         self._config = gui.ensure_user_config(config_path or gui.DEFAULT_CONFIG_PATH)
         # 多账号：正式运行时由账号层提供「当前活动账号」的控制器（同一时刻只有一个活着，
         # 只有它在自动打卡）。注入 dorm（测试与旧调用点）时不叠账号层，直接用注入的控制器。

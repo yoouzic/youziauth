@@ -1,5 +1,6 @@
 import datetime as dt
 import json
+import os
 import tempfile
 import threading
 import time
@@ -8,6 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import agent_ipc
+import desktop_bridge
 import dorm_points
 import proxy_rules
 # 没有注入 lptiyu 控制器的用例会让 DesktopBridge 现场造一个真控制器, 而真控制器
@@ -35,6 +37,27 @@ from dorm_location import map_pick_sample
 
 def _at(value):
     return dt.datetime.fromisoformat(value)
+
+
+class LeftoverCaptureProxyTests(unittest.TestCase):
+    """2026-11-18: 采集崩溃后系统代理指向死端口, 浏览器整台断网。
+
+    界面启动时必须先清一次场; 清场失败也只能安静放过, 不能拦住界面启动。
+    """
+
+    def test_a_leftover_backup_in_the_capture_directory_is_recovered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'LOCALAPPDATA': tmp}), \
+                    patch('proxy_guard.recover_stale_backup',
+                          return_value=True) as recover:
+                self.assertTrue(desktop_bridge.recover_leftover_capture_proxy())
+            expected = (Path(tmp) / 'youziauth' / 'lptiyu' / 'capture'
+                        / 'proxy_backup.json')
+            self.assertEqual(Path(recover.call_args.args[0]), expected)
+
+    def test_a_failing_recovery_never_blocks_startup(self):
+        with patch('proxy_guard.recover_stale_backup', side_effect=OSError('nope')):
+            self.assertFalse(desktop_bridge.recover_leftover_capture_proxy())
 
 
 class FakeController:

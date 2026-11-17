@@ -219,6 +219,13 @@ class LptiyuController:
         # 所以在 capture_status 里做 60 秒缓存。
         self.capture = capture or CaptureSession(self.store.root / 'capture',
                                                  clock=self._clock)
+        # 上次采集如果被强杀, 代理可能还指着那个已经不存在的端口: 先还原再谈别的。
+        recover = getattr(self.capture, 'recover_stale_proxy', None)
+        if callable(recover):
+            try:
+                recover()
+            except Exception:          # noqa: BLE001 —— 清场失败不该拦住控制器构造
+                pass
         # 采集时代为唤起小程序: 少一步「去微信里翻出它」。
         self._open_applet = open_applet or open_mini_program
         self._capture_requested = False      # 某次跑批发现没凭证 → 下一拍自动采集
@@ -729,6 +736,25 @@ class LptiyuController:
             self.capture.start()
         except CaptureError as exc:
             raise LptiyuError('error', str(exc)) from exc
+        try:
+            return self._capture_until_done(auto)
+        finally:
+            # 任何提前返回/异常都不能把系统代理留在采集端口上: 那会让浏览器断网。
+            self._stop_if_capturing()
+
+    def _stop_if_capturing(self):
+        """兜底收尾: 采集还在等就立刻停掉(正常路径已经由 wait/poll 停过)。"""
+        try:
+            state = self.capture.status().get('state')
+        except Exception:              # noqa: BLE001 —— 状态读不到也不影响退出
+            return
+        if state in ('waiting', 'capturing'):
+            try:
+                self.capture.stop('idle', '')
+            except Exception:          # noqa: BLE001 —— 收尾必须尽力
+                pass
+
+    def _capture_until_done(self, auto):
         launched = False
         try:
             launched = bool(self._open_applet())

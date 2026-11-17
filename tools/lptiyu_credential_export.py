@@ -60,7 +60,13 @@ def ask_pin() -> str:
     raise SystemExit('PIN 没输入成功, 退出。')
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ['--proxy-guard']:
+        # 采集代理看门狗: 冻结包用自身 exe 再起一个独立进程。必须最先分派,
+        # 否则看门狗会掉进下面的交互流程去问 PIN。
+        import proxy_guard
+        return proxy_guard.main(argv[1:])
     print('=' * 56, flush=True)
     print('乐跑凭证提取器(在自己的电脑上运行)', flush=True)
     print('=' * 56, flush=True)
@@ -92,32 +98,38 @@ def main() -> int:
     print('      采集证书就绪。')
 
     print('[2/3] 开始采集: 稍后会自动打开微信小程序, 请在里面进入一次跑步首页。')
+    session.recover_stale_proxy()          # 上次被强杀留下的代理, 先还原
     try:
         session.start()
     except CaptureError as exc:
         print(f'启动失败: {exc}')
         return 2
-    launched = open_mini_program()
-    if not launched:
-        print('      没能自动唤起小程序, 请自己打开微信搜索「数体智慧体育」进跑步首页。')
+    try:
+        launched = open_mini_program()
+        if not launched:
+            print('      没能自动唤起小程序, 请自己打开微信搜索「数体智慧体育」进跑步首页。')
 
-    print('[3/3] 等待小程序请求(最多 9 分钟, 抓到就自动收尾)…')
-    last_hint = time.time()
-    while True:
-        cred = session.poll()
-        if cred:
-            break
-        status = session.status()
-        if status.get('state') != 'waiting':
-            print(f'采集结束: {status.get("message") or "已停止"}')
-            return 1
-        if time.time() - last_hint > 30:
-            last_hint = time.time()
-            print(f'      还在等…(已连接 {getattr(session, "connects", 0)} 次) '
-                  '如果一直没流量: 确认微信用的是系统代理、小程序真的打开了。')
-        time.sleep(1.0)
+        print('[3/3] 等待小程序请求(最多 9 分钟, 抓到就自动收尾)…')
+        last_hint = time.time()
+        while True:
+            cred = session.poll()
+            if cred:
+                break
+            status = session.status()
+            if status.get('state') != 'waiting':
+                print(f'采集结束: {status.get("message") or "已停止"}')
+                return 1
+            if time.time() - last_hint > 30:
+                last_hint = time.time()
+                print(f'      还在等…(已连接 {getattr(session, "connects", 0)} 次) '
+                      '如果一直没流量: 确认微信用的是系统代理、小程序真的打开了。')
+            time.sleep(1.0)
 
-    session.stop('captured', '已抓到凭证')
+        session.stop('captured', '已抓到凭证')
+    finally:
+        # 中途任何退出(Ctrl+C、异常、提前 return)都不能把系统代理留在采集端口上,
+        # 否则用户一断网就再也上不了网。
+        session.stop('idle', '')
 
     file_dict = seal_credential(cred, pin)
     target = desktop_dir() / export_file_name()

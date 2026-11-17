@@ -935,6 +935,27 @@ class CaptureFlowTests(PanelTestCase):
             controller._capture_flow()
         self.assertIn("证书", caught.exception.message)
 
+    def test_an_exception_mid_capture_still_stops_the_proxy(self):
+        # 2026-11-18: 采集期间被强杀会把系统代理留在死端口上, 浏览器整台断网。
+        # 采集流程自己抛异常时也必须走同一条收尾路径。
+        class ExplodingCapture(FakeCapture):
+            def log(self, message):
+                # 真采集器的 log 不会改状态; 假采集器的 log 会顺手把状态复位,
+                # 这里保留「still waiting」才能验证异常收尾会停掉采集。
+                self.logs.append(message)
+
+            def wait(self, timeout=None, on_tick=None):
+                if on_tick is not None:
+                    on_tick()
+                raise RuntimeError("boom")
+
+        capture = ExplodingCapture(cred=self.CRED)
+        controller = self.make_controller(capture=capture)
+        with self.assertRaises(RuntimeError):
+            controller._capture_flow()
+        self.assertTrue(capture.stops, "异常收尾也必须停采集, 否则代理留在用户身上")
+        self.assertEqual(capture.stops[-1][0], "idle")
+
     def test_failed_probe_marks_the_token_dead(self):
         controller = self.make_controller(capture=FakeCapture(cred=self.CRED))
         with patch.object(LptiyuController, "_probe_alive", lambda self, client: False):

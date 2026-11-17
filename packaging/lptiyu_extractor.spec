@@ -24,8 +24,10 @@ a = Analysis(
         "lptiyu", "lptiyu.spec", "lptiyu.cipher", "lptiyu.tls", "lptiyu.wire",
         "lptiyu.client", "lptiyu.tracks", "lptiyu.zones", "lptiyu.upfile", "lptiyu.flow",
         "lptiyu_store", "lptiyu_panel", "lptiyu_renew", "lptiyu_capture",
-        # 提取器自身的凭证密封模块
+        # 提取器自己的凭证密封模块
         "lptiyu_credential",
+        # 采集代理看门狗: 提取器也要在 --proxy-guard 模式下再起一个自身进程。
+        "proxy_guard",
     ],
     hookspath=[],
     hooksconfig={},

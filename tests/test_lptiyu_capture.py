@@ -8,10 +8,12 @@
 """
 import datetime as dt
 import json
+import os
 import socket
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -290,6 +292,13 @@ class FakeServer:
         self.stopped = True
 
 
+class HangingServer(FakeServer):
+    """模拟 shutdown() 卡住的采集服务: 停采集不能被它挂住。"""
+
+    def shutdown(self):
+        threading.Event().wait(30)
+
+
 class FakeProxy:
     def __init__(self):
         self.pointed = 0
@@ -306,6 +315,14 @@ class FakeProxy:
         self.restored += 1
         self.backup = False
         return True
+
+
+class BrokenBackupProxy(FakeProxy):
+    """备份写不进去时必须直接放弃采集, 而不是先改代理再说。"""
+
+    def point_at(self, port):
+        self.restored = 0
+        raise cap.CaptureError("无法备份系统代理")
 
 
 class FakeCA:
@@ -329,14 +346,15 @@ class FakeCA:
 
 
 class SessionTests(unittest.TestCase):
-    def session(self, installed=True, timeout=5):
+    def session(self, installed=True, timeout=5, server_factory=FakeServer,
+                guard_factory=None, proxy_factory=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        proxy = FakeProxy()
+        proxy = proxy_factory() if proxy_factory is not None else FakeProxy()
         ca = FakeCA(installed)
         session = cap.CaptureSession(
             Path(tmp.name), proxy_factory=lambda: proxy, ca=ca, timeout_s=timeout,
-            server_factory=FakeServer)
+            server_factory=server_factory, guard_factory=guard_factory)
         return session, proxy, ca
 
     def test_start_refuses_until_the_certificate_is_installed(self):
@@ -421,6 +439,33 @@ class SessionTests(unittest.TestCase):
         proxy.backup = True
         session.start()
         self.assertGreaterEqual(proxy.restored, 1, "上次崩溃留下的代理先还原再开始")
+        session.stop("idle", "")
+
+    def test_stop_is_bounded_when_the_server_will_not_shut_down(self):
+        session, proxy, _ca = self.session(server_factory=HangingServer)
+        session.start()
+        started = time.monotonic()
+        session.stop("idle", "")
+        self.assertLess(time.monotonic() - started, 8.0,
+                        "shutdown 卡住时也必须尽快收尾, 否则界面退不出去、代理留在用户身上")
+        self.assertEqual(proxy.restored, 1)
+
+    def test_a_capture_that_cannot_back_up_the_proxy_never_starts(self):
+        broken = BrokenBackupProxy()
+        session, _proxy, _ca = self.session(proxy_factory=lambda: broken)
+        with self.assertRaises(cap.CaptureError):
+            session.start()
+        self.assertEqual(broken.pointed, 0, "备份没落盘就不该改系统代理")
+
+    def test_start_arms_a_proxy_guard(self):
+        spawned = []
+        session, _proxy, _ca = self.session(
+            guard_factory=lambda *args: spawned.append(args))
+        session.start()
+        self.assertEqual(len(spawned), 1, "采集开始就要有独立看门狗等父进程退出")
+        path, parent_pid, _reg = spawned[0]
+        self.assertEqual(Path(path).name, cap.BACKUP_NAME)
+        self.assertEqual(parent_pid, os.getpid())
         session.stop("idle", "")
 
 
