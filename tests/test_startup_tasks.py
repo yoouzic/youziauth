@@ -191,6 +191,13 @@ class ElevatedLaunchTests(unittest.TestCase):
         patch = mock.patch.object(startup_tasks.ctypes, "windll", fakes)
         patch.start()
         self.addCleanup(patch.stop)
+        # ctypes.get_last_error() 是线程私有的「最近一次错误」, 会被同线程里更早的
+        # 调用(例如看门狗探测进程存活)留成别的值。测试里固定为 0, 让错误码只来自
+        # 下面的假 kernel32.GetLastError() —— 否则这个用例会随执行顺序偶发失败。
+        last_error = mock.patch.object(startup_tasks.ctypes, "get_last_error",
+                                       return_value=0)
+        last_error.start()
+        self.addCleanup(last_error.stop)
 
     def test_runs_the_helper_with_runas_and_returns_its_exit_code(self):
         code = startup_tasks.launch_elevated(["--configure-system-startup=enable"])
