@@ -205,18 +205,22 @@ function Assert-FrozenGuiBoots {
 Assert-FrozenGuiBoots -AppDir $AppDir -DistDir $DistDir
 
 function Build-TrayLauncher {
-    param([string]$AppDir, [string]$BuildDir, [string]$Python)
+    param([string]$AppDir, [string]$BuildDir)
     # .NET Framework ships with supported Windows versions. The login task can
     # wait for Python safely without running an inline PowerShell script.
     $compiler = Join-Path $env:SystemRoot "Microsoft.NET\Framework\v4.0.30319\csc.exe"
     if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
         throw ".NET Framework C# compiler not found at $compiler"
     }
-    $pythonDll = & $Python -c 'import sys; print("python%d%d.dll" % sys.version_info[:2])'
-    if ($LASTEXITCODE -ne 0 -or $pythonDll -notmatch '^python\d+\.dll$') {
-        throw "Could not identify the bundled Python runtime"
+    $runtimeDir = Join-Path $AppDir "_internal"
+    # Skip python3.dll, the stable ABI shim. Pin the actual bundled interpreter.
+    $runtimeDlls = @(Get-ChildItem -LiteralPath $runtimeDir -File |
+        Where-Object { $_.Name -match '^python[0-9]{2,}t?\.dll$' })
+    if ($runtimeDlls.Count -ne 1) {
+        throw "Expected one versioned Python DLL in $runtimeDir"
     }
-    $library = Join-Path $AppDir "_internal\base_library.zip"
+    $pythonDll = $runtimeDlls[0].Name
+    $library = Join-Path $runtimeDir "base_library.zip"
     $hash = (Get-FileHash -LiteralPath $library -Algorithm SHA256).Hash
     $runtimeSource = Join-Path $BuildDir "TrayRuntime.cs"
     @"
@@ -246,7 +250,7 @@ internal static class TrayRuntime
         $probe.Dispose()
     }
 }
-Build-TrayLauncher -AppDir $AppDir -BuildDir $BuildDir -Python $Python
+Build-TrayLauncher -AppDir $AppDir -BuildDir $BuildDir
 
 if ($FrozenOnly) {
     Write-Host "Frozen-only build requested; stopping before the MSI step."
