@@ -28,6 +28,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+import proxy_guard  # noqa: E402
 from lptiyu_capture import CaptureError, CaptureSession  # noqa: E402
 from lptiyu_credential import (desktop_dir, export_file_name,  # noqa: E402
                                seal_credential)
@@ -65,7 +66,6 @@ def main(argv=None) -> int:
     if argv[:1] == ['--proxy-guard']:
         # 采集代理看门狗: 冻结包用自身 exe 再起一个独立进程。必须最先分派,
         # 否则看门狗会掉进下面的交互流程去问 PIN。
-        import proxy_guard
         return proxy_guard.main(argv[1:])
     print('=' * 56, flush=True)
     print('乐跑凭证提取器(在自己的电脑上运行)', flush=True)
@@ -84,7 +84,9 @@ def main(argv=None) -> int:
         print(exc)
         return 2
 
-    session = CaptureSession(WORK_ROOT / 'capture', timeout_s=TIMEOUT_SECONDS)
+    capture_root = WORK_ROOT / 'capture'
+    session = CaptureSession(capture_root, timeout_s=TIMEOUT_SECONDS,
+                             proxy_backup_path=proxy_guard.shared_backup_path())
     print()
     print('[1/3] 检查采集证书…')
     cert = session.cert_status()
@@ -98,7 +100,6 @@ def main(argv=None) -> int:
     print('      采集证书就绪。')
 
     print('[2/3] 开始采集: 稍后会自动打开微信小程序, 请在里面进入一次跑步首页。')
-    session.recover_stale_proxy()          # 上次被强杀留下的代理, 先还原
     try:
         session.start()
     except CaptureError as exc:
@@ -137,7 +138,9 @@ def main(argv=None) -> int:
     print()
     print('完成! 凭证文件已存到桌面:')
     print(f'    {target}')
-    print('把它发给管理员, 并口头告知 PIN。系统代理已还原。')
+    print('把它发给管理员, 并口头告知 PIN。')
+    if session.status()['state'] == 'error':
+        print(session.status()['message'])
     return 0
 
 

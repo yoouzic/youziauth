@@ -25,6 +25,7 @@ from typing import Callable, Optional
 import auto_update
 import campus_auth
 from agent_ipc import AgentCommand, NamedPipeServer, RuntimeSnapshot, read_snapshot, write_snapshot
+from app_update import read_current_version
 from auth_runtime import AgentState, AuthAttempt, AttemptKind, RetryPolicy
 from network_probe import NetworkObservation, NetworkProbe
 from windows_credentials import CredentialError, CredentialStore, machine_config_path, program_data_root
@@ -162,7 +163,8 @@ def _is_install_result(status) -> bool:
     """
     state = getattr(status, "state", "")
     detail = str(getattr(status, "detail", "") or "")
-    return state in ("installed", "installing") or detail.startswith("install")
+    return (state in ("installed", "installing") or detail.startswith("install")
+            or (state == "error" and (detail == "tray startup failed" or detail.startswith("health check failed"))))
 
 
 class Agent:
@@ -197,6 +199,7 @@ class Agent:
         self.snapshot_path = Path(snapshot_path)
         self.logger = logger
         self.boot_id = boot_id or current_boot_id()
+        self._app_version = read_current_version(Path(__file__).with_name("VERSION"))
         # 快照是所有读者（界面 / 巡检 / 指令）共用的一份状态，写它必须串行；
         # RLock 是因为 _publish 之间偶尔会互相嵌套（例如更新进度回调）。
         self._snapshot_lock = threading.RLock()
@@ -885,7 +888,8 @@ class Agent:
     def handle_command(self, command: AgentCommand) -> dict[str, object]:
         self._recover_update()
         if command.command == "status":
-            snapshot = self._current_snapshot()
+            return {"ok": True, "snapshot": dataclasses.asdict(self._current_snapshot()),
+                    "app_version": self._app_version}
         elif command.command == "retry":
             # 立刻返回；强制登录由主循环执行。这个 handler 是单线程的，
             # 在这里做网络 I/O 会让整条指令通道跟着一起卡住。
@@ -1358,6 +1362,7 @@ def build_updater(app_dir: Path, allowed_user_sid: str | None = None) -> tuple:
             executable=install_dir / "youziauth.exe",
             relaunch=run_tray_task,
             agent_relaunch=run_agent_task,
+            tray_user_sid=allowed_user_sid,
             log_dir=Path(app_dir) / "updates",
         )
         return updater, ""

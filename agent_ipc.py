@@ -28,7 +28,7 @@ ALLOWED_COMMANDS = {
     # 安装什么，未提权的进程无法让它安装任意文件。
     "check-update",
 }
-ALLOWED_UI_COMMANDS = {"show", "settings", "retry", "suppress"}
+ALLOWED_UI_COMMANDS = {"show", "settings", "retry", "suppress", "status"}
 ALLOWED_STATES = {
     "online_external",
     "online_campus",

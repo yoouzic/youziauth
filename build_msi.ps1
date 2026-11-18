@@ -204,6 +204,50 @@ function Assert-FrozenGuiBoots {
 }
 Assert-FrozenGuiBoots -AppDir $AppDir -DistDir $DistDir
 
+function Build-TrayLauncher {
+    param([string]$AppDir, [string]$BuildDir, [string]$Python)
+    # .NET Framework ships with supported Windows versions. The login task can
+    # wait for Python safely without running an inline PowerShell script.
+    $compiler = Join-Path $env:SystemRoot "Microsoft.NET\Framework\v4.0.30319\csc.exe"
+    if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+        throw ".NET Framework C# compiler not found at $compiler"
+    }
+    $pythonDll = & $Python -c 'import sys; print("python%d%d.dll" % sys.version_info[:2])'
+    if ($LASTEXITCODE -ne 0 -or $pythonDll -notmatch '^python\d+\.dll$') {
+        throw "Could not identify the bundled Python runtime"
+    }
+    $library = Join-Path $AppDir "_internal\base_library.zip"
+    $hash = (Get-FileHash -LiteralPath $library -Algorithm SHA256).Hash
+    $runtimeSource = Join-Path $BuildDir "TrayRuntime.cs"
+    @"
+[assembly: System.Reflection.AssemblyFileVersion("$Version.0")]
+internal static class TrayRuntime
+{
+    internal const string PythonDll = "$pythonDll";
+    internal const string BaseLibraryHash = "$hash";
+}
+"@ | Set-Content -LiteralPath $runtimeSource -Encoding utf8
+    $launcher = Join-Path $AppDir "youziauth-tray-launcher.exe"
+    $launcherSource = Join-Path $PackagingDir "TrayLauncher.cs"
+    & $compiler /nologo /target:winexe /optimize+ "/out:$launcher" $launcherSource $runtimeSource
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
+        throw "Tray launcher compilation failed"
+    }
+    $probe = Start-Process -FilePath $launcher -ArgumentList "--verify-runtime" -WindowStyle Hidden -PassThru
+    try {
+        if (-not $probe.WaitForExit(15000)) {
+            $probe.Kill()
+            throw "Tray launcher did not complete the bundled runtime check"
+        }
+        if ($probe.ExitCode -ne 0) {
+            throw "Tray launcher could not read the packaged runtime (exit $($probe.ExitCode))"
+        }
+    } finally {
+        $probe.Dispose()
+    }
+}
+Build-TrayLauncher -AppDir $AppDir -BuildDir $BuildDir -Python $Python
+
 if ($FrozenOnly) {
     Write-Host "Frozen-only build requested; stopping before the MSI step."
     exit 0

@@ -17,6 +17,7 @@ import time
 import unittest
 import urllib.parse
 from pathlib import Path
+from types import SimpleNamespace
 
 from unittest.mock import patch
 
@@ -273,6 +274,39 @@ class SystemProxyTests(unittest.TestCase):
     def test_restore_without_backup_is_harmless(self):
         self.assertFalse(cap.SystemProxy(self.backup, reg_path=self.REG).restore())
 
+    def test_a_second_session_cannot_replace_an_active_backup(self):
+        self.proxy.point_at(18888)
+        try:
+            second = cap.SystemProxy(self.backup, reg_path=self.REG)
+            with self.assertRaises(cap.CaptureError):
+                second.point_at(18889)
+            self.assertEqual(self.proxy.read()[1], "127.0.0.1:18888")
+            self.assertEqual(json.loads(self.backup.read_text())["port"], 18888)
+        finally:
+            self.proxy.restore()
+        self.assertEqual(self.proxy.read()[1], "127.0.0.1:7890")
+
+    def test_normal_restore_preserves_an_external_proxy_change(self):
+        self.proxy.point_at(18888)
+        self.proxy.write(1, "new-proxy.example:8080", "<local>")
+        self.assertFalse(self.proxy.restore())
+        self.assertEqual(self.proxy.read()[1], "new-proxy.example:8080")
+        self.assertFalse(self.backup.exists())
+
+    def test_stop_requests_watchdog_recovery_after_transient_restore_failure(self):
+        session = cap.CaptureSession(self.backup.parent, ca=FakeCA(),
+                                     proxy_factory=lambda: self.proxy, server_factory=FakeServer,
+                                     guard_factory=lambda *_: SimpleNamespace(pid=4321))
+        session.start()
+        capture_id = self.proxy.capture_id
+        with patch.object(cap.proxy_guard, "write_proxy", side_effect=PermissionError("temporarily locked")):
+            session.stop("idle", "已停止采集")
+        self.assertEqual(session.status()["state"], "error")
+        self.assertTrue(cap.proxy_guard.read_backup(self.backup)["release_requested"])
+        self.assertEqual(cap.proxy_guard.main([str(self.backup), str(os.getpid()), self.REG, capture_id]), 0)
+        self.assertEqual(self.proxy.read()[1], "127.0.0.1:7890")
+        session.stop()
+
 
 class FakeServer:
     def __init__(self, ca, sink, port=0):
@@ -418,14 +452,59 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(session.status()["state"], "timeout")
         self.assertEqual(proxy.restored, 1)
 
-    def test_a_stolen_proxy_is_pointed_back_at_us(self):
+    def test_an_external_proxy_change_stops_capture(self):
         session, proxy, _ca = self.session()
         proxy.read = lambda: (1, "127.0.0.1:7890", "")     # Clash 抢回去了
-        proxy.pointed = 0
         session.start()
-        self.assertTrue(session.ensure_proxy(), '被抢走就要抢回来')
-        self.assertEqual(proxy.pointed, 18888)
-        session.stop("idle", "")
+        proxy.pointed = 0
+        session.ensure_proxy()
+        self.assertEqual(proxy.pointed, 0, "不应再覆盖另一个程序设置的代理")
+        self.assertEqual(session.status()["state"], "idle")
+        self.assertEqual(proxy.restored, 1)
+
+    def test_stop_clears_port_and_cancels_the_wait_tick(self):
+        session, proxy, _ca = self.session()
+        proxy.read = lambda: (0, "", "")
+        session.start()
+        session.stop("idle", "已停止采集")
+        proxy.pointed = 0
+        session.ensure_proxy()
+        ticks = []
+        session.wait(timeout=0.01, on_tick=lambda: ticks.append(1))
+        self.assertEqual(ticks, [])
+        self.assertEqual(proxy.pointed, 0)
+        self.assertEqual(session.status()["port"], 0)
+        self.assertEqual(session.status()["message"], "已停止采集")
+
+    def test_an_old_wait_does_not_stop_a_new_capture(self):
+        session, proxy, _ca = self.session()
+        session.start()
+
+        def restart():
+            session.stop("idle", "")
+            session.start()
+
+        try:
+            self.assertIsNone(session.wait(timeout=0.01, on_tick=restart))
+            self.assertEqual(session.status()["state"], "waiting")
+            self.assertEqual(proxy.restored, 1)
+        finally:
+            session.stop()
+
+    def test_listener_start_failure_does_not_switch_the_proxy(self):
+        session, proxy, _ca = self.session()
+        with patch.object(threading.Thread, "start", side_effect=RuntimeError("can't start thread")):
+            with self.assertRaises(cap.CaptureError):
+                session.start()
+        self.assertEqual(proxy.pointed, 0)
+        self.assertEqual(session.status()["port"], 0)
+
+    def test_watchdog_start_failure_does_not_switch_the_proxy(self):
+        session, proxy, _ca = self.session(guard_factory=lambda *_: None)
+        with self.assertRaises(cap.CaptureError):
+            session.start()
+        self.assertEqual(proxy.pointed, 0)
+        self.assertEqual(session.status()["port"], 0)
 
     def test_wait_reports_progress_on_every_tick(self):
         session, _proxy, _ca = self.session(timeout=3.0)
@@ -460,7 +539,7 @@ class SessionTests(unittest.TestCase):
     def test_start_arms_a_proxy_guard(self):
         spawned = []
         session, _proxy, _ca = self.session(
-            guard_factory=lambda *args: spawned.append(args))
+            guard_factory=lambda *args: spawned.append(args) or SimpleNamespace(pid=4321))
         session.start()
         self.assertEqual(len(spawned), 1, "采集开始就要有独立看门狗等父进程退出")
         path, parent_pid, _reg = spawned[0]

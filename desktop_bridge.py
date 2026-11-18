@@ -943,8 +943,10 @@ class DesktopBridge(LocationProbe):
             controller = self._lptiyu
             if controller is None:
                 raise RuntimeError('乐跑功能在本机暂不可用')
-            controller.capture_stop()
-            return '已停止采集，系统代理已还原'
+            result = controller.capture_stop()
+            if result['state'] == 'error':
+                raise RuntimeError(result['message'])
+            return result['message']
         if action in ('lptiyu_cert_install', 'lptiyu_cert_remove'):
             controller = self._lptiyu
             if controller is None:

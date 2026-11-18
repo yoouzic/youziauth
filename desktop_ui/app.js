@@ -133,6 +133,12 @@ const NET_LEVEL = {WARNING:'警告', ERROR:'错误', CRITICAL:'严重'};
 const NET_UPDATE_STATE = {idle:'等待检查', checking:'正在检查', downloading:'正在后台下载',
   verifying:'正在校验', ready:'准备安装', up_to_date:'已是最新', installing:'正在安装',
   installed:'已更新完成', error:'更新未完成', launching:'正在安装', launched:'已更新完成'};
+function updateRecoveryLabel(state,detail){
+  if(state==='installing'&&detail==='installer recovery pending')return '正在确认程序启动';
+  if(state==='installed'&&detail==='reboot required')return '等待重启';
+  if(state==='installed'&&detail==='tray deferred')return '等待登录启动托盘';
+  return '';
+}
 // 例行行：心跳与「已认证」的例行检测。它们每分钟/每半小时来一条，不该把人从旧记录里叫回来。
 const LOG_ROUTINE_LINE = /^\d{2}:\d{2}\s+(?:后台检查正常|例行检测：已认证)(?:（×\d+，至 \d{2}:\d{2}）)?$/;
 // 乐跑自己的例行行：探活成功一天出现好几次，不该把人从旧记录里叫回来。
@@ -156,9 +162,10 @@ function netLabel(message){
     const version = (m[4] || m[3] || '').replace(/^v/, '');
     // 尾部通常是 detail=…；以后加了别的字段也照抄，不能因为多一个字段就退回整行原文。
     const tail = (m[5] || '').replace(/^detail=/, '');
+    const recovery = updateRecoveryLabel(m[2],tail);
     return (m[1] === 'requested' ? '手动检查更新：' : '后台更新：')
-      + (NET_UPDATE_STATE[m[2]] || m[2]) + (version ? '（v' + version + '）' : '')
-      + (tail ? ' · ' + tail : '');
+      + (recovery || NET_UPDATE_STATE[m[2]] || m[2]) + (version ? '（v' + version + '）' : '')
+      + (tail&&!recovery ? ' · ' + tail : '');
   }
   if((m = /^automatic update failed: (.*)$/.exec(message))) return '自动更新未完成（' + m[1] + '）';
   if((m = /^automatic update disabled: (.*)$/.exec(message))) return '自动更新未启用：' + m[1];
@@ -533,14 +540,16 @@ function renderChanges(u){
 }
 function renderUpdates(){
   const u=state.update,error=u.state==='error';
-  const done=u.state==='installed';
+  const installed=u.state==='installed';
+  const recovery=updateRecoveryLabel(u.state,u.detail);
+  const done=installed&&!recovery;
   const busy=['checking','downloading','verifying','installing','ready'].includes(u.state);
   // 后台自动更新：界面只报进度，不再有「可以安装 / 已打开安装向导」这类需要用户
   // 参与的状态。安装由常驻的提权代理完成。
   const names={idle:'等待检查',checking:'正在检查',downloading:'正在后台下载',verifying:'正在验证',
     ready:'准备安装',up_to_date:'无需更新',installing:'正在后台安装',installed:'已自动更新',
     error:'更新未完成',launching:'正在安装',launched:'已自动更新'};
-  badge('update-status',names[u.state]||'等待检查',error?'error':done||u.state==='up_to_date'?'success':'');
+  badge('update-status',recovery||names[u.state]||'等待检查',error?'error':done||u.state==='up_to_date'?'success':'');
   $('update-current-version').textContent=u.current_version;
   $('update-latest-version').textContent=u.latest_version||'尚未检查';
   $('update-message').textContent=u.message;
@@ -553,13 +562,13 @@ function renderUpdates(){
   $('update-progress-label').textContent=progressVisible?'后台更新进度 · '+Math.round(u.progress)+'%':'后台更新进度';
   $('update-download-size').textContent=u.total_bytes?updateSize(u.downloaded_bytes)+' / '+updateSize(u.total_bytes)
     :u.downloaded_bytes||u.state==='downloading'?updateSize(u.downloaded_bytes)+' · 总大小未知':'尚未下载';
-  // 安装不再需要用户确认，所以全局提示只在成功和失败时出现。
+  // 安装结束后保留实际结果，包含待重启和托盘延后启动的情况。
   const notice=done?'已自动更新到 '+u.latest_version+' · '+u.message
-    :error?'自动更新未完成 · '+u.message:'';
+    :installed?u.message:error?'自动更新未完成 · '+u.message:'';
   // Keep polling quiet, including the live region when its text has not changed.
   if($('update-notice-text').textContent!==notice)$('update-notice-text').textContent=notice;
   $('update-notice').classList.toggle('error',error);
-  $('update-notice').hidden=!done&&!error;
+  $('update-notice').hidden=!installed&&!error;
   renderChanges(u);
 }
 function requireUpdateSync(){

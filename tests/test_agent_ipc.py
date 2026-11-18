@@ -60,6 +60,7 @@ class CommandTests(unittest.TestCase):
 
     def test_ui_command_has_separate_fixed_vocabulary(self):
         self.assertEqual(UiCommand.parse({"command": "show"}), UiCommand("show"))
+        self.assertEqual(UiCommand.parse({"command": "status"}), UiCommand("status"))
         with self.assertRaises(InvalidAgentCommand):
             UiCommand.parse({"command": "run-powershell"})
 

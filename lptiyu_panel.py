@@ -727,7 +727,9 @@ class LptiyuController:
 
     def capture_stop(self):
         self.capture.stop('idle', '已停止采集')
-        return self._set_latest('idle', '已停止采集', record=False)
+        status = self.capture.status()
+        return self._set_latest(status.get('state', 'idle'),
+                                status.get('message') or '已停止采集', record=False)
 
     def _capture_flow(self):
         """等一次小程序登录, 把 token 与身份一起落盘, 然后当真门探活。"""
@@ -776,12 +778,13 @@ class LptiyuController:
         last_check = started_at
 
         def tick():
-            """每秒一次: 代理被抢走就抢回来; 25 秒还没流量就给一句诊断。"""
+            """结束被其他代理打断的采集，并提示无流量的情况。"""
             nonlocal hint_at, last_check
             stamp = time.monotonic()
             if stamp - last_check >= 10:
                 last_check = stamp
-                self.capture.ensure_proxy()
+                if self.capture.ensure_proxy():
+                    return
             if hint_at and stamp >= hint_at and not getattr(self.capture, 'connects', 0):
                 hint_at = 0
                 self.capture.log('25 秒内没有任何连接: 微信可能没走系统代理, 或被别的代理软件接管')

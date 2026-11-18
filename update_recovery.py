@@ -22,7 +22,9 @@ from pathlib import Path
 INSTALL_RESULT_FILE = 'install-result.json'
 CONSUMED_RESULT_FILE = 'install-result-consumed.json'
 RESULT_LIMIT = 4096
-_RESULT_FIELDS = frozenset({'code', 'relaunched', 'healthy', 'agent_restarted', 'launch_exit_code'})
+_RESULT_FIELDS = frozenset({'code', 'complete', 'tray_status', 'relaunched', 'healthy',
+                            'agent_restarted', 'launch_exit_code'})
+_TRAY_STATES = ('ready', 'deferred', 'failed')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,6 +67,31 @@ def _read_object(path: Path):
         return None
 
 
+def is_pending_success(result: dict) -> bool:
+    # Before "complete" existed, a bare success code was written before the
+    # detached worker had checked either application. It can outlive the worker.
+    return result == {'code': 0} or result == {'code': 0, 'complete': False}
+
+
+def valid_installer_result(result: dict) -> bool:
+    if (set(result) - _RESULT_FIELDS or type(result.get('code')) is not int
+            or not -0x80000000 <= result['code'] <= 0xFFFFFFFF):
+        return False
+    if any(type(result[field]) is not bool
+           for field in ('relaunched', 'healthy', 'agent_restarted') if field in result):
+        return False
+    if ('launch_exit_code' in result and (type(result['launch_exit_code']) is not int
+            or not -0x80000000 <= result['launch_exit_code'] <= 0xFFFFFFFF)):
+        return False
+    if 'complete' not in result:
+        return 'tray_status' not in result
+    if type(result['complete']) is not bool or result['code'] != 0:
+        return False
+    if not result['complete']:
+        return is_pending_success(result)
+    return 'healthy' in result and result.get('tray_status') in _TRAY_STATES
+
+
 def read_install_result(path: Path) -> InstallResult | None:
     value = _read_object(path)
     if value is None or set(value) != {'version', 'result', 'checked'}:
@@ -78,16 +105,8 @@ def read_install_result(path: Path) -> InstallResult | None:
     if 'error' in result:
         if set(result) != {'error'} or type(result['error']) is not int or not 0 < result['error'] <= 0xFFFFFFFF:
             return None
-    else:
-        if ('code' not in result or set(result) - _RESULT_FIELDS
-                or type(result['code']) is not int or not -0x80000000 <= result['code'] <= 0xFFFFFFFF):
-            return None
-        for field in ('relaunched', 'healthy', 'agent_restarted'):
-            if field in result and type(result[field]) is not bool:
-                return None
-        if ('launch_exit_code' in result and (type(result['launch_exit_code']) is not int
-                or not -0x80000000 <= result['launch_exit_code'] <= 0xFFFFFFFF)):
-            return None
+    elif not valid_installer_result(result):
+        return None
     canonical = json.dumps(value, sort_keys=True, separators=(',', ':')).encode('utf-8')
     return InstallResult(version, result, checked, hashlib.sha256(canonical).hexdigest())
 

@@ -26,7 +26,8 @@ class AgentUpdateRecoveryTests(unittest.TestCase):
 
     def write_result(self):
         (self.updates / 'install-result.json').write_text(json.dumps({
-            'version': '1.8.27', 'result': {'code': 0, 'healthy': True, 'agent_restarted': True},
+            'version': '1.8.27', 'result': {'code': 0, 'complete': True, 'healthy': True,
+                                            'tray_status': 'ready', 'agent_restarted': True},
             'checked': dt.datetime.now(dt.timezone.utc).isoformat()}), encoding='utf-8')
 
     def make_agent(self):

@@ -237,10 +237,11 @@ class WindowsTrayIcon:
         if not is_supported():
             return False
         if self._thread and self._thread.is_alive():
-            return True
+            return self._icon_added
+        self._ready.clear()
         self._thread = threading.Thread(target=self._message_loop, daemon=True)
         self._thread.start()
-        return self._ready.wait(3)
+        return self._ready.wait(3) and self._icon_added
 
     def update(self, status: TrayStatus, detail: str = "") -> None:
         self.status = status
@@ -285,6 +286,11 @@ class WindowsTrayIcon:
             shell32.Shell_NotifyIconW(self.NIM_ADD, ctypes.byref(self._notify_data()))
         )
         self._ready.set()
+        if not self._icon_added:
+            if self._hwnd:
+                user32.DestroyWindow(self._hwnd)
+                self._hwnd = None
+            return
 
         message = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(message), None, 0, 0) != 0:

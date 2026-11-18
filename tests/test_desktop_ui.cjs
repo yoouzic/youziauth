@@ -837,6 +837,21 @@ test('a silent install reports progress and then success without a confirmation 
   assert.equal(h.calls.length,0);
 });
 
+test('update recovery displays its remaining step without saying the update succeeded',async()=>{
+  const cases=[
+    ['installing','installer recovery pending','正在确认程序启动'],
+    ['installed','reboot required','等待重启'],
+    ['installed','tray deferred','等待登录启动托盘'],
+  ];
+  for(const [state,detail,label] of cases){
+    const message='v1.5.0 '+label;
+    const h=await updateHarness({state,detail,progress:100,latest_version:'1.5.0',message});
+    assert.equal(h.el('update-status').textContent,label);
+    assert.doesNotMatch(h.el('update-notice-text').textContent,/已自动更新/);
+    if(state==='installed')assert.equal(h.el('update-notice-text').textContent,message);
+  }
+});
+
 test('snapshot failure disables the check button instead of dispatching',async()=>{
   const h=await updateHarness({state:'up_to_date',latest_version:'1.4.4',message:'当前已是最新正式版。'});
   assert.equal(h.el('check-updates').disabled,false);

@@ -33,6 +33,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 import proxy_guard
@@ -387,99 +388,62 @@ class SystemProxy:
     def __init__(self, backup_path: Path, reg_path: str = REG_PATH):
         self.backup_path = Path(backup_path)
         self.reg_path = reg_path
-        self._saved = None
-
-    def _open(self, write=False):
-        import winreg
-        return winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, self.reg_path, 0,
-            winreg.KEY_READ | (winreg.KEY_SET_VALUE if write else 0))
+        self.capture_id = None
 
     def read(self):
-        import winreg
-        with self._open() as key:
-            try:
-                enable = int(winreg.QueryValueEx(key, "ProxyEnable")[0])
-            except FileNotFoundError:
-                enable = 0
-            try:
-                server = str(winreg.QueryValueEx(key, "ProxyServer")[0])
-            except FileNotFoundError:
-                server = ""
-            try:
-                override = str(winreg.QueryValueEx(key, "ProxyOverride")[0])
-            except FileNotFoundError:
-                override = ""
-        return enable, server, override
+        return proxy_guard.read_proxy(self.reg_path)
 
     def write(self, enable, server, override=None):
-        import winreg
-        with self._open(write=True) as key:
-            winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, int(bool(enable)))
-            winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, str(server))
-            if override is not None:
-                winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, str(override))
-        self._notify()
+        proxy_guard.write_proxy(enable, server, override, self.reg_path)
 
-    @staticmethod
-    def _notify():
-        try:
-            import ctypes
-            ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)   # SETTINGS_CHANGED
-            ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)   # REFRESH
-        except Exception:                  # noqa: BLE001 —— 无 WinINet 时忽略
-            pass
-
-    def point_at(self, port):
-        """把系统代理指到本机采集端口, 并先把原值备份下来。
-
-        备份必须真的落盘才允许改代理: 以前写失败只是 `pass`, 于是进程一旦被杀
-        就没有任何东西能还原 —— 浏览器被留在死端口上, 整台机器看起来断网。
-        """
-        if self._saved is None:
-            self._saved = self.read()
-        try:
+    def prepare(self, port):
+        """Reserve the shared backup and record the current proxy before switching."""
+        with proxy_guard.backup_lock(self.backup_path):
+            previous = proxy_guard.read_backup(self.backup_path)
+            if previous is not None:
+                if proxy_guard.backup_is_active(self.backup_path, previous):
+                    raise CaptureError("另一个采集正在使用系统代理，请先结束该采集")
+                proxy_guard.restore_locked_backup(self.backup_path, previous, self.reg_path)
+            elif self.backup_path.exists():
+                raise CaptureError("无法读取上次的系统代理备份，请检查后再开始采集")
+            if self.backup_path == proxy_guard.shared_backup_path():
+                legacy = proxy_guard.legacy_extractor_backup_path()
+                proxy_guard.recover_stale_backup(legacy, self.reg_path)
+                if legacy.exists():
+                    raise CaptureError("旧版提取器的代理备份仍在使用或无法读取，请先结束该采集")
+            enable, server, override = self.read()
+            capture_id = uuid.uuid4().hex
             proxy_guard.write_backup(self.backup_path, {
-                "enable": int(self._saved[0]),
-                "server": str(self._saved[1]),
-                "override": str(self._saved[2]),
+                "enable": enable,
+                "server": server,
+                "override": override,
                 "pid": os.getpid(),
                 "port": int(port),
-                "created": time.time(),
+                "capture_id": capture_id,
             })
-        except OSError as exc:
-            raise CaptureError(
-                f"无法备份系统代理（{exc}）；为避免采集失败后断网，本次采集没有开始"
-            ) from exc
-        self.write(1, f"127.0.0.1:{port}", self._saved[2])
+            self.capture_id = capture_id
+
+    def point_at(self, port):
+        if self.capture_id is None:
+            self.prepare(port)
+        with proxy_guard.backup_lock(self.backup_path):
+            saved = proxy_guard.read_backup(self.backup_path)
+            if not saved or saved.get("capture_id") != self.capture_id or saved.get("port") != port:
+                raise CaptureError("采集的代理备份已变更，本次采集没有开始")
+            if self.read() != (saved["enable"], saved["server"], saved["override"]):
+                raise CaptureError("系统代理在采集启动期间已变更，本次采集没有开始")
+            self.write(1, f"127.0.0.1:{port}", saved["override"])
 
     def restore_stale(self):
-        """收拾上次崩溃留下的备份: 确认没有别的采集进程还在用才动注册表。
-
-        与 `restore()` 的区别: 这个只用于「启动时先清场」, 不会去覆盖一份仍然
-        属于活进程的备份(例如另一个提取器正在采集)。
-        """
         return proxy_guard.recover_stale_backup(self.backup_path, self.reg_path)
 
     def restore(self):
-        """还原系统代理; 有崩溃遗留的备份也能收拾。"""
-        saved = self._saved
-        if saved is None and self.backup_path.is_file():
-            try:
-                data = json.loads(self.backup_path.read_text(encoding="utf-8"))
-                saved = (int(data.get("enable") or 0), str(data.get("server") or ""),
-                         str(data.get("override") or ""))
-            except (OSError, ValueError):
-                saved = None
-        if saved is None:
-            return False
-        self.write(*saved)
-        self._saved = None
-        try:
-            self.backup_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return True
+        if self.capture_id is None:
+            return self.restore_stale()
+        restored = proxy_guard.restore_backup(self.backup_path, expected_pid=os.getpid(),
+                                               capture_id=self.capture_id, reg_path=self.reg_path)
+        self.capture_id = None
+        return restored
 
     def stale_backup(self):
         return self.backup_path.is_file()
@@ -718,13 +682,14 @@ class CaptureSession:
     """一次采集: 起代理 → 等 token → 收尾。状态机对外只暴露 status()。"""
 
     def __init__(self, root: Path, clock=None, proxy_factory=None, ca=None,
-                 timeout_s=DEFAULT_TIMEOUT_S, server_factory=None, guard_factory=None):
+                 timeout_s=DEFAULT_TIMEOUT_S, server_factory=None, guard_factory=None,
+                 proxy_backup_path=None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._clock = clock or _now
         self.ca = ca or CertificateAuthority(self.root)
         self.proxy = (proxy_factory or
-                      (lambda: SystemProxy(self.root / BACKUP_NAME)))()
+                      (lambda: SystemProxy(proxy_backup_path or self.root / BACKUP_NAME)))()
         self.timeout_s = int(timeout_s)
         self._server_factory = server_factory or _ProxyServer
         self._guard_factory = guard_factory
@@ -733,6 +698,8 @@ class CaptureSession:
         self._guard = None
         self._tokens = queue.Queue()
         self._lock = threading.Lock()
+        self._lifecycle = threading.RLock()
+        self._stop_generation = 0
         self._state = "idle"
         self._message = ""
         self._port = 0
@@ -780,49 +747,47 @@ class CaptureSession:
 
     # ---------------------------------------------------------- 生命周期
     def start(self):
-        if self.proxy.stale_backup():
-            # 上次崩溃留下的代理, 先还原再开始; 别的进程还在采集时不动它。
-            restore_stale = getattr(self.proxy, "restore_stale", None)
-            if callable(restore_stale):
-                restore_stale()
-            else:
-                self.proxy.restore()
+        with self._lifecycle:
+            if self._server is not None:
+                raise CaptureError("本次采集已经开始")
+            generation = self._stop_generation
         if not self.ca.installed():
-            # 装证书是明确的用户动作(界面上有按钮), 采集本身不替用户做主。
             raise CaptureError('还没有安装采集证书：先点「安装采集证书」，再开始采集')
-        server = self._server_factory(self.ca, self)
-        self._server = server
-        port = server.server_address[1]
-        self._port = port
-        try:
-            self.proxy.point_at(port)
-        except Exception:              # noqa: BLE001 —— 备份没落盘就不能把代理留在我们手里
-            self._server = None
+        with self._lifecycle:
+            if self._server is not None:
+                raise CaptureError("本次采集已经开始")
+            if generation != self._stop_generation:
+                raise CaptureError("本次采集已取消")
+            system_proxy = isinstance(self.proxy, SystemProxy)
+            if not system_proxy and self.proxy.stale_backup():
+                self.proxy.restore()
+            self._tokens = queue.Queue()
             try:
-                server.server_close()
-            except OSError:
-                pass
-            try:
-                self.proxy.restore()   # 可能已经写了一半的注册表, 尽力还原
-            except Exception:          # noqa: BLE001
-                pass
-            raise
-        self._deadline = time.time() + self.timeout_s
-
-        def serve():
-            try:
-                server.serve_forever()
-            except Exception:          # noqa: BLE001 —— 收尾时关端口会让循环抛异常
-                pass
-
-        self._thread = threading.Thread(target=serve,
-                                        name="youziauth-lptiyu-capture", daemon=True)
-        self._thread.start()
-        self._arm_exit_restore()
-        self._start_proxy_guard(port)
-        self.log(f"采集开始 127.0.0.1:{port}")
-        self._set("waiting", "等待小程序请求：在微信里打开「数体智慧体育」并进入跑步首页")
-        return self.status()
+                server = self._server_factory(self.ca, self)
+                self._server = server
+                port = server.server_address[1]
+                self._thread = threading.Thread(target=server.serve_forever,
+                                                name="youziauth-lptiyu-capture", daemon=True)
+                self._thread.start()
+                self._arm_exit_restore()
+                if system_proxy:
+                    self.proxy.prepare(port)
+                self._start_proxy_guard(port)
+                if not self._thread.is_alive():
+                    raise CaptureError("本地采集监听未能启动")
+                self.proxy.point_at(port)
+            except Exception as exc:
+                self.stop()
+                if isinstance(exc, CaptureError):
+                    raise
+                raise CaptureError(f"无法启动乐跑采集：{exc}") from exc
+            with self._lock:
+                self._port = port
+                self._deadline = time.time() + self.timeout_s
+                self._state = "waiting"
+                self._message = "等待小程序请求：在微信里打开「数体智慧体育」并进入跑步首页"
+            self.log(f"采集开始 127.0.0.1:{port}")
+            return self.status()
 
     def _arm_exit_restore(self):
         """最后一道兜底: 解释器正常退出(包括未处理异常)时也必须还原代理。"""
@@ -841,121 +806,136 @@ class CaptureSession:
 
     def _restore_on_exit(self):
         try:
-            self.proxy.restore()
+            with self._lifecycle:
+                self.proxy.restore()
         except Exception:              # noqa: BLE001 —— 退出路径只能尽力
             pass
 
     def _start_proxy_guard(self, port):
-        """起一个独立看门狗: 进程被强杀时由它还原系统代理, 避免浏览器断网。
-
-        `server.shutdown()` 卡住、任务管理器结束任务、卡死对话框的「关闭程序」
-        都不会执行 finally/atexit, 只有另一个进程能收拾。
-        """
+        """Require a running watchdog before switching the Windows proxy."""
         factory = self._guard_factory
-        if factory is None:
-            if not isinstance(self.proxy, SystemProxy):
-                return              # 测试注入的假代理没有真实备份路径
-            factory = proxy_guard.spawn_guard
+        if factory is None and not isinstance(self.proxy, SystemProxy):
+            return
         path = getattr(self.proxy, "backup_path", None) or (self.root / BACKUP_NAME)
         reg_path = getattr(self.proxy, "reg_path", proxy_guard.REG_PATH)
-        try:
+        if factory is not None:
             self._guard = factory(path, os.getpid(), reg_path)
-            if self._guard is not None:
-                self.log(f"代理看门狗已启动 pid={getattr(self._guard, 'pid', '?')} "
-                         f"(端口 {port})")
-        except Exception:              # noqa: BLE001 —— 看门狗起不来还有 atexit 与启动清场
-            self._guard = None
+            ready = self._guard is not None
+        else:
+            capture_id = self.proxy.capture_id
+            self._guard = proxy_guard.spawn_guard(path, os.getpid(), reg_path,
+                                                   capture_id=capture_id)
+            ready = self._guard is not None and proxy_guard.guard_ready(path, capture_id, self._guard)
+        if not ready:
+            raise CaptureError("代理看门狗未就绪，本次采集没有开始")
+        self.log(f"代理看门狗已启动 pid={getattr(self._guard, 'pid', '?')} (端口 {port})")
 
     def _stop_server(self, timeout=5.0):
         """关掉采集代理端口; shutdown 最多等几秒, 绝不让停采集把界面挂住。"""
         server, self._server = self._server, None
         if server is None:
             return
-        done = threading.Event()
+        thread, self._thread = self._thread, None
+        if thread is not None and thread.is_alive():
+            done = threading.Event()
 
-        def shutdown():
-            try:
-                server.shutdown()
-            except Exception:          # noqa: BLE001 —— 卡住的 serve_forever 也要收尾
-                pass
-            finally:
-                done.set()
+            def shutdown():
+                try:
+                    server.shutdown()
+                except Exception:      # noqa: BLE001 —— 卡住的 serve_forever 也要收尾
+                    pass
+                finally:
+                    done.set()
 
-        threading.Thread(target=shutdown, name="youziauth-lptiyu-stop",
-                         daemon=True).start()
-        if not done.wait(timeout):
-            self.log(f"代理服务 {timeout:.0f} 秒内没有停住, 直接关闭监听端口")
+            threading.Thread(target=shutdown, name="youziauth-lptiyu-stop", daemon=True).start()
+            if not done.wait(timeout):
+                self.log(f"代理服务 {timeout:.0f} 秒内没有停住, 直接关闭监听端口")
         try:
             server.server_close()      # 端口必须真的放掉, 否则下次换端口重来
         except OSError:
             pass
 
     def stop(self, state=None, message=None):
-        self._stop_server()
-        try:
-            self.proxy.restore()
-        except Exception:              # noqa: BLE001 —— 收尾必须尽力
-            pass
-        self._disarm_exit_restore()
-        if self._guard is not None:
-            # 看门狗自己会发现备份已删除并在几秒内退出; 这里只放掉句柄。
-            self._guard = None
-        if state:
-            self.log(f"采集结束 {state} {message or ''}".strip())
-        if state:
-            self._set(state, message or "")
+        with self._lifecycle:
+            self._stop_generation += 1
+            with self._lock:
+                self._port = 0
+                self._state, self._message = state or "idle", message or ""
+            try:
+                if self._atexit_callback is not None:
+                    self.proxy.restore()
+            except Exception as exc:      # noqa: BLE001 —— 保留退出时的恢复机会
+                self.log(f"恢复系统代理失败：{exc}")
+                self._set("error", "已停止采集，系统代理恢复失败")
+                if isinstance(self.proxy, SystemProxy) and self.proxy.capture_id is not None:
+                    try:
+                        proxy_guard.request_restore(self.proxy.backup_path, self.proxy.capture_id)
+                    except OSError as request_error:
+                        self.log(f"无法通知看门狗恢复系统代理：{request_error}")
+            else:
+                self._disarm_exit_restore()
+                self._guard = None
+            self._stop_server()
+            if state:
+                self.log(f"采集结束 {state} {message or ''}".strip())
 
     def poll(self):
         """取到 token 就返回它(并收尾); 超时则返回 None 并置 timeout。"""
-        try:
-            cred = self._tokens.get_nowait()
-        except queue.Empty:
-            cred = None
-        if cred is not None:
-            self.stop("captured", "已抓到凭证")
-            return cred
-        with self._lock:
-            waiting = self._state == "waiting"
-            expired = waiting and time.time() >= self._deadline
-        if expired:
-            self.stop("timeout", f"等待超时：没有看到小程序请求（微信连接 {self.connects} 次）")
+        with self._lifecycle:
+            if self._state != "waiting":
+                return None
+            try:
+                cred = self._tokens.get_nowait()
+            except queue.Empty:
+                cred = None
+            if cred is not None:
+                self.stop("captured", "已抓到凭证")
+                return cred
+            if not self._thread.is_alive():
+                self.stop("error", "本地采集监听已停止，已尝试恢复系统代理")
+                return None
+            if time.time() >= self._deadline:
+                self.stop("timeout", f"等待超时：没有看到小程序请求（微信连接 {self.connects} 次）")
         return None
 
     def ensure_proxy(self):
-        """系统代理被别的软件(Clash/公司代理)抢回去时重新指回来。返回是否动过。"""
-        if not self._port:
-            return False
-        try:
-            enable, server, _override = self.proxy.read()
-        except Exception:                  # noqa: BLE001
-            return False
-        if int(enable) == 1 and str(server).strip() == f"127.0.0.1:{self._port}":
-            return False
-        try:
-            self.proxy.point_at(self._port)
-        except Exception:                  # noqa: BLE001
-            return False
-        self.log(f"系统代理被改回去了(现在是 {server}), 已重新指到 127.0.0.1:{self._port}")
-        return True
+        """Stop capture when another program changes the proxy."""
+        with self._lifecycle:
+            if self._state != "waiting":
+                return False
+            try:
+                enable, server, _override = self.proxy.read()
+            except OSError:
+                return False
+            if enable == 1 and server.strip() == f"127.0.0.1:{self._port}":
+                return False
+            self.stop("idle", "系统代理已由其他程序更改，已停止本次采集")
+            return True
 
     def wait(self, timeout=None, on_tick=None):
         deadline = time.time() + (timeout if timeout is not None else self.timeout_s)
         last_tick = 0.0
+        with self._lifecycle:
+            generation = self._stop_generation
         while time.time() < deadline:
-            cred = self.poll()
-            if cred:
-                return cred
-            with self._lock:
-                if self._state not in ("waiting", "idle"):
+            with self._lifecycle:
+                if generation != self._stop_generation or self._state != "waiting":
                     return None
-            if on_tick is not None and time.time() - last_tick >= 1.0:
-                last_tick = time.time()
-                try:
-                    on_tick()
-                except Exception:          # noqa: BLE001 —— 诊断不能打断采集
-                    pass
+                cred = self.poll()
+                if cred:
+                    return cred
+                if self._state != "waiting":
+                    return None
+                if on_tick is not None and time.time() - last_tick >= 1.0:
+                    last_tick = time.time()
+                    try:
+                        on_tick()
+                    except Exception:      # noqa: BLE001 —— 诊断不能打断采集
+                        pass
             time.sleep(0.2)
-        self.stop("timeout", f"等待超时：没有看到小程序请求（微信连接 {self.connects} 次）")
+        with self._lifecycle:
+            if generation == self._stop_generation and self._state == "waiting":
+                self.stop("timeout", f"等待超时：没有看到小程序请求（微信连接 {self.connects} 次）")
         return None
 
     # ---------------------------------------------------------- 流量回调

@@ -1678,6 +1678,14 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertTrue(self.bridge.dispatch('lptiyu_capture_stop')['ok'])
         self.assertEqual(self.controller.latest['state'], 'idle')
 
+    def test_capture_stop_reports_proxy_recovery_failure(self):
+        with patch.object(self.controller, 'capture_stop', return_value={
+            'state': 'error', 'message': '已停止采集，系统代理恢复失败',
+        }):
+            result = self.bridge.dispatch('lptiyu_capture_stop')
+        self.assertFalse(result['ok'])
+        self.assertIn('恢复失败', result['message'])
+
     def test_certificate_actions_report_their_detail(self):
         ca = self.controller.capture.ca
         with patch.object(type(ca), 'installed', lambda self: True), \

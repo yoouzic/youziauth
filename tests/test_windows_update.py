@@ -11,6 +11,7 @@ private key ever enters the repository.
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import json
 import os
@@ -464,16 +465,17 @@ class DetachedRecoveryTests(unittest.TestCase):
                   update._WORKER_RECOVERY + "\n" + body)
         env = os.environ.copy()
         env.update(environment or {})
+        env["YOUZIAUTH_UPDATE_WORKER"] = script
         completed = subprocess.run(
             [str(update._system_tool("WindowsPowerShell/v1.0/powershell.exe")),
-             "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded(script)],
+             "-NoProfile", "-NonInteractive", "-EncodedCommand", update._ENCODED_WORKER],
             env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             creationflags=0x08000000,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return json.loads(completed.stdout)
 
-    def completion(self, code, *, healthy=True, quiet=True):
+    def completion(self, code, *, healthy=True, quiet=True, interactive=True, tray_ready=True):
         with tempfile.TemporaryDirectory() as temporary:
             record = Path(temporary) / "install-result.json"
             body = r'''
@@ -484,29 +486,54 @@ function Start-UpdateTask($name) {
     $script:calls += $name
     return $true
 }
-function Test-AgentHealthy { return ($env:TEST_HEALTHY -eq '1') }
+function Test-AgentHealthy([string]$expectedVersion, [string]$expectedExe) {
+    $script:agentVersion = $expectedVersion
+    return ($env:TEST_HEALTHY -eq '1')
+}
+function Get-ActiveTraySessions { if ($env:TEST_INTERACTIVE -eq '1') { return 2 } }
+function Test-TrayReady([string]$expectedVersion, [string]$expectedExe, [int[]]$sessionIds) {
+    $script:trayVersion = $expectedVersion
+    return ($env:TEST_TRAY_READY -eq '1' -and $sessionIds -contains 2)
+}
 $quiet = ($env:TEST_QUIET -eq '1')
 $request = [pscustomobject]@{ properties = [pscustomobject]@{ ProductVersion = '1.2.3' } }
 $final = @{ code = [int]$env:TEST_INSTALL_CODE }
 Complete-Install $final
 @{ result = $final; calls = @($script:calls); before = @($script:before);
+   agentVersion = $script:agentVersion; trayVersion = $script:trayVersion;
    record = (Get-Content -LiteralPath $env:YOUZIAUTH_UPDATE_RESULT -Raw | ConvertFrom-Json) } |
     ConvertTo-Json -Compress -Depth 6
 '''
             return self.run_script(body, environment={
                 "YOUZIAUTH_UPDATE_RESULT": str(record), "TEST_INSTALL_CODE": str(code),
+                "YOUZIAUTH_UPDATE_EXE": str(Path(temporary) / "youziauth.exe"),
                 "TEST_HEALTHY": "1" if healthy else "0",
                 "TEST_QUIET": "1" if quiet else "0",
+                "TEST_INTERACTIVE": "1" if interactive else "0",
+                "TEST_TRAY_READY": "1" if tray_ready else "0",
             })
 
-    def test_surviving_worker_records_success_before_running_tasks(self):
+    def test_surviving_worker_records_pending_before_checking_the_target_version(self):
         value = self.completion(0)
         self.assertEqual(value["calls"], [r"\youziauth\SystemAgent", r"\youziauth\Tray"])
-        self.assertEqual(value["before"][0]["result"], {"code": 0})
+        self.assertEqual(value["before"][0]["result"], {"code": 0, "complete": False})
+        self.assertEqual(value["agentVersion"], "1.2.3")
+        self.assertEqual(value["trayVersion"], "1.2.3")
         self.assertEqual(value["record"]["version"], "1.2.3")
         self.assertRegex(value["record"]["checked"], r"^\d{4}-\d{2}-\d{2}T.*(?:Z|\+00:00)$")
         self.assertEqual(value["record"]["result"],
-                         {"code": 0, "relaunched": True, "healthy": True, "agent_restarted": True})
+                         {"code": 0, "complete": True, "tray_status": "ready",
+                          "relaunched": True, "healthy": True, "agent_restarted": True})
+
+    def test_accepted_tray_task_is_not_a_successful_start(self):
+        value = self.completion(0, tray_ready=False)
+        self.assertEqual(value["record"]["result"]["tray_status"], "failed")
+        self.assertFalse(value["record"]["result"]["relaunched"])
+
+    def test_tray_does_not_have_to_start_without_an_interactive_session(self):
+        value = self.completion(0, interactive=False)
+        self.assertEqual(value["calls"], [r"\youziauth\SystemAgent"])
+        self.assertEqual(value["record"]["result"]["tray_status"], "deferred")
 
     def test_an_unresponsive_agent_is_not_reported_as_healthy(self):
         value = self.completion(0, healthy=False)
@@ -553,6 +580,43 @@ Complete-Install $final
         self.assertFalse(thread.is_alive(), "the probe must consume the reply and disconnect")
         self.assertEqual(seen, ["status"])
         self.assertTrue(value["healthy"])
+
+    def test_status_probe_checks_peer_path_and_target_version(self):
+        import agent_ipc
+        name = "youziauth-test-target-version-" + os.urandom(8).hex()
+        executable = ctypes.create_unicode_buffer(32768)
+        self.assertTrue(ctypes.windll.kernel32.GetModuleFileNameW(None, executable, len(executable)))
+        server = agent_ipc.NamedPipeServer(name, lambda command: {
+            "ok": True, "app_version": "1.2.3",
+            "snapshot": {"boot_id": "test-boot", "state": "waiting_for_network"}})
+        thread = threading.Thread(target=server.serve_once, daemon=True)
+        thread.start()
+        value = self.run_script(r'''
+$owner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$reply = Read-UpdateProbe $env:TEST_PIPE ([DateTime]::UtcNow.AddSeconds(5)) $env:TEST_EXE $owner
+@{ version = $reply.response.app_version; session = $reply.session } | ConvertTo-Json
+''', environment={"TEST_PIPE": name, "TEST_EXE": executable.value})
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(value["version"], "1.2.3")
+        self.assertGreaterEqual(value["session"], 0)
+
+    def test_a_running_other_agent_version_does_not_confirm_recovery(self):
+        import agent_ipc
+        name = "youziauth-test-old-agent-" + os.urandom(8).hex()
+        server = agent_ipc.NamedPipeServer(name, lambda command: {
+            "ok": True, "app_version": "1.2.2",
+            "snapshot": {"boot_id": "test-boot", "state": "waiting_for_network"}})
+        thread = threading.Thread(target=server.serve_once, daemon=True)
+        thread.start()
+        value = self.run_script(
+            "@{ healthy = (Test-AgentHealthy -pipeName $env:TEST_PIPE -expectedVersion '1.2.3' "
+            "-timeoutMs 600) } | ConvertTo-Json",
+            environment={"TEST_PIPE": name},
+        )
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(value["healthy"])
 
     def test_absent_pipe_is_not_healthy(self):
         value = self.run_script(
@@ -727,7 +791,9 @@ class ProcessBoundaryTests(unittest.TestCase):
         self.assertNotIn(str(result), source)
 
     def test_worker_and_launcher_scripts_are_encoded_once(self):
-        self.assertEqual(base64.b64decode(update._ENCODED_WORKER).decode("utf-16le"), update._WORKER)
+        self.assertEqual(base64.b64decode(update._ENCODED_WORKER).decode("utf-16le"), update._WORKER_ENTRY)
+        self.assertLess(len(update._ENCODED_WORKER), 1000)
+        self.assertIn(update._ENCODED_WORKER, update._LAUNCHER)
         self.assertEqual(base64.b64decode(update._ENCODED_LAUNCHER).decode("utf-16le"), update._LAUNCHER)
         self.assertEqual(base64.b64decode(update._ENCODED_COMMAND).decode("utf-16le"), update._POWERSHELL)
 

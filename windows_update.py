@@ -47,6 +47,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 import ed25519
+from update_recovery import valid_installer_result
 
 
 class UpdateVerificationError(RuntimeError):
@@ -172,38 +173,159 @@ try {
 _ENCODED_COMMAND = base64.b64encode(_POWERSHELL.encode("utf-16le")).decode("ascii")
 
 _AGENT_HEALTHCHECK = r"""
-function Test-AgentHealthy([string]$pipeName = 'youziauth-agent', [int]$timeoutMs = 15000) {
+function Initialize-UpdateProbe {
+    if ('YouziauthUpdateProbe' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
+
+public static class YouziauthUpdateProbe {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Session {
+        public int Id;
+        public IntPtr Name;
+        public int State;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetNamedPipeServerProcessId(SafePipeHandle pipe, out int pid);
+    [DllImport("wtsapi32.dll", EntryPoint = "WTSEnumerateSessionsW", SetLastError = true)]
+    private static extern bool EnumerateSessions(IntPtr server, int reserved, int version,
+        out IntPtr sessions, out int count);
+    [DllImport("wtsapi32.dll")]
+    private static extern void WTSFreeMemory(IntPtr buffer);
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    private static extern bool WTSQueryUserToken(int id, out IntPtr token);
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static int[] ActiveSessions(string sid) {
+        IntPtr buffer;
+        int count;
+        if (!EnumerateSessions(IntPtr.Zero, 0, 1, out buffer, out count))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        var ids = new List<int>();
+        try {
+            int size = Marshal.SizeOf(typeof(Session));
+            for (int i = 0; i < count; i++) {
+                var session = (Session)Marshal.PtrToStructure(IntPtr.Add(buffer, i * size), typeof(Session));
+                if (session.Id == 0 || session.State != 0) continue; // WTSActive
+                IntPtr token;
+                if (!WTSQueryUserToken(session.Id, out token)) {
+                    int error = Marshal.GetLastWin32Error();
+                    // The session can be active before its user has logged in,
+                    // or disappear while we are enumerating sessions.
+                    if (error == 1008 || error == 1312 || error == 7022) continue;
+                    throw new Win32Exception(error);
+                }
+                try {
+                    using (var identity = new WindowsIdentity(token)) {
+                        if (String.IsNullOrEmpty(sid) || identity.User.Value == sid)
+                            ids.Add(session.Id);
+                    }
+                } finally { CloseHandle(token); }
+            }
+        } finally { WTSFreeMemory(buffer); }
+        return ids.ToArray();
+    }
+}
+'@
+}
+function Get-ActiveTraySessions([string]$userSid) {
+    Initialize-UpdateProbe
+    return [YouziauthUpdateProbe]::ActiveSessions($userSid)
+}
+function Get-UpdatePipePeerSession($pipe, [string]$expectedExe, [string]$expectedOwner) {
+    Initialize-UpdateProbe
+    if ($expectedOwner -and
+        $pipe.GetAccessControl().GetOwner([Security.Principal.SecurityIdentifier]).Value -cne $expectedOwner) {
+        throw 'unexpected-pipe-owner'
+    }
+    $serverId = 0
+    if (-not [YouziauthUpdateProbe]::GetNamedPipeServerProcessId($pipe.SafePipeHandle, [ref]$serverId)) {
+        throw 'unidentified-pipe-server'
+    }
+    $server = [Diagnostics.Process]::GetProcessById($serverId)
+    try {
+        if (-not [string]::Equals($server.MainModule.FileName, $expectedExe,
+                                 [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'unexpected-pipe-server'
+        }
+        return $server.SessionId
+    } finally { $server.Dispose() }
+}
+function Read-UpdateProbe([string]$pipeName, [DateTime]$deadline,
+                          [string]$expectedExe = '', [string]$expectedOwner = '') {
+    $pipe = $null
+    $pending = $null
+    try {
+        $pipe = New-Object IO.Pipes.NamedPipeClientStream('.', $pipeName,
+            [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous,
+            [Security.Principal.TokenImpersonationLevel]::Identification)
+        $remaining = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        $pipe.Connect([Math]::Min(500, $remaining))
+        $sessionId = -1
+        if ($expectedExe) {
+            $sessionId = Get-UpdatePipePeerSession $pipe $expectedExe $expectedOwner
+        }
+        $pipe.ReadMode = [IO.Pipes.PipeTransmissionMode]::Message
+        $message = [Text.Encoding]::UTF8.GetBytes('{"command":"status"}')
+        $pipe.Write($message, 0, $message.Length)
+        $buffer = New-Object byte[] 16384
+        $pending = $pipe.BeginRead($buffer, 0, $buffer.Length, $null, $null)
+        $remaining = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        if (-not $pending.AsyncWaitHandle.WaitOne([Math]::Min(1500, $remaining))) {
+            throw 'status-timeout'
+        }
+        $count = $pipe.EndRead($pending)
+        if ($count -le 0 -or -not $pipe.IsMessageComplete) { throw 'status-incomplete' }
+        return @{
+            response = [Text.Encoding]::UTF8.GetString($buffer, 0, $count) | ConvertFrom-Json
+            session = $sessionId
+        }
+    } finally {
+        if ($null -ne $pipe) { $pipe.Dispose() }
+        if ($null -ne $pending) { $pending.AsyncWaitHandle.Close() }
+    }
+}
+function Test-AgentHealthy([string]$pipeName = 'youziauth-agent', [int]$timeoutMs = 15000,
+                           [string]$expectedVersion = '', [string]$expectedExe = '') {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
     while ([DateTime]::UtcNow -lt $deadline) {
-        $pipe = $null
-        $pending = $null
         try {
-            $pipe = New-Object IO.Pipes.NamedPipeClientStream('.', $pipeName,
-                [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
-            $remaining = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-            $pipe.Connect([Math]::Min(500, $remaining))
-            $pipe.ReadMode = [IO.Pipes.PipeTransmissionMode]::Message
-            $message = [Text.Encoding]::UTF8.GetBytes('{"command":"status"}')
-            $pipe.Write($message, 0, $message.Length)
-            $buffer = New-Object byte[] 16384
-            $pending = $pipe.BeginRead($buffer, 0, $buffer.Length, $null, $null)
-            $remaining = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-            if (-not $pending.AsyncWaitHandle.WaitOne([Math]::Min(1500, $remaining))) {
-                throw 'status-timeout'
-            }
-            $count = $pipe.EndRead($pending)
-            if ($count -le 0 -or -not $pipe.IsMessageComplete) { throw 'status-incomplete' }
-            $response = [Text.Encoding]::UTF8.GetString($buffer, 0, $count) | ConvertFrom-Json
+            $reply = Read-UpdateProbe $pipeName $deadline $expectedExe 'S-1-5-18'
+            $response = $reply.response
             if ($response.ok -is [bool] -and $response.ok -and
+                (-not $expectedExe -or $reply.session -eq 0) -and
+                (-not $expectedVersion -or ($response.app_version -is [string] -and
+                                            $response.app_version -ceq $expectedVersion)) -and
                 $response.snapshot.boot_id -is [string] -and $response.snapshot.boot_id -and
                 @('online_external', 'online_campus', 'waiting_for_network', 'auth_failed', 'error') -ccontains
                     $response.snapshot.state) { return $true }
         } catch {
             # A scheduled-task launch is only a request; wait for a real IPC reply.
-        } finally {
-            if ($null -ne $pipe) { $pipe.Dispose() }
-            if ($null -ne $pending) { $pending.AsyncWaitHandle.Close() }
         }
+        $remaining = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+        if ($remaining -gt 0) { Start-Sleep -Milliseconds ([Math]::Min(100, $remaining)) }
+    }
+    return $false
+}
+function Test-TrayReady([string]$expectedVersion, [string]$expectedExe, [int[]]$sessionIds,
+                        [string]$expectedOwner = '', [int]$timeoutMs = 45000) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $reply = Read-UpdateProbe 'youziauth-ui' $deadline $expectedExe $expectedOwner
+            $response = $reply.response
+            if ($response.ok -is [bool] -and $response.ok -and
+                $response.tray_ready -is [bool] -and $response.tray_ready -and
+                $response.app_version -is [string] -and $response.app_version -ceq $expectedVersion -and
+                $response.session_id -is [int] -and $response.session_id -eq $reply.session -and
+                $sessionIds -contains $reply.session) { return $true }
+        } catch { }
         $remaining = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
         if ($remaining -gt 0) { Start-Sleep -Milliseconds ([Math]::Min(100, $remaining)) }
     }
@@ -260,8 +382,41 @@ function Start-UpdateTask($name) {
 }
 """ + _AGENT_HEALTHCHECK + r"""
 function Complete-Install($result) {
-    # This worker outlives the application stopped by MSI. Save the outcome before
-    # starting the new agent, then replace it with the observed recovery outcome.
+    # MSI exit 0 commits files. It does not confirm either application's boot.
+    if ($quiet -and $result.ContainsKey('code') -and $result.code -eq 0) {
+        Write-InstallResult @{ code = 0; complete = $false }
+        $version = [string]$request.properties.ProductVersion
+        $trayExe = [string]$env:YOUZIAUTH_UPDATE_EXE
+        $userSid = [string]$env:YOUZIAUTH_UPDATE_TRAY_SID
+        $result.agent_restarted = $false
+        $result.healthy = $false
+        $result.tray_status = 'failed'
+        $result.relaunched = $false
+        try {
+            $agentExe = [IO.Path]::Combine([IO.Path]::GetDirectoryName($trayExe), 'youziauth-agent.exe')
+            $result.agent_restarted = Start-UpdateTask '\youziauth\SystemAgent'
+            $result.healthy = Test-AgentHealthy -expectedVersion $version -expectedExe $agentExe
+        } catch { }
+        try {
+            $sessions = @(Get-ActiveTraySessions $userSid)
+            if ($sessions.Count -eq 0) {
+                $result.tray_status = 'deferred'
+            } else {
+                [void](Start-UpdateTask '\youziauth\Tray')
+                $result.relaunched = Test-TrayReady -expectedVersion $version -expectedExe $trayExe `
+                    -sessionIds $sessions -expectedOwner $userSid
+                if ($result.relaunched) {
+                    $result.tray_status = 'ready'
+                } elseif (@(Get-ActiveTraySessions $userSid).Count -eq 0) {
+                    # The user can log off during the startup wait.
+                    $result.tray_status = 'deferred'
+                }
+            }
+        } catch { }
+        $result.complete = $true
+        Write-InstallResult $result
+        return
+    }
     Write-InstallResult $result
     if ($result.ContainsKey('code')) {
         if ($quiet -and $result.code -ne 3010) {
@@ -410,7 +565,11 @@ Complete-Install $final
 try { Publish-Status 'final' $final }
 catch { exit 1 }
 """
-_ENCODED_WORKER = base64.b64encode(_WORKER.encode("utf-16le")).decode("ascii")
+# The worker script is longer than the CreateProcess command-line limit once
+# encoded. Inherit the fixed script from the trusted parent as data, with a
+# short fixed entry point. Package metadata remains in separate variables.
+_WORKER_ENTRY = "& ([ScriptBlock]::Create($env:YOUZIAUTH_UPDATE_WORKER))"
+_ENCODED_WORKER = base64.b64encode(_WORKER_ENTRY.encode("utf-16le")).decode("ascii")
 
 _LAUNCHER = r"""
 $ErrorActionPreference = 'Stop'
@@ -420,11 +579,11 @@ try {
     $env:YOUZIAUTH_UPDATE_LAUNCHER = [string]$PID
     $powershell = [IO.Path]::Combine([Environment]::SystemDirectory, 'WindowsPowerShell\v1.0\powershell.exe')
     $worker = Start-Process -FilePath $powershell -WindowStyle Hidden -PassThru -ArgumentList @(
-        '-NoProfile', '-NonInteractive', '-EncodedCommand', $env:YOUZIAUTH_UPDATE_WORKER)
+        '-NoProfile', '-NonInteractive', '-EncodedCommand', '@WORKER_ENTRY@')
     [Console]::Out.Write((@{ pid = $worker.Id } | ConvertTo-Json -Compress))
     $worker.Dispose()
 } catch { exit 1 }
-"""
+""".replace("@WORKER_ENTRY@", _ENCODED_WORKER)
 _ENCODED_LAUNCHER = base64.b64encode(_LAUNCHER.encode("utf-16le")).decode("ascii")
 
 
@@ -770,7 +929,8 @@ def verify_msi(path, executable, version, sha256, signature=None) -> None:
 
 def _start_worker(msi: Path, anchor: Path, version: str, size: int, digest: str,
                   signature: bytes, payload: bytes, directory: Path,
-                  silent: bool = False, log_path=None, result_path=None) -> int:
+                  silent: bool = False, log_path=None, result_path=None,
+                  tray_user_sid: str | None = None) -> int:
     powershell = _system_tool("WindowsPowerShell/v1.0/powershell.exe")
     request_path, report_path = _write_request(msi, version, size, digest, signature, payload)
     request = {
@@ -784,7 +944,8 @@ def _start_worker(msi: Path, anchor: Path, version: str, size: int, digest: str,
         "YOUZIAUTH_UPDATE_SIGNATURE": signature.hex(), "YOUZIAUTH_UPDATE_PAYLOAD": payload.decode("ascii"),
         "YOUZIAUTH_UPDATE_REQUEST_FILE": str(request_path), "YOUZIAUTH_UPDATE_RESPONSE_FILE": str(report_path),
         "YOUZIAUTH_UPDATE_REQUEST": base64.b64encode(json.dumps(request).encode("utf-8")).decode("ascii"),
-        "YOUZIAUTH_UPDATE_VERIFY": _ENCODED_COMMAND, "YOUZIAUTH_UPDATE_WORKER": _ENCODED_WORKER,
+        "YOUZIAUTH_UPDATE_VERIFY": _ENCODED_COMMAND, "YOUZIAUTH_UPDATE_WORKER": _WORKER,
+        "YOUZIAUTH_UPDATE_TRAY_SID": tray_user_sid or "",
         "YOUZIAUTH_UPDATE_SILENT": "1" if silent else "",
         "YOUZIAUTH_UPDATE_LOG": str(log_path) if log_path else "",
         "YOUZIAUTH_UPDATE_RESULT": str(result_path) if result_path else "",
@@ -850,15 +1011,7 @@ def _observe_worker(pid: int, directory: Path, on_launch: Callable[[], None],
                 if set(final) == {"error"} and type(final["error"]) is int:
                     finished = True
                     raise UpdateVerificationError(_ERRORS.get(final["error"], _ERRORS[21]))
-                allowed = {"code", "relaunched", "healthy", "launch_exit_code", "agent_restarted"}
-                if (not set(final) <= allowed or type(final.get("code")) is not int or
-                        not -0x80000000 <= final["code"] <= 0xFFFFFFFF or
-                        any(type(final[key]) is not bool for key in
-                            ("relaunched", "healthy", "agent_restarted") if key in final) or
-                        ("launch_exit_code" in final and
-                         (type(final["launch_exit_code"]) is not int or
-                          not -0x80000000 <= final["launch_exit_code"] <= 0xFFFFFFFF)) or
-                        not notified):
+                if not valid_installer_result(final) or final.get('complete') is False or not notified:
                     raise UpdateVerificationError(_ERRORS[20])
                 finished = True
                 if notification_error is not None:
@@ -885,7 +1038,7 @@ def _observe_worker(pid: int, directory: Path, on_launch: Callable[[], None],
 
 
 def install_msi(path, executable, version, sha256, on_launch, signature=None,
-                silent=False, log_dir=None) -> int | dict:
+                silent=False, log_dir=None, *, tray_user_sid: str | None = None) -> int | dict:
     if not callable(on_launch):
         raise UpdateVerificationError("安装启动通知回调无效。")
     msi, anchor, version, sha256, signature, size = _validate_inputs(
@@ -916,7 +1069,8 @@ def install_msi(path, executable, version, sha256, on_launch, signature=None,
         except OSError:
             log_path = None
     pid = _start_worker(msi, anchor, version, size, digest, signature, payload, directory,
-                        silent=silent, log_path=log_path, result_path=result_path)
+                        silent=silent, log_path=log_path, result_path=result_path,
+                        tray_user_sid=tray_user_sid)
     if silent:
         return _observe_worker(pid, directory, on_launch, full_result=True)
     return _observe_worker(pid, directory, on_launch)

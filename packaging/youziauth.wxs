@@ -29,13 +29,13 @@
          copies to the next reboot, and a user who launches the installed app before
          that reboot gets "Failed to start embedded python interpreter: Failed to
          import encodings module" because base_library.zip never landed on disk.
-         Stop both processes before InstallValidate so every payload file is written
-         during this transaction and no reboot is required. The second pass catches a
-         process the first taskkill raced with. -->
+         End the Tray task to stop an older launcher waiting to start the tray.
+         Stop the processes before InstallValidate so payload files can be written
+         during this transaction. The second pass catches a racing launch. -->
     <CustomAction
       Id="StopYouziauthProcesses"
       Directory="SystemFolder"
-      ExeCommand="cmd.exe /c taskkill /f /t /im youziauth-agent.exe &gt;nul 2&gt;nul &amp; taskkill /f /t /im youziauth.exe &gt;nul 2&gt;nul &amp; ping -n 2 127.0.0.1 &gt;nul &amp; taskkill /f /t /im youziauth-agent.exe &gt;nul 2&gt;nul &amp; taskkill /f /t /im youziauth.exe &gt;nul 2&gt;nul &amp; ping -n 2 127.0.0.1 &gt;nul"
+      ExeCommand="cmd.exe /c schtasks /End /TN &quot;\youziauth\Tray&quot; &gt;nul 2&gt;nul &amp; taskkill /f /t /im youziauth-agent.exe &gt;nul 2&gt;nul &amp; taskkill /f /im youziauth-tray-launcher.exe &gt;nul 2&gt;nul &amp; taskkill /f /t /im youziauth.exe &gt;nul 2&gt;nul &amp; ping -n 2 127.0.0.1 &gt;nul &amp; schtasks /End /TN &quot;\youziauth\Tray&quot; &gt;nul 2&gt;nul &amp; taskkill /f /t /im youziauth-agent.exe &gt;nul 2&gt;nul &amp; taskkill /f /im youziauth-tray-launcher.exe &gt;nul 2&gt;nul &amp; taskkill /f /t /im youziauth.exe &gt;nul 2&gt;nul &amp; ping -n 2 127.0.0.1 &gt;nul"
       Execute="immediate"
       Impersonate="no"
       Return="ignore" />
@@ -52,7 +52,7 @@
     <CustomAction
       Id="StopYouziauthProcessesElevated"
       Directory="SystemFolder"
-      ExeCommand="cmd.exe /c taskkill /f /t /im youziauth-agent.exe &gt;nul 2&gt;nul &amp; taskkill /f /t /im youziauth.exe &gt;nul 2&gt;nul &amp; ping -n 2 127.0.0.1 &gt;nul"
+      ExeCommand="cmd.exe /c schtasks /End /TN &quot;\youziauth\Tray&quot; &gt;nul 2&gt;nul &amp; taskkill /f /t /im youziauth-agent.exe &gt;nul 2&gt;nul &amp; taskkill /f /im youziauth-tray-launcher.exe &gt;nul 2&gt;nul &amp; taskkill /f /t /im youziauth.exe &gt;nul 2&gt;nul &amp; ping -n 2 127.0.0.1 &gt;nul"
       Execute="deferred"
       Impersonate="no"
       Return="ignore" />

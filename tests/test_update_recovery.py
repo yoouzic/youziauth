@@ -32,7 +32,8 @@ class UpdateRecoveryTests(unittest.TestCase):
 
     def record(self, result=None, version='1.9.0', checked='2026-10-11T04:00:00+00:00'):
         data = {'version': version, 'checked': checked,
-                'result': result or {'code': 0, 'healthy': True, 'relaunched': True,
+                'result': result or {'code': 0, 'complete': True, 'healthy': True,
+                                     'tray_status': 'ready', 'relaunched': True,
                                      'agent_restarted': True}}
         self.path.write_text(json.dumps(data), encoding='utf-8')
         return data
@@ -134,10 +135,62 @@ class UpdateRecoveryTests(unittest.TestCase):
         self.assertIsNone(self.recover())
 
     def test_new_health_fields_with_the_same_timestamp_are_not_deduplicated(self):
-        self.record({'code': 0})
-        self.assertEqual(self.recover().state, 'installed')
-        self.record({'code': 0, 'healthy': False, 'launch_exit_code': 42})
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self.record({'code': 0}, checked=now)
+        self.assertEqual(self.recover().state, 'installing')
+        self.record({'code': 0, 'healthy': False, 'launch_exit_code': 42}, checked=now)
         self.assertEqual(self.recover().state, 'error')
+
+    def test_pending_worker_result_expires_and_is_not_treated_as_success(self):
+        checked = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=11)).isoformat()
+        record = self.record({'code': 0, 'complete': False}, checked=checked)
+        self.assertEqual(self.parser().read_install_result(self.path).result, record['result'])
+        status = self.recover()
+        self.assertEqual(status.state, 'error')
+        self.assertIn('安装结果', status.message)
+
+    def test_explicit_pending_result_can_be_replaced_by_terminal_tray_status(self):
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self.record({'code': 0, 'complete': False}, checked=now)
+        self.assertEqual(self.recover().state, 'installing')
+        self.assertIsNone(self.recover())
+        self.record({'code': 0, 'complete': True, 'healthy': True,
+                     'tray_status': 'deferred'}, checked=now)
+        status = self.recover()
+        self.assertEqual(status.state, 'installed')
+        self.assertIn('登录', status.message)
+        self.assertEqual(status.detail, 'tray deferred')
+
+    def test_a_new_check_cannot_replace_an_in_progress_startup_confirmation(self):
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self.record({'code': 0, 'complete': False}, checked=now)
+        self.updater._controller_factory = lambda *args: self.fail('a new check must wait')
+        self.assertEqual(self.updater.run_cycle().state, 'installing')
+        self.assertEqual(self.updater.run_cycle().state, 'installing')
+
+    def test_a_consumed_legacy_interim_result_still_expires(self):
+        checked = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=11)).isoformat()
+        self.record({'code': 0}, checked=checked)
+        parser = self.parser()
+        parser.mark_consumed(self.cache / parser.CONSUMED_RESULT_FILE,
+                             parser.read_install_result(self.path))
+        auto_update.write_status(self.cache / auto_update.STATUS_FILE, UpdateStatus(
+            state='installed', latest_version='1.9.0', checked=checked))
+        self.assertEqual(self.recover().state, 'error')
+
+    def test_a_successful_msi_with_a_failed_tray_does_not_report_success(self):
+        self.record({'code': 0, 'complete': True, 'healthy': True, 'tray_status': 'failed'})
+        status = self.recover()
+        self.assertEqual(status.state, 'error')
+        self.assertIn('托盘', status.message)
+
+    def test_a_legacy_terminal_record_keeps_msi_outcome_but_reports_unconfirmed_startup(self):
+        record = self.record({'code': 0, 'healthy': True, 'relaunched': True})
+        self.assertEqual(self.parser().read_install_result(self.path).result, record['result'])
+        status = self.recover()
+        self.assertEqual(status.state, 'error')
+        self.assertEqual(status.current_version, '1.9.0')
+        self.assertIn('未确认', status.message)
 
     def test_a_new_check_makes_the_previous_result_historical(self):
         self.record()
@@ -181,6 +234,11 @@ class UpdateRecoveryTests(unittest.TestCase):
                      dict(valid, checked='not a timestamp'), dict(valid, checked='2026-10-11T04:00:00'),
                      dict(valid, result={'code': True}), dict(valid, result={'code': 0, 'error': 17}),
                      dict(valid, result={'code': 0, 'healthy': 'yes'}),
+                     dict(valid, result={'code': 0, 'complete': 1}),
+                     dict(valid, result={'code': 0, 'complete': True}),
+                     dict(valid, result={'code': 0, 'complete': False, 'healthy': True}),
+                     dict(valid, result={'code': 0, 'complete': True, 'healthy': True,
+                                         'tray_status': ['ready']}),
                      dict(valid, result={'code': 0, 'unknown': True}),
                      dict(valid, result={'code': 0, 'launch_exit_code': 2 ** 33})]
         for item in malformed:

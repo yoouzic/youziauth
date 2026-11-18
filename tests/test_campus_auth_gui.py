@@ -708,6 +708,13 @@ class AgentRepairTests(unittest.TestCase):
 
 
 class TrayStatusTests(unittest.TestCase):
+    def test_start_reports_failure_if_the_shell_did_not_add_the_icon(self):
+        tray = windows_tray.WindowsTrayIcon(on_command=mock.Mock())
+        with mock.patch.object(windows_tray, 'is_supported', return_value=True), \
+             mock.patch.object(windows_tray.threading, 'Thread') as thread:
+            thread.return_value.start.side_effect = tray._ready.set
+            self.assertFalse(tray.start())
+
     def test_tooltip_includes_current_online_status(self):
         tooltip = windows_tray.format_tray_tooltip(windows_tray.TrayStatus.ONLINE)
 

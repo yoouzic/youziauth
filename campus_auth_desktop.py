@@ -6,8 +6,10 @@ import ctypes
 import json
 import os
 import queue
+import re
 import sys
 import threading
+from ctypes import wintypes
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,7 +17,56 @@ from pathlib import Path
 import agent_ipc
 import campus_auth_gui as gui
 import windows_tray
+from app_update import read_current_version
 from desktop_bridge import DesktopBridge, PreviewBridge
+
+
+_STARTUP_EVENT_FLAG = '--startup-ready-event'
+_STARTUP_EVENT_NAME = re.compile(r'Local\\youziauth-tray-ready-[a-f0-9]{32}')
+
+
+def signal_startup_ready(name):
+    """Signal the launcher-owned event only after the desktop has initialized."""
+    if os.name != 'nt' or _STARTUP_EVENT_NAME.fullmatch(name) is None:
+        return False
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.OpenEventW.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.OpenEventW.restype = wintypes.HANDLE
+    kernel32.SetEvent.argtypes = (wintypes.HANDLE,)
+    kernel32.SetEvent.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    event = kernel32.OpenEventW(0x0002, False, name)  # EVENT_MODIFY_STATE
+    if not event:
+        return False
+    try:
+        return bool(kernel32.SetEvent(event))
+    finally:
+        kernel32.CloseHandle(event)
+
+
+def current_session_id():
+    if os.name != 'nt':
+        return None
+    identify = ctypes.windll.kernel32.ProcessIdToSessionId
+    identify.argtypes = (wintypes.DWORD, ctypes.POINTER(wintypes.DWORD))
+    identify.restype = wintypes.BOOL
+    session = wintypes.DWORD()
+    if identify(os.getpid(), ctypes.byref(session)):
+        return session.value
+    return None
+
+
+def _acknowledge_existing_desktop(event):
+    try:
+        status = gui.send_ui_action('status')
+    except (OSError, ValueError):
+        return False
+    version = read_current_version(gui.resource_path('VERSION'))
+    session = current_session_id()
+    return (status.get('ok') is True and bool(version) and status.get('app_version') == version
+            and session is not None and status.get('session_id') == session
+            and signal_startup_ready(event))
 
 
 def set_desktop_app_id():
@@ -36,6 +87,8 @@ class DesktopRuntime:
         self.closed = threading.Event()
         self.exiting = False
         self.tray = None
+        self._app_version = read_current_version(gui.resource_path('VERSION'))
+        self._session_id = current_session_id()
         self.bridge._window_action = self.events.put
         self.bridge._ui_dispatch = self._on_ui
 
@@ -95,18 +148,24 @@ class DesktopRuntime:
         elif action == 'suppress' and not self.preview:
             self.bridge._agent_command('suppress-notifications-for-boot')
 
+    def _receive_ui_command(self, command):
+        if command.command == 'status':
+            active = not self.closed.is_set()
+            return {'ok': active, 'app_version': self._app_version, 'session_id': self._session_id,
+                    'tray_ready': self.tray is not None and active}
+        self.events.put(command.command)
+        return {'ok': True}
+
     def _ipc(self):
-        def receive(command):
-            self.events.put(command.command)
-            return {'ok': True}
-        server = agent_ipc.NamedPipeServer(gui.UI_PIPE_NAME, receive, command_parser=agent_ipc.UiCommand.parse)
+        server = agent_ipc.NamedPipeServer(gui.UI_PIPE_NAME, self._receive_ui_command,
+                                           command_parser=agent_ipc.UiCommand.parse)
         while not self.closed.is_set():
             try:
                 server.serve_once()
             except Exception:
                 self.closed.wait(1)
 
-    def run(self, startup=False, secondary=None):
+    def run(self, startup=False, secondary=None, startup_event=None):
         self.window.events.loaded.wait()
         if not startup:
             self.window.show()
@@ -128,6 +187,8 @@ class DesktopRuntime:
                 self.bridge.dispatch('network_start')
         if secondary:
             self.events.put(secondary)
+        if startup_event and not self.closed.is_set():
+            signal_startup_ready(startup_event)
         while not self.closed.is_set():
             try:
                 action = self.events.get(timeout=1)
@@ -260,6 +321,12 @@ def main(argv=None):
     except ImportError:
         raise RuntimeError('缺少桌面组件。请先运行 python -m pip install -r requirements-desktop.txt') from None
     startup = gui.TRAY_STARTUP_ARGUMENT in argv or gui.LEGACY_STARTUP_ARGUMENT in argv
+    startup_event = None
+    if _STARTUP_EVENT_FLAG in argv:
+        index = argv.index(_STARTUP_EVENT_FLAG) + 1
+        if not startup or index >= len(argv) or _STARTUP_EVENT_NAME.fullmatch(argv[index]) is None:
+            return 2
+        startup_event = argv[index]
     secondary = gui.resolve_secondary_action(argv)
     hidden = gui.should_start_hidden(startup, secondary)
     instance = None
@@ -267,6 +334,8 @@ def main(argv=None):
         instance = gui.SingleInstanceLock()
         code = gui.handle_single_instance_startup(startup,instance,secondary_action=secondary)
         if code is not None:
+            if code == 0 and startup_event and not _acknowledge_existing_desktop(startup_event):
+                return 1
             return code
     bridge = None
     runtime = None
@@ -283,7 +352,7 @@ def main(argv=None):
         runtime = DesktopRuntime(bridge,window,preview)
         window.events.closing += runtime.closing
         window.events.closed += runtime.closed.set
-        webview.start(runtime.run,(hidden,secondary),gui='edgechromium',
+        webview.start(runtime.run,(hidden,secondary,startup_event),gui='edgechromium',
                       icon=str(gui.resource_path('assets/yuzu_app.ico')))
         return 0
     finally:

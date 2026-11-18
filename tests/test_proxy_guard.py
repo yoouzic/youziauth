@@ -87,6 +87,13 @@ class ProxyGuardTests(unittest.TestCase):
         self.assertEqual(proxy_guard.read_proxy(REG)[1], "127.0.0.1:7890")
         self.assertFalse(self.backup.exists())
 
+    def test_stale_backup_preserves_a_newer_proxy_setting(self):
+        self._write_backup(pid=dead_pid(), port=18888)
+        proxy_guard.write_proxy(1, "new-proxy.example:8080", "<local>", REG)
+        self.assertFalse(proxy_guard.recover_stale_backup(self.backup, REG))
+        self.assertEqual(proxy_guard.read_proxy(REG)[1], "new-proxy.example:8080")
+        self.assertFalse(self.backup.exists())
+
     def test_an_old_backup_without_a_pid_is_still_restored(self):
         self.backup.write_text(json.dumps(
             {"enable": 1, "server": "127.0.0.1:7890", "override": "<local>"}),
@@ -115,9 +122,68 @@ class ProxyGuardTests(unittest.TestCase):
         self.assertEqual(proxy_guard.read_proxy(REG)[1], "127.0.0.1:7890")
         self.assertFalse(self.backup.exists())
 
+    def test_guard_subprocess_acknowledges_ownership_before_parent_exits(self):
+        with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]) as parent:
+            try:
+                capture_id = "current-capture"
+                self._write_backup(pid=parent.pid, port=18888, capture_id=capture_id)
+                guard = proxy_guard.spawn_guard(self.backup, parent.pid, REG, capture_id=capture_id)
+                self.assertIsNotNone(guard)
+                try:
+                    self.assertTrue(proxy_guard.guard_ready(self.backup, capture_id, guard))
+                    self._point_at_dead_port()
+                    parent.terminate()
+                    parent.wait(timeout=5)
+                    self.assertEqual(guard.wait(timeout=10), 0)
+                    self.assertEqual(proxy_guard.read_proxy(REG)[1], "127.0.0.1:7890")
+                    self.assertFalse(self.backup.exists())
+                finally:
+                    if guard.poll() is None:
+                        guard.kill()
+                        guard.wait(timeout=5)
+            finally:
+                if parent.poll() is None:
+                    parent.terminate()
+
     def test_guard_main_exits_quietly_when_the_backup_is_already_gone(self):
         self.assertEqual(proxy_guard.main([str(self.backup), str(dead_pid()), REG]), 0)
         self.assertEqual(proxy_guard.read_proxy(REG)[1], "127.0.0.1:7890")
+
+    def test_guard_retries_a_release_request_while_parent_is_alive(self):
+        owner = os.getpid()
+        capture_id = "sample-capture"
+        self._write_backup(pid=owner, port=18888, capture_id=capture_id, release_requested=True)
+        self._point_at_dead_port()
+        write = proxy_guard.write_proxy
+        failures = [PermissionError("temporary registry lock")]
+
+        def restore(*args):
+            if failures:
+                raise failures.pop()
+            write(*args)
+
+        with (
+            patch.object(proxy_guard, "pid_alive", side_effect=AssertionError("owner exit not required")),
+            patch.object(proxy_guard, "write_proxy", side_effect=restore) as attempt,
+            patch.object(proxy_guard.time, "sleep"),
+        ):
+            self.assertEqual(proxy_guard.main([str(self.backup), str(owner), REG, capture_id]), 0)
+        self.assertEqual(attempt.call_count, 2)
+        self.assertEqual(proxy_guard.read_proxy(REG)[1], "127.0.0.1:7890")
+        self.assertFalse(self.backup.exists())
+
+    def test_proxy_server_write_failure_does_not_enable_a_disabled_proxy(self):
+        calls = []
+
+        def record_write(_key, name, *_values):
+            calls.append(name)
+            if name == "ProxyServer":
+                raise PermissionError("could not set new proxy server")
+
+        with patch.object(self.winreg, "SetValueEx", side_effect=record_write):
+            with self.assertRaises(PermissionError):
+                proxy_guard.write_proxy(1, "127.0.0.1:18888", "<local>", REG)
+        self.assertEqual(calls, ["ProxyServer"])
 
     def test_guard_command_identifies_the_backup_and_parent(self):
         command = proxy_guard.guard_command(self.backup, 4321, REG)

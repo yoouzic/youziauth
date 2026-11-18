@@ -474,13 +474,20 @@ class AgentLoopTests(unittest.TestCase):
 
     def test_a_recovered_install_still_defers_the_next_check(self):
         class Restoring:
-            def recover_install_result(inner):
-                return auto_update.UpdateStatus(state='installed', current_version='1.9.14',
-                                                latest_version='1.9.14')
+            def __init__(self, status):
+                self.status = status
 
-        agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]), updater=Restoring())
-        agent._recover_update()
-        self.assertFalse(agent.update_due(), '刚装完不能重启后立刻再装一遍')
+            def recover_install_result(self):
+                return self.status
+
+        for state, detail in (('installed', ''), ('error', 'tray startup failed'),
+                              ('error', 'health check failed (exit 1)')):
+            with self.subTest(state=state, detail=detail):
+                status = auto_update.UpdateStatus(state=state, detail=detail, current_version='1.9.14',
+                                                  latest_version='1.9.14')
+                agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]), updater=Restoring(status))
+                agent._recover_update()
+                self.assertFalse(agent.update_due(), '保留安装结果供界面显示')
 
     def test_the_periodic_schedule_is_set_before_the_work_so_a_restart_cannot_loop(self):
         class CountingUpdater:
@@ -1161,6 +1168,12 @@ class AgentLivenessTests(AgentLoopTests):
     这一组测试锁住「再也不会那样静默地冻住」。
     """
 
+    def test_status_reports_the_running_agents_version(self):
+        with patch('campus_auth_agent.read_current_version', return_value='1.9.42', create=True):
+            agent = self.make_agent(FakeProbe([]), FakeAuthenticator([]))
+        response = agent.handle_command(agent_ipc.AgentCommand('status'))
+        self.assertEqual(response['app_version'], '1.9.42')
+
     def test_the_retry_command_returns_without_doing_network_work(self):
         probe = BlockingProbe()
         authenticator = FakeAuthenticator([AuthAttempt(AttemptKind.LOGIN_SUCCEEDED, "ok")])
@@ -1438,14 +1451,14 @@ class BuildUpdaterTests(unittest.TestCase):
         (self.install / "youziauth.exe").write_bytes(b"stub")
         self.app_dir = self.root / "appdata"
 
-    def build(self):
+    def build(self, allowed_user_sid=None):
         import campus_auth_agent
 
         real_frozen, real_exe = getattr(sys, "frozen", None), sys.executable
         sys.frozen = True
         sys.executable = str(self.install / "youziauth-agent.exe")
         try:
-            return campus_auth_agent.build_updater(self.app_dir)
+            return campus_auth_agent.build_updater(self.app_dir, allowed_user_sid)
         finally:
             sys.executable = real_exe
             if real_frozen is None:
@@ -1459,6 +1472,12 @@ class BuildUpdaterTests(unittest.TestCase):
         self.assertIsNotNone(updater, "VERSION inside _internal must still enable updates")
         self.assertEqual(updater.install_dir, self.install)
         self.assertEqual(updater.executable, self.install / "youziauth.exe")
+
+    def test_updater_checks_the_task_owners_interactive_session(self):
+        sid = 'S-1-5-21-1-2-3-1001'
+        updater, reason = self.build(sid)
+        self.assertEqual(reason, '')
+        self.assertEqual(updater._tray_user_sid, sid)
 
     def test_the_update_cache_and_logs_stay_out_of_the_install_directory(self):
         # 缓存写进 Program Files 有个实际毛病：MSI 修复/卸载会连它一起动，而往安装目录

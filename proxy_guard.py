@@ -22,12 +22,16 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
+
+from windows_credentials import atomic_write_bytes
 
 BACKUP_NAME = "proxy_backup.json"
 REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 # 看门狗等待父进程的轮询间隔; 1 秒足够快, 又不会白烧 CPU。
 POLL_SECONDS = 1.0
+RESTORE_ATTEMPTS = 5
 # 备份文件被正常收尾删掉后, 再等这么久确认不是「写一半」再退出。
 MISSING_BACKUP_GRACE_SECONDS = 3.0
 # 备份里的 pid 还活着时, 最多容忍这么久; 超过就当成「pid 被复用」直接还原,
@@ -74,10 +78,13 @@ def write_proxy(enable, server, override=None, reg_path: str = REG_PATH) -> None
     with winreg.OpenKey(
         winreg.HKEY_CURRENT_USER, reg_path, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE
     ) as key:
-        winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, int(bool(enable)))
+        if not enable:
+            winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
         winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, str(server))
         if override is not None:
             winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, str(override))
+        if enable:
+            winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
     notify_settings_changed()
 
 
@@ -100,17 +107,45 @@ def read_backup(path) -> dict | None:
     return data
 
 
-def write_backup(path, payload: dict) -> None:
-    """原子写备份: 半截 JSON 会让看门狗读不出来, 等于没有保护。"""
+def _local_data_root() -> Path:
+    return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+
+
+def shared_backup_path() -> Path:
+    return _local_data_root() / "youziauth" / "lptiyu" / "capture" / BACKUP_NAME
+
+
+def legacy_extractor_backup_path() -> Path:
+    return _local_data_root() / "lptiyu-extractor" / "capture" / BACKUP_NAME
+
+
+@contextmanager
+def backup_lock(path):
+    """Serialize proxy ownership and restoration across capture processes."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(target.name + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.replace(temporary, target)
+    lock_path = target.with_suffix(".lock")
+    # Closing the handle releases the lock, even when the owner is terminated.
+    with lock_path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def write_backup(path, payload: dict) -> None:
+    """Flush the previous proxy settings and atomically replace the backup."""
+    atomic_write_bytes(Path(path), json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
 
 def pid_alive(pid) -> bool:
-    """进程还在吗。拿不到句柄(无权限/不存在)一律按「不在了」处理。"""
+    """Treat access denied as a possibly live owner."""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
@@ -137,56 +172,68 @@ def pid_alive(pid) -> bool:
     kernel32.CloseHandle.restype = wintypes.BOOL
     handle = kernel32.OpenProcess(synchronize, False, pid)
     if not handle:
-        return False
+        return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED
     try:
         return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
     finally:
         kernel32.CloseHandle(handle)
 
 
-def restore_backup(path, *, expected_pid=None, reg_path: str = REG_PATH) -> bool:
-    """按备份还原并删掉备份。返回是否真的写过注册表。"""
-    data = read_backup(path)
-    if data is None:
-        return False
-    owner = data.get("pid")
+def backup_owner(data):
     try:
-        owner = int(owner) if owner not in (None, "") else 0
+        return int(data.get("pid") or 0)
     except (TypeError, ValueError):
-        owner = 0
-    if expected_pid is not None and owner and owner != int(expected_pid):
-        # 备份已经被新的采集覆盖: 不能拿旧看门狗去还原它。
+        return 0
+
+
+def backup_is_active(path, data):
+    owner = backup_owner(data)
+    if data.get("release_requested") is True or not owner or not pid_alive(owner):
         return False
-    write_proxy(data["enable"], data["server"], data.get("override"), reg_path)
     try:
-        Path(path).unlink(missing_ok=True)
+        return time.time() - Path(path).stat().st_mtime < MAX_LIVE_OWNER_SECONDS
     except OSError:
-        pass
+        return True
+
+
+def restore_locked_backup(path, data, reg_path: str = REG_PATH) -> bool:
+    """Restore only if the current proxy still points to the recorded capture."""
+    port = data.get("port")
+    enable = data["enable"]
+    override = data["override"]
+    if port is not None:
+        current_enable, server, override = read_proxy(reg_path)
+        if server.strip() != f"127.0.0.1:{port}":
+            Path(path).unlink(missing_ok=True)
+            return False
+        # Leave a proxy that was disabled during capture disabled.
+        enable = current_enable and enable
+    write_proxy(enable, data["server"], override, reg_path)
+    Path(path).unlink(missing_ok=True)
     return True
 
 
-def recover_stale_backup(path, reg_path: str = REG_PATH) -> bool:
-    """启动时收拾上次崩溃留下的代理。
-
-    只有确认没有别的采集进程还在用这份备份时才动注册表; 备份很旧(pid 可能被
-    复用)时也直接还原 —— 宁可恢复一个旧代理, 不能让浏览器一直连死端口。
-    """
-    data = read_backup(path)
-    if data is None:
-        return False
-    owner = data.get("pid")
-    try:
-        owner = int(owner) if owner not in (None, "") else 0
-    except (TypeError, ValueError):
-        owner = 0
-    if owner and owner != os.getpid() and pid_alive(owner):
-        try:
-            age = time.time() - Path(path).stat().st_mtime
-        except OSError:
-            age = 0.0
-        if age < MAX_LIVE_OWNER_SECONDS:
+def restore_backup(path, *, expected_pid=None, capture_id=None, reg_path: str = REG_PATH) -> bool:
+    with backup_lock(path):
+        data = read_backup(path)
+        if data is None:
             return False
-    return restore_backup(path, reg_path=reg_path)
+        if expected_pid is not None and backup_owner(data) not in (0, int(expected_pid)):
+            return False
+        if capture_id is not None and data.get("capture_id") != capture_id:
+            return False
+        return restore_locked_backup(path, data, reg_path)
+
+
+def recover_stale_backup(path, reg_path: str = REG_PATH) -> bool:
+    """Leave an active capture alone and recover its predecessor after a crash."""
+    if not Path(path).is_file():
+        return False
+    with backup_lock(path):
+        data = read_backup(path)
+        if data is None or backup_is_active(path, data):
+            return False
+        return restore_locked_backup(path, data, reg_path)
 
 
 def _log(path, message: str) -> None:
@@ -201,18 +248,19 @@ def _log(path, message: str) -> None:
         pass
 
 
-def guard_command(backup_path, parent_pid, reg_path: str = REG_PATH) -> list[str]:
+def guard_command(backup_path, parent_pid, reg_path: str = REG_PATH, *, capture_id=None) -> list[str]:
     """拉起看门狗用的命令行; 冻结包直接复用自身 exe, 源码运行走脚本。"""
     if getattr(sys, "frozen", False):
         base = [sys.executable]
     else:
         base = [sys.executable,
                 str(Path(__file__).resolve().with_name("campus_auth_desktop.py"))]
-    return base + ["--proxy-guard", str(backup_path), str(int(parent_pid)), reg_path]
+    command = base + ["--proxy-guard", str(backup_path), str(int(parent_pid)), reg_path]
+    return command + [capture_id] if capture_id is not None else command
 
 
-def spawn_guard(backup_path, parent_pid, reg_path: str = REG_PATH):
-    """起一个脱离父进程的看门狗; 起不来就返回 None(调用方继续采集, 还有正常收尾兜底)。"""
+def spawn_guard(backup_path, parent_pid, reg_path: str = REG_PATH, *, capture_id=None):
+    """Start a detached watchdog. The caller waits for it before switching the proxy."""
     if os.name != "nt":
         return None
     flags = 0x08000000 | 0x00000008          # CREATE_NO_WINDOW | DETACHED_PROCESS
@@ -223,7 +271,7 @@ def spawn_guard(backup_path, parent_pid, reg_path: str = REG_PATH):
         env = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
     try:
         return subprocess.Popen(
-            guard_command(backup_path, parent_pid, reg_path),
+            guard_command(backup_path, parent_pid, reg_path, capture_id=capture_id),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -235,8 +283,46 @@ def spawn_guard(backup_path, parent_pid, reg_path: str = REG_PATH):
         return None
 
 
+def guard_ready(path, capture_id, process, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and process.poll() is None:
+        with backup_lock(path):
+            data = read_backup(path)
+        if data is None or data.get("capture_id") != capture_id:
+            return False
+        if data.get("guard_ready") is True:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def request_restore(path, capture_id):
+    """Allow the watchdog to restore after a failed stop while its parent lives."""
+    with backup_lock(path):
+        data = read_backup(path)
+        if data is None or data.get("capture_id") != capture_id:
+            return
+        data["release_requested"] = True
+        write_backup(path, data)
+
+
+def _finish_restore(path, parent_pid, capture_id, reg_path):
+    for attempt in range(RESTORE_ATTEMPTS):
+        try:
+            restored = restore_backup(path, expected_pid=parent_pid, capture_id=capture_id,
+                                      reg_path=reg_path)
+        except OSError as exc:
+            if attempt == RESTORE_ATTEMPTS - 1:
+                _log(path, f"系统代理恢复失败，保留备份：{exc}")
+                return 1
+            time.sleep(POLL_SECONDS)
+        else:
+            _log(path, "已还原系统代理" if restored else "无需还原系统代理")
+            return 0
+
+
 def main(argv=None) -> int:
-    """`--proxy-guard <备份路径> <父进程 pid> [注册表路径]`。"""
+    """`--proxy-guard <备份路径> <父进程 pid> [注册表路径] [采集标识]`。"""
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) < 2:
         return 2
@@ -246,10 +332,21 @@ def main(argv=None) -> int:
     except (TypeError, ValueError):
         return 2
     reg_path = argv[2] if len(argv) > 2 else REG_PATH
+    capture_id = argv[3] if len(argv) > 3 else None
+    if capture_id is not None:
+        with backup_lock(backup_path):
+            data = read_backup(backup_path)
+            if data is None or data.get("capture_id") != capture_id or backup_owner(data) != parent_pid:
+                return 1
+            data["guard_ready"] = True
+            write_backup(backup_path, data)
     _log(backup_path, f"看门狗启动 pid={os.getpid()} 监视父进程 {parent_pid}")
     missing_since = None
     while True:
-        if read_backup(backup_path) is None:
+        data = read_backup(backup_path)
+        if data is not None and capture_id is not None and data.get("capture_id") != capture_id:
+            return 0
+        if data is None:
             if missing_since is None:
                 missing_since = time.monotonic()
             elif time.monotonic() - missing_since >= MISSING_BACKUP_GRACE_SECONDS:
@@ -257,12 +354,9 @@ def main(argv=None) -> int:
                 return 0
         else:
             missing_since = None
-        if not pid_alive(parent_pid):
-            restored = restore_backup(
-                backup_path, expected_pid=parent_pid, reg_path=reg_path)
-            _log(backup_path,
-                 "父进程已退出, 已还原系统代理" if restored else "父进程已退出, 无需还原")
-            return 0
+        released = capture_id is not None and data is not None and data.get("release_requested") is True
+        if released or not pid_alive(parent_pid):
+            return _finish_restore(backup_path, parent_pid, capture_id, reg_path)
         time.sleep(POLL_SECONDS)
 
 

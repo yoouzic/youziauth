@@ -20,6 +20,7 @@ from typing import Callable
 TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 SYSTEM_TASK_NAME = r"\youziauth\SystemAgent"
 TRAY_TASK_NAME = r"\youziauth\Tray"
+TRAY_LAUNCHER_NAME = "youziauth-tray-launcher.exe"
 SYSTEM_SID = "S-1-5-18"
 USER_SID_PATTERN = r"S-1-(?:5-21|12-1)-(?:\d+-){3}\d+"
 # Bounded retries cover task-command failures; they do not repair a missing
@@ -27,63 +28,6 @@ USER_SID_PATTERN = r"S-1-(?:5-21|12-1)-(?:\d+-){3}\d+"
 TASK_REGISTRATION_ATTEMPTS = 3
 TASK_REGISTRATION_RETRY_DELAY_SECONDS = 1.5
 ENSURE_AGENT_TIMEOUT_SECONDS = 15.0
-
-# Task Scheduler starts this before Python so it can wait out a missing or locked
-# runtime without invoking the frozen executable's blocking startup dialog.
-_TRAY_STARTUP = r"""
-$ErrorActionPreference = 'Stop'
-$install = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('@INSTALL_PATH@'))
-$exe = Join-Path $install 'youziauth.exe'
-$runtime = Join-Path $install '_internal'
-try {
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $timer = [Diagnostics.Stopwatch]::StartNew()
-    while ($true) {
-        try {
-            foreach ($file in @($exe, (Join-Path $runtime '@PYTHON_DLL@'))) {
-                $stream = [IO.File]::OpenRead($file)
-                try {
-                    if ($stream.Length -eq 0) { throw "Empty runtime file: $file" }
-                } finally { $stream.Dispose() }
-            }
-            $archive = [IO.Compression.ZipFile]::OpenRead((Join-Path $runtime 'base_library.zip'))
-            try {
-                foreach ($name in @('encodings/__init__.pyc', 'encodings/aliases.pyc', 'encodings/utf_8.pyc')) {
-                    $entry = $archive.GetEntry($name)
-                    if ($null -eq $entry -or $entry.Length -eq 0) { throw "Missing runtime entry: $name" }
-                    $stream = $entry.Open()
-                    try { $stream.CopyTo([IO.Stream]::Null) } finally { $stream.Dispose() }
-                }
-            } finally { $archive.Dispose() }
-            break
-        } catch {
-            if ($timer.Elapsed.TotalSeconds -ge 30) { throw }
-            Start-Sleep -Seconds 1
-        }
-    }
-    $start = New-Object Diagnostics.ProcessStartInfo
-    $start.FileName = $exe
-    $start.Arguments = '--tray-startup'
-    $start.WorkingDirectory = $install
-    $start.UseShellExecute = $false
-    $start.CreateNoWindow = $true
-    $tray = [Diagnostics.Process]::Start($start)
-    $tray.WaitForExit()
-    $code = $tray.ExitCode
-    $tray.Dispose()
-    if ($code -eq 0) { exit 0 }
-    $failure = "Tray exited with code $code"
-} catch {
-    $code = 1
-    $failure = $_.Exception.Message
-}
-try {
-    $logs = Join-Path $env:LOCALAPPDATA 'youziauth'
-    [void][IO.Directory]::CreateDirectory($logs)
-    Set-Content -LiteralPath (Join-Path $logs 'tray-startup-error.log') -Encoding UTF8 -Value "$(Get-Date -Format o) $failure"
-} catch { [Console]::Error.WriteLine($failure) }
-exit $code
-"""
 
 ET.register_namespace("", TASK_NS)
 
@@ -162,20 +106,13 @@ def build_system_task_xml(install_dir: Path, user_sid: str) -> str:
 
 
 def build_tray_task_xml(install_dir: Path, user_sid: str) -> str:
-    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-    powershell = system_root / "System32/WindowsPowerShell/v1.0/powershell.exe"
-    python_dll = f"python{sys.version_info.major}{sys.version_info.minor}.dll"
-    install_path = base64.b64encode(str(install_dir).encode("utf-16le")).decode("ascii")
-    script = _TRAY_STARTUP.replace("@PYTHON_DLL@", python_dll).replace("@INSTALL_PATH@", install_path)
-    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
     return _build_task_xml(
         install_dir,
         trigger="LogonTrigger",
         user_sid=user_sid,
         logon_type="InteractiveToken",
         run_level="LeastPrivilege",
-        command=powershell,
-        arguments=f"-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}",
+        command=Path(install_dir) / TRAY_LAUNCHER_NAME,
     )
 
 

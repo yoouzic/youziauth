@@ -1,9 +1,15 @@
 from pathlib import Path
+import ctypes
+import hashlib
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import xml.etree.ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -122,6 +128,13 @@ class PackagingWorkflowTests(unittest.TestCase):
         self.assertIn("--acceptEula wix7", script)
         self.assertIn("$LASTEXITCODE", script)
 
+    def test_msi_packages_the_verified_tray_launcher(self):
+        script = ROOT.joinpath("build_msi.ps1").read_text(encoding="utf-8")
+        self.assertIn("TrayLauncher.cs", script)
+        self.assertIn("youziauth-tray-launcher.exe", script)
+        self.assertIn("--verify-runtime", script)
+        self.assertLess(script.index("--verify-runtime"), script.index("generate_wix_files.py"))
+
     def test_wix_source_has_start_menu_shortcut_and_uninstall_metadata(self):
         source = ROOT.joinpath("packaging", "youziauth.wxs").read_text(
             encoding="utf-8"
@@ -157,6 +170,152 @@ class PackagingWorkflowTests(unittest.TestCase):
         self.assertIn("ProtocolRegistrationComponent", source)
 
 
+@unittest.skipUnless(os.name == "nt", "Windows launcher process integration")
+class TrayLauncherTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        compiler = Path(os.environ["SystemRoot"]) / "Microsoft.NET/Framework/v4.0.30319/csc.exe"
+        if not compiler.is_file():
+            raise unittest.SkipTest(".NET Framework C# compiler is unavailable")
+        temp = tempfile.TemporaryDirectory(prefix="youziauth-launcher-test-")
+        cls.addClassCleanup(temp.cleanup)
+        cls.bundle = Path(temp.name)
+        runtime = cls.bundle / "_internal"
+        runtime.mkdir()
+        library_bytes = b"base-library fixture"
+        (runtime / "base_library.zip").write_bytes(library_bytes)
+        (runtime / "python314.dll").write_bytes(b"runtime fixture")
+        harness = cls.bundle / "Harness.cs"
+        harness.write_text(
+            f"""
+using System;
+internal static class TrayRuntime {{
+    internal const string PythonDll = "python314.dll";
+    internal const string BaseLibraryHash = "{hashlib.sha256(library_bytes).hexdigest()}";
+}}
+internal static class Harness {{
+    public static int Main() {{
+        return TrayLauncher.Run(AppDomain.CurrentDomain.BaseDirectory, TimeSpan.FromSeconds(3));
+    }}
+}}
+""",
+            encoding="utf-8",
+        )
+        fixture = cls.bundle / "FakeTray.cs"
+        fixture.write_text(
+            r"""
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+internal static class FakeTray {
+    public static int Main(string[] args) {
+        if (args.Length == 1 && args[0] == "--unrelated") {
+            Thread.Sleep(15000);
+            return 0;
+        }
+        if (args.Length != 3 || args[0] != "--tray-startup"
+            || args[1] != "--startup-ready-event"
+            || !args[2].StartsWith(@"Local\youziauth-tray-ready-")) return 2;
+        File.WriteAllText("fixture.pid", Process.GetCurrentProcess().Id.ToString());
+        string mode = File.ReadAllText("fixture-mode.txt");
+        if (mode == "early") return 0;
+        if (mode == "ready") {
+            using (var ready = EventWaitHandle.OpenExisting(args[2])) ready.Set();
+            Thread.Sleep(250);
+            File.WriteAllText("fixture-finished", "true");
+            return 7;
+        }
+        Thread.Sleep(15000);
+        return 2;
+    }
+}
+""",
+            encoding="utf-8",
+        )
+        for name, entry, sources in (
+            ("launcher.exe", "Harness", (ROOT / "packaging" / "TrayLauncher.cs", harness)),
+            ("youziauth.exe", "FakeTray", (fixture,)),
+        ):
+            result = subprocess.run(
+                [str(compiler), "/nologo", "/target:winexe", f"/main:{entry}",
+                 f"/out:{cls.bundle / name}", *map(str, sources)],
+                capture_output=True, text=True, timeout=20, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode:
+                raise AssertionError(result.stdout + result.stderr)
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="youziauth launcher 漢字 [test] ")
+        self.addCleanup(temp.cleanup)
+        self.install_dir = Path(temp.name)
+        shutil.copytree(self.bundle / "_internal", self.install_dir / "_internal")
+        for name in ("launcher.exe", "youziauth.exe"):
+            shutil.copy2(self.bundle / name, self.install_dir / name)
+        self.environment = {**os.environ, "LOCALAPPDATA": str(self.install_dir)}
+        self.failure_log = self.install_dir / "youziauth" / "tray-startup-error.log"
+
+    def _start(self, name, *args):
+        process = subprocess.Popen(
+            [str(self.install_dir / name), *args],
+            cwd=self.install_dir, env=self.environment, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+
+        def cleanup():
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=10)
+
+        self.addCleanup(cleanup)
+        return process
+
+    def _launch_tray(self, mode):
+        (self.install_dir / "fixture-mode.txt").write_text(mode, encoding="ascii")
+        return self._start("launcher.exe")
+
+    def test_ready_tray_runs_to_its_own_exit_and_forwards_that_status(self):
+        self.assertEqual(self._launch_tray("ready").wait(timeout=8), 7)
+        self.assertTrue((self.install_dir / "fixture-finished").is_file())
+
+    def test_zero_exit_without_readiness_fails_and_is_logged(self):
+        self.assertEqual(self._launch_tray("early").wait(timeout=8), 1)
+        self.assertIn("exited before readiness", self.failure_log.read_text(encoding="utf-8"))
+
+    def test_hung_tray_times_out_and_only_its_child_is_stopped(self):
+        unrelated = self._start("youziauth.exe", "--unrelated")
+        launcher = self._launch_tray("hang")
+        pid_file = self.install_dir / "fixture.pid"
+        deadline = time.monotonic() + 2.5
+        pid = ""
+        while not pid and time.monotonic() < deadline:
+            if pid_file.is_file():
+                pid = pid_file.read_text(encoding="ascii")
+            if not pid:
+                time.sleep(0.025)
+        self.assertTrue(pid)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel32.OpenProcess(0x00100000, False, int(pid))
+        self.assertTrue(handle)
+        try:
+            self.assertEqual(launcher.wait(timeout=8), 1)
+            self.assertEqual(kernel32.WaitForSingleObject(handle, 0), 0)
+            self.assertIsNone(unrelated.poll())
+            self.assertIn("readiness timed out", self.failure_log.read_text(encoding="utf-8"))
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def test_wrong_stdlib_is_rejected_without_starting_the_tray(self):
+        (self.install_dir / "_internal" / "base_library.zip").write_bytes(b"incomplete runtime")
+        self.assertEqual(self._launch_tray("ready").wait(timeout=8), 1)
+        self.assertFalse((self.install_dir / "fixture.pid").exists())
+        self.assertIn("base_library.zip", self.failure_log.read_text(encoding="utf-8"))
+
+
 class PayloadCompletenessTests(unittest.TestCase):
     """1.4.0 shipped an MSI whose running processes made Windows Installer defer 41
     file copies (including _internal\\base_library.zip) to the next reboot, so the
@@ -173,6 +332,26 @@ class PayloadCompletenessTests(unittest.TestCase):
         self.assertIn("youziauth-agent.exe", source)
         self.assertIn("youziauth.exe", source)
         self.assertIn('Condition="NOT REMOVE"', source)
+        root = ET.fromstring(source)
+        ns = {"wix": "http://wixtoolset.org/schemas/v4/wxs"}
+        for action_id, passes in (
+            ("StopYouziauthProcesses", 2),
+            ("StopYouziauthProcessesElevated", 1),
+        ):
+            with self.subTest(action=action_id):
+                action = root.find(f".//wix:CustomAction[@Id='{action_id}']", ns)
+                self.assertIsNotNone(action)
+                tray_commands = [
+                    command.removeprefix("cmd.exe /c ") for command in action.get("ExeCommand").split(" & ")
+                    if "youziauth-tray-launcher.exe" in command or "youziauth.exe" in command
+                    or r"\youziauth\Tray" in command
+                ]
+                self.assertEqual(
+                    tray_commands,
+                    [r'schtasks /End /TN "\youziauth\Tray" >nul 2>nul',
+                     "taskkill /f /im youziauth-tray-launcher.exe >nul 2>nul",
+                     "taskkill /f /t /im youziauth.exe >nul 2>nul"] * passes,
+                )
 
     def test_build_script_verifies_the_wix_manifest_and_can_verify_the_payload(self):
         script = ROOT.joinpath("build_msi.ps1").read_text(encoding="utf-8")

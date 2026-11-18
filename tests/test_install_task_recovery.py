@@ -47,7 +47,7 @@ class InstallTaskRecoveryTests(unittest.TestCase):
         self.assertEqual(set(created), {tasks.SYSTEM_TASK_NAME, tasks.TRAY_TASK_NAME})
         tray = created[tasks.TRAY_TASK_NAME]
         self.assertEqual(tray.findtext('.//t:Principal/t:UserId', namespaces=NS), SID)
-        self.assertEqual(Path(tray.findtext('.//t:Exec/t:Command', namespaces=NS)).name, 'powershell.exe')
+        self.assertEqual(Path(tray.findtext('.//t:Exec/t:Command', namespaces=NS)).name, 'youziauth-tray-launcher.exe')
         system = created[tasks.SYSTEM_TASK_NAME]
         self.assertEqual(system.findtext('.//t:Principal/t:UserId', namespaces=NS), tasks.SYSTEM_SID)
         self.assertEqual(system.findtext('.//t:Exec/t:Arguments', namespaces=NS), '--allowed-user-sid ' + SID)

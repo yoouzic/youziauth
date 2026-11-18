@@ -176,6 +176,19 @@ def _timestamp() -> str:
     return dt.datetime.now().astimezone().isoformat(timespec="microseconds")
 
 
+def _recent_install(checked: str) -> bool:
+    started = update_recovery.timestamp(checked)
+    return (started is not None and
+            0 <= (dt.datetime.now(dt.timezone.utc) - started).total_seconds() <= INSTALL_RESULT_WAIT_SECONDS)
+
+
+def _missing_install_result(status: UpdateStatus, installed: str) -> UpdateStatus:
+    return dataclasses.replace(
+        status, state='error', current_version=installed, checked=_timestamp(),
+        message='未能恢复安装结果，请查看安装日志；后台稍后会重新检查。',
+        detail='installer result missing or stale')
+
+
 def _report(report: callable, status: UpdateStatus) -> UpdateStatus:
     if report is not None:
         try:
@@ -204,6 +217,7 @@ class Updater:
         report=None,
         relaunch=None,
         log_dir: Path | None = None,
+        tray_user_sid: str | None = None,
     ):
         self.install_dir = Path(install_dir)
         self.cache_dir = Path(cache_dir)
@@ -214,6 +228,7 @@ class Updater:
         self._report = report
         self._relaunch = relaunch
         self._relaunch_agent = agent_relaunch
+        self._tray_user_sid = tray_user_sid
         self._restored_status = False
         self._last_install_record = ''
         # 这次失败值不值得早一点再试。``None`` 表示「按正常间隔」，由调用方（agent）
@@ -240,15 +255,23 @@ class Updater:
         self._restored_status = True
         record = update_recovery.read_install_result(self.log_dir / update_recovery.INSTALL_RESULT_FILE)
         consumed = self.log_dir / update_recovery.CONSUMED_RESULT_FILE
-        if (record is not None and record.fingerprint != self._last_install_record
-                and not update_recovery.is_consumed(consumed, record)):
+        legacy_unconfirmed_success = (
+            record is not None and saved is not None and saved.state == 'installed'
+            and saved.latest_version == record.version and saved.checked == record.checked
+            and record.result.get('code') == 0 and 'complete' not in record.result)
+        if (record is not None and (legacy_unconfirmed_success or
+                (record.fingerprint != self._last_install_record
+                 and not update_recovery.is_consumed(consumed, record)))):
             saved_time = update_recovery.timestamp(saved.checked) if saved is not None else None
             result_time = update_recovery.timestamp(record.checked)
             self._last_install_record = record.fingerprint
             if saved_time is None or result_time >= saved_time:
                 status = self._status_from_install(record.result, record.version)
                 changes = saved.changes if saved and saved.latest_version == record.version else {}
-                status = self._publish(dataclasses.replace(status, checked=record.checked, changes=changes))
+                status = dataclasses.replace(status, checked=record.checked, changes=changes)
+                if status.state == 'installing' and not _recent_install(record.checked):
+                    status = _missing_install_result(status, status.current_version)
+                status = self._publish(status)
                 # Preserve recoverability if persisting feedback failed. Marking
                 # a result seen before its terminal status lands loses it on reboot.
                 if read_status(self.log_dir / STATUS_FILE) == status:
@@ -256,19 +279,12 @@ class Updater:
                 return status
             update_recovery.mark_consumed(consumed, record)
         if saved is not None and saved.state == 'installing':
-            started = update_recovery.timestamp(saved.checked)
-            age = ((dt.datetime.now(dt.timezone.utc) - started).total_seconds()
-                   if started is not None else None)
             installed = read_installed_version(self.install_dir)
-            if (age is not None and 0 <= age <= INSTALL_RESULT_WAIT_SECONDS
-                    and installed == saved.latest_version):
+            if _recent_install(saved.checked) and installed == saved.latest_version:
                 # MSI commit may start the agent before msiexec returns to the
                 # detached worker. VERSION alone cannot announce completion.
                 return _report(self._report, saved) if restore else None
-            return self._publish(dataclasses.replace(
-                saved, state='error', current_version=installed, checked=_timestamp(),
-                message='未能恢复安装结果，请查看安装日志；后台稍后会重新检查。',
-                detail='installer result missing or stale'))
+            return self._publish(_missing_install_result(saved, installed))
         if restore and saved is not None and saved.state in ('installed', 'error', 'up_to_date'):
             if saved.state == 'installed' and saved.latest_version != read_installed_version(self.install_dir):
                 return None
@@ -279,8 +295,10 @@ class Updater:
         from windows_update import install_msi
 
         installer = self._installer or install_msi
-        return installer(package, self.executable, version, digest, on_launch,
-                         signature, silent=True, log_dir=self.log_dir)
+        options = {'silent': True, 'log_dir': self.log_dir}
+        if self._tray_user_sid is not None:
+            options['tray_user_sid'] = self._tray_user_sid
+        return installer(package, self.executable, version, digest, on_launch, signature, **options)
 
     def _restart_agent(self) -> bool:
         """Start the privileged agent again after the installer stopped it.
@@ -324,8 +342,14 @@ class Updater:
         self.retry_after_seconds = None
         # Starting a new cycle makes any previous completion historical. Consume
         # it before publishing a new timestamp so it cannot reappear in polling.
-        self._restored_status = True
         previous = update_recovery.read_install_result(self.log_dir / update_recovery.INSTALL_RESULT_FILE)
+        if (previous is not None and previous.version == current
+                and update_recovery.is_pending_success(previous.result)
+                and _recent_install(previous.checked)):
+            status = self.recover_install_result() or read_status(self.log_dir / STATUS_FILE)
+            if status is not None and status.state == 'installing':
+                return _report(progress, status)
+        self._restored_status = True
         if previous is not None:
             self._last_install_record = previous.fingerprint
             update_recovery.mark_consumed(self.log_dir / update_recovery.CONSUMED_RESULT_FILE, previous)
@@ -411,19 +435,15 @@ class Updater:
                 launched["seen"] = True
 
             result = self._install(package, version, digest, signature, on_launch)
-            tray = False
-            agent = False
             # The detached worker owns restart in production. These callbacks
-            # remain a fallback for installers without recovery metadata.
-            if isinstance(result, dict) and result.get('code') == 0:
-                tray = bool(result.get('relaunched')) or self._relaunch_tray()
-                agent = bool(result.get('agent_restarted')) or self._restart_agent()
-            status = self._status_from_install(result, version, tray)
-            if agent and status.state == 'installed' and status.detail != 'reboot required':
-                # 两个进程都由安装器停掉：窗口回来了、agent 也必须回来，
-                # 否则下一次自动更新不会发生（它的任务只在开机时触发）。
-                status = dataclasses.replace(status, detail="agent restarted")
-            return self._publish(status)
+            # remain a fallback for old installers, but cannot confirm startup.
+            if (isinstance(result, dict) and result.get('code') == 0
+                    and result.get('healthy') is True and 'complete' not in result):
+                if not result.get('relaunched'):
+                    self._relaunch_tray()
+                if not result.get('agent_restarted'):
+                    self._restart_agent()
+            return self._publish(self._status_from_install(result, version))
         except UpdateVerificationError as exc:
             return self._publish(UpdateStatus(
                 state="error", current_version=current, checked=_timestamp(),
@@ -552,7 +572,7 @@ class Updater:
             changes=changes if interesting else {},
         )
 
-    def _status_from_install(self, result: object, version: str, tray: bool = False) -> UpdateStatus:
+    def _status_from_install(self, result: object, version: str) -> UpdateStatus:
         if isinstance(result, dict) and type(result.get('error')) is int:
             from windows_update import _ERRORS
             error = result['error']
@@ -561,7 +581,7 @@ class Updater:
                 latest_version=version, checked=_timestamp(),
                 message=_ERRORS.get(error, '后台更新辅助进程未完成，请查看安装日志。'),
                 detail=f'worker error {error}')
-        if not isinstance(result, dict) or type(result.get("code")) is not int:
+        if not isinstance(result, dict) or not update_recovery.valid_installer_result(result):
             return UpdateStatus(
                 state="error", current_version=read_installed_version(self.install_dir),
                 latest_version=version, checked=_timestamp(),
@@ -590,9 +610,14 @@ class Updater:
                 progress=100, checked=_timestamp(),
                 message=f"后台安装未完成（返回码 {code}），已记录日志，将在下次检查时重试。",
                 detail=f"msiexec exit {code}")
+        if update_recovery.is_pending_success(result):
+            return UpdateStatus(
+                state='installing', current_version=installed, latest_version=version,
+                progress=100, checked=_timestamp(),
+                message='安装已结束，正在确认后台认证和托盘是否启动。', detail='installer recovery pending')
         # 安装返回 0 之后仍然要看程序能不能跑：静默路径没有人工兜底。
         healthy = result.get("healthy")
-        if healthy is False:
+        if healthy is not True:
             reason = result.get("launch_exit_code")
             return UpdateStatus(
                 state="error", current_version=installed or version, latest_version=version,
@@ -600,10 +625,27 @@ class Updater:
                 message=f"v{version} 已安装但程序没能启动，已停止重试并保留日志。",
                 detail=f"health check failed (exit {reason})" if reason is not None
                 else "health check failed")
+        tray_status = result.get('tray_status')
+        if tray_status is None:
+            return UpdateStatus(
+                state='error', current_version=installed, latest_version=version,
+                progress=100, checked=_timestamp(),
+                message=f'v{version} 已安装。旧版更新程序未确认新版本的后台认证和托盘是否启动。',
+                detail='installer startup not verified')
+        if tray_status == 'failed':
+            return UpdateStatus(
+                state='error', current_version=installed, latest_version=version,
+                progress=100, checked=_timestamp(),
+                message=f'v{version} 已安装，托盘未通过启动检查；请查看安装日志。',
+                detail='tray startup failed')
+        if tray_status == 'deferred':
+            return UpdateStatus(
+                state='installed', current_version=installed, latest_version=version,
+                progress=100, checked=_timestamp(),
+                message=f'已自动更新到 v{version}。当前没有交互登录，托盘将在登录后启动。',
+                detail='tray deferred')
         return UpdateStatus(
             state="installed", current_version=installed or version, latest_version=version,
             progress=100, checked=_timestamp(),
             message=f"已自动更新到 v{version}。",
-            detail="agent restarted" if result.get('agent_restarted') is True
-            else "relaunched" if (result.get("relaunched") or tray)
-            else "installed, relaunch not confirmed")
+            detail="agent and tray ready")

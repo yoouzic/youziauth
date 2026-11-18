@@ -83,7 +83,8 @@ class UpdaterTests(unittest.TestCase):
             cache_dir=self.cache,
             executable=self.install / 'youziauth.exe',
             controller_factory=lambda *a, **k: controller,
-            installer=self.install_stub(result if result is not None else {'code': 0, 'healthy': True, 'relaunched': True}),
+            installer=self.install_stub(result if result is not None else {
+                'code': 0, 'complete': True, 'healthy': True, 'tray_status': 'ready'}),
             report=self.statuses.append,
             log_dir=self.cache,
             **kwargs,
@@ -198,16 +199,16 @@ class UpdaterTests(unittest.TestCase):
                                   relaunch=lambda: calls.append(True) or True)
         status = updater.run_cycle()
         self.assertEqual(calls, [True])
-        self.assertEqual(status.state, 'installed')
-        self.assertEqual(status.detail, 'relaunched')
+        self.assertEqual(status.state, 'error')
+        self.assertEqual(status.detail, 'installer startup not verified')
 
     def test_a_failed_relaunch_is_recorded_rather_than_hidden(self):
         self.write_version('1.8.4')
         updater, _ = self.updater(READY, result={'code': 0, 'healthy': True},
                                   relaunch=lambda: False)
         status = updater.run_cycle()
-        self.assertEqual(status.state, 'installed')
-        self.assertEqual(status.detail, 'installed, relaunch not confirmed')
+        self.assertEqual(status.state, 'error')
+        self.assertEqual(status.detail, 'installer startup not verified')
 
     def test_a_raising_relaunch_never_escapes(self):
         self.write_version('1.8.4')
@@ -217,7 +218,7 @@ class UpdaterTests(unittest.TestCase):
 
         updater, _ = self.updater(READY, result={'code': 0, 'healthy': True}, relaunch=exploding)
         status = updater.run_cycle()
-        self.assertEqual(status.state, 'installed')
+        self.assertEqual(status.state, 'error')
 
     def test_installing_is_published_before_the_installer_starts_without_report(self):
         self.write_version('1.8.4')
@@ -406,7 +407,8 @@ class RetryTests(unittest.TestCase):
             return holder["controller"]
 
         def installer(*args, **kwargs):
-            result = install_result or {"code": 0, "healthy": True, "relaunched": True}
+            result = install_result or {
+                "code": 0, "complete": True, "healthy": True, "tray_status": "ready"}
             if result.get('code') in (0, 3010):
                 (self.install / 'VERSION').write_text(args[2], encoding='utf-8')
             return result
@@ -500,17 +502,16 @@ class AgentRecoveryTests(unittest.TestCase):
         calls = []
         status = self.build(lambda: calls.append("agent") or True).run_cycle()
         self.assertEqual(calls, ["agent"], "the agent must be started again")
-        self.assertEqual(status.state, "installed")
-        self.assertEqual(status.detail, "agent restarted")
+        self.assertEqual(status.state, "error")
+        self.assertEqual(status.detail, "installer startup not verified")
 
-    def test_a_failed_restart_is_reported_but_does_not_fail_the_update(self):
-        # 更新已经装好了，agent 没拉起来不该让整件事变成失败。
+    def test_a_failed_restart_does_not_hide_the_unconfirmed_legacy_result(self):
         def boom():
             raise OSError("schtasks is unavailable")
 
         status = self.build(boom).run_cycle()
-        self.assertEqual(status.state, "installed")
-        self.assertNotEqual(status.detail, "agent restarted")
+        self.assertEqual(status.state, "error")
+        self.assertEqual(status.detail, "installer startup not verified")
 
     def test_no_runner_configured_is_not_an_error(self):
         self.assertFalse(self.build(None)._restart_agent())
@@ -561,7 +562,7 @@ class SlowDownloadTests(unittest.TestCase):
         def installer(*args, **kwargs):
             owner.installations.append(args[2])
             (owner.install / 'VERSION').write_text(args[2], encoding='utf-8')
-            return {'code': 0, 'healthy': True}
+            return {'code': 0, 'complete': True, 'healthy': True, 'tray_status': 'ready'}
 
         updater = Updater(self.install, self.cache, controller_factory=lambda *args: controller,
                           installer=installer)
