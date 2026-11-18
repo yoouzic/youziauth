@@ -135,6 +135,21 @@ class ProxyGuardTests(unittest.TestCase):
         self.assertTrue(keywords["creationflags"] & 0x00000008,
                         "看门狗必须脱离父进程, 否则被一起结束就失去意义")
 
+    def test_frozen_guard_uses_its_own_pyinstaller_runtime(self):
+        with (
+            patch.object(sys, "frozen", True, create=True),
+            patch.dict(os.environ, {
+                "PYINSTALLER_RESET_ENVIRONMENT": "0",
+                "YOUZIAUTH_TEST_ENV": "preserved",
+            }),
+            patch.object(proxy_guard.subprocess, "Popen") as popen,
+        ):
+            proxy_guard.spawn_guard(self.backup, 4321, REG)
+            child_env = popen.call_args.kwargs.get("env", {})
+            self.assertEqual(child_env.get("PYINSTALLER_RESET_ENVIRONMENT"), "1")
+            self.assertEqual(child_env.get("YOUZIAUTH_TEST_ENV"), "preserved")
+            self.assertEqual(os.environ["PYINSTALLER_RESET_ENVIRONMENT"], "0")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,3 +1,4 @@
+import base64
 import subprocess
 import tempfile
 import unittest
@@ -42,7 +43,7 @@ class StartupTaskXmlTests(unittest.TestCase):
         )
 
     def test_tray_task_uses_interactive_token_and_hidden_mode(self):
-        install_dir = Path(r"C:\Program Files\youziauth")
+        install_dir = Path(r"C:\Program Files\youziauth [O'Neil]")
         user_sid = "S-1-5-21-123-456-789-1001"
         root = ET.fromstring(build_tray_task_xml(install_dir, user_sid))
 
@@ -53,7 +54,19 @@ class StartupTaskXmlTests(unittest.TestCase):
             root.findtext(".//task:Principal/task:LogonType", namespaces=NS),
             "InteractiveToken",
         )
-        self.assertEqual(root.findtext(".//task:Exec/task:Arguments", namespaces=NS), "--tray-startup")
+        command = root.findtext(".//task:Exec/task:Command", namespaces=NS)
+        arguments = root.findtext(".//task:Exec/task:Arguments", namespaces=NS).split()
+        self.assertEqual(Path(command).name, "powershell.exe")
+        self.assertEqual(arguments[:-1], [
+            "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand",
+        ])
+        script = base64.b64decode(arguments[-1]).decode("utf-16le")
+        encoded_install_dir = base64.b64encode(str(install_dir).encode("utf-16le")).decode("ascii")
+        self.assertIn(f"FromBase64String('{encoded_install_dir}')", script)
+        self.assertIn("base_library.zip", script)
+        self.assertIn("encodings/__init__.pyc", script)
+        self.assertLess(script.index("encodings/__init__.pyc"), script.index("--tray-startup"))
+        self.assertEqual(root.findtext(".//task:Exec/task:WorkingDirectory", namespaces=NS), str(install_dir))
 
 
 class ConfigureStartupTests(unittest.TestCase):

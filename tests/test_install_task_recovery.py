@@ -36,10 +36,18 @@ class InstallTaskRecoveryTests(unittest.TestCase):
         return restored, calls, created
 
     def test_surviving_tray_restores_system_agent_with_original_user(self):
+        old_tray = tasks._build_task_xml(
+            Path('C:/old'), trigger='LogonTrigger', user_sid=SID,
+            logon_type='InteractiveToken', run_level='LeastPrivilege',
+            command=Path('C:/old/youziauth.exe'), arguments='--tray-startup',
+        )
         restored, calls, created = self.run_repair({
-            tasks.TRAY_TASK_NAME: tasks.build_tray_task_xml(Path('C:/old'), SID)})
+            tasks.TRAY_TASK_NAME: old_tray})
         self.assertTrue(restored)
         self.assertEqual(set(created), {tasks.SYSTEM_TASK_NAME, tasks.TRAY_TASK_NAME})
+        tray = created[tasks.TRAY_TASK_NAME]
+        self.assertEqual(tray.findtext('.//t:Principal/t:UserId', namespaces=NS), SID)
+        self.assertEqual(Path(tray.findtext('.//t:Exec/t:Command', namespaces=NS)).name, 'powershell.exe')
         system = created[tasks.SYSTEM_TASK_NAME]
         self.assertEqual(system.findtext('.//t:Principal/t:UserId', namespaces=NS), tasks.SYSTEM_SID)
         self.assertEqual(system.findtext('.//t:Exec/t:Arguments', namespaces=NS), '--allowed-user-sid ' + SID)

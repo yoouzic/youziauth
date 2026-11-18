@@ -217,6 +217,10 @@ def spawn_guard(backup_path, parent_pid, reg_path: str = REG_PATH):
         return None
     flags = 0x08000000 | 0x00000008          # CREATE_NO_WINDOW | DETACHED_PROCESS
     flags |= 0x00000200                      # CREATE_NEW_PROCESS_GROUP
+    env = None
+    if getattr(sys, "frozen", False):
+        # 单文件提取器退出时会清理临时运行库。看门狗要独立解包，才能在它退出后运行。
+        env = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
     try:
         return subprocess.Popen(
             guard_command(backup_path, parent_pid, reg_path),
@@ -225,6 +229,7 @@ def spawn_guard(backup_path, parent_pid, reg_path: str = REG_PATH):
             stderr=subprocess.DEVNULL,
             close_fds=True,
             creationflags=flags,
+            env=env,
         )
     except OSError:
         return None
