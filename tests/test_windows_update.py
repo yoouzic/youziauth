@@ -601,6 +601,41 @@ $reply = Read-UpdateProbe $env:TEST_PIPE ([DateTime]::UtcNow.AddSeconds(5)) $env
         self.assertEqual(value["version"], "1.2.3")
         self.assertGreaterEqual(value["session"], 0)
 
+    def test_peer_identity_uses_the_process_user_independently_of_pipe_ownership(self):
+        import agent_ipc
+        name = "youziauth-test-peer-token-" + os.urandom(8).hex()
+        executable = ctypes.create_unicode_buffer(32768)
+        self.assertTrue(ctypes.windll.kernel32.GetModuleFileNameW(None, executable, len(executable)))
+        server = agent_ipc.NamedPipeServer(name, lambda command: {"ok": True})
+        thread = threading.Thread(target=server.serve_once, daemon=True)
+        thread.start()
+        value = self.run_script(r'''
+$pipe = New-Object IO.Pipes.NamedPipeClientStream('.', $env:TEST_PIPE, [IO.Pipes.PipeDirection]::InOut)
+try {
+    $pipe.Connect(1500)
+    $pipe.ReadMode = [IO.Pipes.PipeTransmissionMode]::Message
+    $peer = [pscustomobject]@{ SafePipeHandle = $pipe.SafePipeHandle }
+    # The security descriptor owner can differ from the token user under elevation.
+    $peer | Add-Member ScriptMethod GetAccessControl { throw 'pipe-owner-is-not-process-user' }
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $session = $null
+    try { $session = Get-UpdatePipePeerSession $peer $env:TEST_EXE $sid } catch { }
+    $refused = $false
+    try { [void](Get-UpdatePipePeerSession $peer $env:TEST_EXE 'S-1-5-7') }
+    catch { $refused = ($_.Exception.Message -eq 'unexpected-pipe-user') }
+    $command = [Text.Encoding]::UTF8.GetBytes('{"command":"status"}')
+    $pipe.Write($command, 0, $command.Length)
+    $buffer = New-Object byte[] 100
+    [void]$pipe.Read($buffer, 0, $buffer.Length)
+    @{ session = $session; refused = $refused } | ConvertTo-Json
+} finally { $pipe.Dispose() }
+''', environment={"TEST_PIPE": name, "TEST_EXE": executable.value})
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertIsInstance(value["session"], int)
+        self.assertGreaterEqual(value["session"], 0)
+        self.assertTrue(value["refused"])
+
     def test_a_running_other_agent_version_does_not_confirm_recovery(self):
         import agent_ipc
         name = "youziauth-test-old-agent-" + os.urandom(8).hex()

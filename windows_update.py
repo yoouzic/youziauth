@@ -192,6 +192,10 @@ public static class YouziauthUpdateProbe {
     }
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool GetNamedPipeServerProcessId(SafePipeHandle pipe, out int pid);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
     [DllImport("wtsapi32.dll", EntryPoint = "WTSEnumerateSessionsW", SetLastError = true)]
     private static extern bool EnumerateSessions(IntPtr server, int reserved, int version,
         out IntPtr sessions, out int count);
@@ -201,6 +205,23 @@ public static class YouziauthUpdateProbe {
     private static extern bool WTSQueryUserToken(int id, out IntPtr token);
     [DllImport("kernel32.dll")]
     private static extern bool CloseHandle(IntPtr handle);
+
+    public static string ProcessUserSid(int pid) {
+        const uint ProcessQueryLimitedInformation = 0x1000;
+        const uint TokenQuery = 0x0008;
+        IntPtr process = OpenProcess(ProcessQueryLimitedInformation, false, pid);
+        if (process == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            IntPtr token;
+            if (!OpenProcessToken(process, TokenQuery, out token))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            try {
+                using (var identity = new WindowsIdentity(token)) {
+                    return identity.User.Value;
+                }
+            } finally { CloseHandle(token); }
+        } finally { CloseHandle(process); }
+    }
 
     public static int[] ActiveSessions(string sid) {
         IntPtr buffer;
@@ -238,15 +259,15 @@ function Get-ActiveTraySessions([string]$userSid) {
     Initialize-UpdateProbe
     return [YouziauthUpdateProbe]::ActiveSessions($userSid)
 }
-function Get-UpdatePipePeerSession($pipe, [string]$expectedExe, [string]$expectedOwner) {
+function Get-UpdatePipePeerSession($pipe, [string]$expectedExe, [string]$expectedUserSid) {
     Initialize-UpdateProbe
-    if ($expectedOwner -and
-        $pipe.GetAccessControl().GetOwner([Security.Principal.SecurityIdentifier]).Value -cne $expectedOwner) {
-        throw 'unexpected-pipe-owner'
-    }
     $serverId = 0
     if (-not [YouziauthUpdateProbe]::GetNamedPipeServerProcessId($pipe.SafePipeHandle, [ref]$serverId)) {
         throw 'unidentified-pipe-server'
+    }
+    # The pipe object's ACL owner can be a group. Authenticate the process user.
+    if ($expectedUserSid -and [YouziauthUpdateProbe]::ProcessUserSid($serverId) -cne $expectedUserSid) {
+        throw 'unexpected-pipe-user'
     }
     $server = [Diagnostics.Process]::GetProcessById($serverId)
     try {
@@ -258,7 +279,7 @@ function Get-UpdatePipePeerSession($pipe, [string]$expectedExe, [string]$expecte
     } finally { $server.Dispose() }
 }
 function Read-UpdateProbe([string]$pipeName, [DateTime]$deadline,
-                          [string]$expectedExe = '', [string]$expectedOwner = '') {
+                          [string]$expectedExe = '', [string]$expectedUserSid = '') {
     $pipe = $null
     $pending = $null
     try {
@@ -269,7 +290,7 @@ function Read-UpdateProbe([string]$pipeName, [DateTime]$deadline,
         $pipe.Connect([Math]::Min(500, $remaining))
         $sessionId = -1
         if ($expectedExe) {
-            $sessionId = Get-UpdatePipePeerSession $pipe $expectedExe $expectedOwner
+            $sessionId = Get-UpdatePipePeerSession $pipe $expectedExe $expectedUserSid
         }
         $pipe.ReadMode = [IO.Pipes.PipeTransmissionMode]::Message
         $message = [Text.Encoding]::UTF8.GetBytes('{"command":"status"}')
@@ -314,11 +335,11 @@ function Test-AgentHealthy([string]$pipeName = 'youziauth-agent', [int]$timeoutM
     return $false
 }
 function Test-TrayReady([string]$expectedVersion, [string]$expectedExe, [int[]]$sessionIds,
-                        [string]$expectedOwner = '', [int]$timeoutMs = 45000) {
+                        [string]$expectedUserSid = '', [int]$timeoutMs = 45000) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
     while ([DateTime]::UtcNow -lt $deadline) {
         try {
-            $reply = Read-UpdateProbe 'youziauth-ui' $deadline $expectedExe $expectedOwner
+            $reply = Read-UpdateProbe 'youziauth-ui' $deadline $expectedExe $expectedUserSid
             $response = $reply.response
             if ($response.ok -is [bool] -and $response.ok -and
                 $response.tray_ready -is [bool] -and $response.tray_ready -and
@@ -404,7 +425,7 @@ function Complete-Install($result) {
             } else {
                 [void](Start-UpdateTask '\youziauth\Tray')
                 $result.relaunched = Test-TrayReady -expectedVersion $version -expectedExe $trayExe `
-                    -sessionIds $sessions -expectedOwner $userSid
+                    -sessionIds $sessions -expectedUserSid $userSid
                 if ($result.relaunched) {
                     $result.tray_status = 'ready'
                 } elseif (@(Get-ActiveTraySessions $userSid).Count -eq 0) {
