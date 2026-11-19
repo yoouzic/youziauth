@@ -25,8 +25,10 @@ from . import spec
 from . import tracks as TRK
 from . import upfile as UP
 from .cipher import seal
-from .client import ApiError
+from .client import ApiClient, ApiError
 from .spec import R_AUTOCORRECT, R_NEGATIVE_HINTS
+
+SUBMITTED_REVIEW_CANCELLED = 6
 
 
 def _positive_reason(reason: str) -> bool:
@@ -109,18 +111,20 @@ class DailyFlow:
                 pass
 
     def _sleep(self, sec):
-        if sec <= 0:
-            return
-        t0 = time.time()
-        while time.time() - t0 < sec:
-            if self.stop_event.is_set():
-                raise ApiError(9, "interrupted (user stop)")
-            time.sleep(0.2)
+        if sec > 0:
+            self.stop_event.wait(sec)
+        self._check_cancelled()
+
+    def _check_cancelled(self):
+        if self.stop_event.is_set():
+            raise ApiError(9, "interrupted (user stop)")
 
     # ------------------------------------------------------------ 步骤
     def _gate(self, client):
         """[0] 真门 + 学校信息。"""
+        self._check_cancelled()
         client.term_list()              # 101 已由 ApiClient 统一抛出
+        self._check_cancelled()
         info = client.school_info()
         if not isinstance(info, dict) or "school_name" not in info:
             raise ApiError(4, f"学校信息异常: {str(info)[:200]}")
@@ -128,7 +132,9 @@ class DailyFlow:
         self._sleep(self.rnd.uniform(0.6, 1.5))
 
     def _zone_rule(self, client):
+        self._check_cancelled()
         cfg = client.before_run()
+        self._check_cancelled()
         if not isinstance(cfg, dict) or not cfg.get("run_line_info"):
             raise ApiError(4, f"beforeRun 异常: {str(cfg)[:200]}")
         pts = []
@@ -181,6 +187,7 @@ class DailyFlow:
         day0 = int(time.mktime(datetime.date.today().timetuple()))
         done = 0
         for page in (1, 2):
+            self._check_cancelled()
             r = client.term_records(term_id, page)
             if not isinstance(r, dict):
                 break
@@ -196,6 +203,7 @@ class DailyFlow:
                 break
             self._sleep(self.rnd.uniform(0.6, 1.4))
         self.log(f"[2] 今日已完成 {done} 次 (上限 {self.policy['max_per_day']})")
+        self._check_cancelled()
         if done >= self.policy["max_per_day"] and submit:
             raise ApiError(3, "当日额度已满, 不提交")
         return done
@@ -259,6 +267,7 @@ class DailyFlow:
                 self.log("[4] 模板缺失 → 自动改用 ring 引擎")
             style = "ring"
         for attempt in range(12):
+            self._check_cancelled()
             if attempt:
                 self._report(2, f'轨迹参数未达标，重新生成（第 {attempt + 1} 次尝试）…')
             target_m = self.rnd.uniform(lo, hi) * 1000
@@ -288,13 +297,18 @@ class DailyFlow:
     # ------------------------------------------------------------ 主入口
     def run(self, submit=False, zone_override=None):  # noqa: C901 —— 线性流水线
         """返回 (summary|None, exit_code)。退出码: 0 成功/受理 | 2 token失效
-        | 3 额度满 | 4 其他失败 | 5 受理但判无效 | 9 中断。"""
-        client = self.slot.make_client(pace=0.8)
+        | 3 额度满 | 4 其他失败 | 5 受理但判无效 | 6 已提交、停止等待判定 | 9 中断。"""
+        submitting = False
         try:
+            self._check_cancelled()
+            client = self.slot.make_client(pace=0.8)
+            if isinstance(client, ApiClient):
+                client.stop_event = self.stop_event
             self._report(2, '正在连接小程序并读取跑区…')
             self._gate(client)
             rule = self._zone_rule(client)
             if zone_override and zone_override != rule["zone"]:
+                self._check_cancelled()
                 client.set_zone(zone_override)
                 self.log(f"[1b] setRunZone → {zone_override}")
                 rule = self._zone_rule(client)
@@ -304,6 +318,7 @@ class DailyFlow:
                                       f"服务器仍在 {rule['zone']}({rule['zone_name']})")
             self._quota(client, rule["term_id"], submit)
             self._sleep(self.rnd.uniform(0.6, 1.4))
+            self._check_cancelled()
             srv_now = client.server_time()
             self.log(f"[3] 服务器时间={srv_now}")
             # 课外跑有效时段守卫(校方规则 06:00~23:00): 时段外提交=白判无效
@@ -318,7 +333,9 @@ class DailyFlow:
                          f"(dry-run 继续; 真提交会被拒)")
 
             style = self.policy.get("style", "template")
+            self._check_cancelled()
             track, kind, used, dist_km, meta = self._gen_track(rule, style)
+            self._check_cancelled()
             end_time = srv_now - self.rnd.randint(15, 75)
             start_time = end_time - used
             if kind == "template":
@@ -358,6 +375,7 @@ class DailyFlow:
             self.log(f"[6] record_file={record_file} txt={len(track_text)}B "
                      f"点数={len(track)}")
 
+            self._check_cancelled()
             if not submit:
                 out = {"stopRun_biz": biz, "track_points": len(track),
                        "track": track,
@@ -370,7 +388,9 @@ class DailyFlow:
 
             self._sleep(self.rnd.uniform(0.4, 1.2))
             self._report(3, '正在上传轨迹数据…')
+            self._check_cancelled()
             sts = client.oss_sts()
+            self._check_cancelled()
             if not isinstance(sts, dict) or "AccessKeySecret" not in sts:
                 raise ApiError(4, f"getOssSts 异常: {str(sts)[:200]}")
             status, rbody = UP.upload_to_oss(track_text, sts, now_ms,
@@ -383,14 +403,21 @@ class DailyFlow:
             self._report(3, '正在提交跑步成绩…')
             self.log(f"[7] stopRun 距离={dist_km}km 用时={used}s "
                      f"步数={step_num} 配速={int(used / dist_km)}s/km")
+            self._check_cancelled()
+            submitting = True
             resp = client.stop_run(biz)
             self.log("[7] 响应: " + json.dumps(resp, ensure_ascii=False)[:300])
 
             detail = None
             if isinstance(resp, dict) and resp.get("record_id"):
                 self._report(4, '成绩已提交，等待学校判定…')
-                self._sleep(self.rnd.uniform(2.5, 6.0))
-                detail = client.record_detail(resp["record_id"])
+                try:
+                    self._sleep(self.rnd.uniform(2.5, 6.0))
+                    self._check_cancelled()
+                    detail = client.record_detail(resp["record_id"])
+                except (ApiError, OSError):
+                    if not self.stop_event.is_set():
+                        raise
                 if isinstance(detail, dict):
                     self.log(f"[8] recordDetail: status={detail.get('record_status')} "
                              f"reason={detail.get('record_failed_reason')!r} "
@@ -422,13 +449,17 @@ class DailyFlow:
                     "passed_points": (detail or {}).get("point_list"),
                 }
                 self.log("RUN_RESULT:" + json.dumps(summary, ensure_ascii=False))
+                if summary["record_id"] and detail is None and self.stop_event.is_set():
+                    return summary, SUBMITTED_REVIEW_CANCELLED
                 if summary["record_id"] and str(stt) in ("0", "1") \
                         and _positive_reason(rsn):
-                    self.slot.after_submission(client)
+                    if not self.stop_event.is_set():
+                        self.slot.after_submission(client)
                     return summary, 0
                 if summary["record_id"] and not _positive_reason(rsn):
                     self.log(f"[WARN] 记录已创建但被判无效: {rsn}")
-                    self.slot.after_submission(client)
+                    if not self.stop_event.is_set():
+                        self.slot.after_submission(client)
                     return summary, 5
             return (resp if isinstance(resp, dict) else None), 4
         except ApiError as e:
@@ -440,4 +471,6 @@ class DailyFlow:
                            (3 if e.code == 3 else 4)))
         except OSError as e:
             self.log(f"[FATAL] 业务链不通 {e.__class__.__name__}: {e}")
+            if not submitting and self.stop_event.is_set():
+                return None, 9
             return None, 4

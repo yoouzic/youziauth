@@ -33,7 +33,9 @@ def open_login_page(page, cancel, authenticated=None):
         try:
             response = page.goto(url, wait_until='domcontentloaded', timeout=30000)
         except Exception:
+            check_cancel(cancel)
             raise CheckinError('network_error', f'{stage}未能加载，请检查网络后重试') from None
+        check_cancel(cancel)
         if response is not None and response.status >= 400:
             state = 'login_required' if response.status in (401, 403) else 'network_error'
             raise CheckinError(state, f'{stage}返回 HTTP {response.status}，请稍后重试或手动登录')
@@ -663,6 +665,7 @@ def login(store, api, cancel, timeout=300, *, interactive=True, idm_credentials=
                         page, credentials.username, credentials.password,
                         cancel=cancel, fresh_session=fresh_session, log=log,
                     )
+                    check_cancel(cancel)
                     silent_result = silent
                     if silent.ok:
                         # 认证已通过：把纯 HTTP 会话拿到的 cookie 灌回浏览器，并
@@ -688,6 +691,7 @@ def login(store, api, cancel, timeout=300, *, interactive=True, idm_credentials=
                 except Exception:
                     # 静默登录属于增强能力，任何异常都不应影响原有流程
                     pass
+            check_cancel(cancel)
 
             # ★ 交回人工前，把页面刷新成一张**可用**的登录表单（只限交互模式 + 明确失败）。
             #
@@ -753,10 +757,12 @@ def login(store, api, cancel, timeout=300, *, interactive=True, idm_credentials=
                 raise CheckinError('network_error', '学校登录交换未完成，已保留会话，请稍后重试')
             try:
                 student = identify_student(api, token[0], cancel)
-            except CheckinError:
+            except CheckinError as exc:
                 # 交换已经成功 = 这次登录是成功的；身份没核验出来时把成果保住，
                 # 别让上层以为要重新登录（那正是「第一次成功却重登」的另一半原因）。
-                keep_session(store, token[0], context, session)
+                check_cancel(cancel)
+                if exc.state != 'cancelled':
+                    keep_session(store, token[0], context, session)
                 raise
             check_cancel(cancel)
             # 「恢复的账号不一致」这条只在**续用已有会话**时才有意义：
@@ -769,10 +775,13 @@ def login(store, api, cancel, timeout=300, *, interactive=True, idm_credentials=
             log(f'登录完成：会话已保存（学号 {student}，cookie {len(cookies)} 个）')
             return student
     except CheckinError as exc:
+        if exc.state != 'cancelled':
+            check_cancel(cancel)
         if not interactive and exc.state == 'login_required':
             store.clear_browser_session()
         raise
     except Exception:
+        check_cancel(cancel)
         if not interactive:
             raise CheckinError('error', '登录会话恢复未完成，请稍后重试或手动登录') from None
         raise CheckinError('login_required', '登录未完成，请重新打开登录窗口') from None

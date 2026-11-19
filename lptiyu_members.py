@@ -31,7 +31,7 @@ MEMBERS_DIRNAME = 'members'
 REGISTRY_NAME = 'members.json'
 REGISTRY_VERSION = 1
 # 每个成员都是一条独立的采集/提交链路, 数量无界增长只会放大风控与误操作面。
-MAX_MEMBERS = 5
+MAX_MEMBERS = 10
 MAX_NAME_LENGTH = 24
 # 成员目录名即路径分量, 必须限定字符集挡住手改文件里的路径穿越。
 MEMBER_ID_PATTERN = re.compile(r'[0-9a-f]{12}')

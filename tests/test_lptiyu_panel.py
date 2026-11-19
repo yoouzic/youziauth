@@ -583,6 +583,49 @@ class ZoneSyncTests(PanelTestCase):
              {'id': '1874', 'name': '第一运动场', 'is_default': 1},
              {'id': '1876', 'name': '南区操场', 'is_default': 0}]
 
+    def test_cancel_stops_visiting_zones_and_restores_selected_zone(self):
+        controller = self.make_controller(settings=Settings(enabled=True, zone_id='1873'))
+
+        class CancelAfterSwitch(FakeZoneClient):
+            def set_zone(self, zone_id):
+                result = super().set_zone(zone_id)
+                if zone_id == '1874':
+                    controller.cancel_work()
+                return result
+
+        client = CancelAfterSwitch(self.ZONES)
+        with patch.object(TokenSlot, 'make_client', lambda self, pace=0: client):
+            with self.assertRaises(LptiyuError) as caught:
+                controller._sync_zones()
+        self.assertEqual(caught.exception.state, 'cancelled')
+        self.assertEqual(client.set_calls, ['1874', '1873'])
+        self.assertEqual(client.current, '1873')
+
+    def test_cancel_restores_the_initial_server_zone_even_if_selection_differs(self):
+        for cancel_at, occurrence, expected in (
+            ('1873', 1, ['1873', '1876']),
+            ('1874', 1, ['1873', '1874', '1876']),
+            ('1873', 2, ['1873', '1874', '1876', '1873', '1876']),
+        ):
+            with self.subTest(cancel_at=cancel_at, occurrence=occurrence):
+                controller = self.make_controller(settings=Settings(enabled=True, zone_id='1873'))
+
+                class CancelAfterSwitch(FakeZoneClient):
+                    def set_zone(self, zone_id):
+                        result = super().set_zone(zone_id)
+                        if zone_id == cancel_at and self.set_calls.count(zone_id) == occurrence:
+                            controller.cancel_work()
+                        return result
+
+                client = CancelAfterSwitch(self.ZONES, current='1876')
+                with patch.object(TokenSlot, 'make_client', lambda self, pace=0: client):
+                    with self.assertRaises(LptiyuError) as caught:
+                        controller._sync_zones()
+                self.assertEqual(caught.exception.state, 'cancelled')
+                self.assertEqual(client.set_calls, expected)
+                self.assertEqual(client.current, '1876')
+                self.assertEqual(controller.store.settings().zone_id, '1873')
+
     def test_sync_collects_every_field_and_restores_the_choice(self):
         controller = self.make_controller(settings=Settings(enabled=True, zone_id='1873'))
         client = FakeZoneClient(self.ZONES)
@@ -655,14 +698,14 @@ class FakeCapture:
         self.state = "idle"
         self.message = ""
 
-    def start(self):
+    def start(self, stop_event=None):
         from lptiyu_capture import CaptureError
         if not self.ca.installed():
             raise CaptureError("还没有安装采集证书：先点「安装采集证书」，再开始采集")
         self.started += 1
         self.state, self.message = "waiting", "等待小程序登录"
 
-    def wait(self, timeout=None, on_tick=None):
+    def wait(self, timeout=None, on_tick=None, stop_event=None):
         if on_tick is not None:
             on_tick()
         self.state = self.final.get("state", "captured" if self.cred else "timeout")
@@ -924,6 +967,49 @@ class CaptureFlowTests(PanelTestCase):
         self.assertEqual(caught.exception.state, "need_token")
         self.assertIn("超时", caught.exception.message)
 
+    def test_cancel_action_interrupts_capture_and_restores_proxy(self):
+        waiting = threading.Event()
+        release = threading.Event()
+
+        class WaitingCapture(FakeCapture):
+            def log(self, message):
+                self.logs.append(message)
+
+            def wait(self, timeout=None, on_tick=None, stop_event=None):
+                waiting.set()
+                (stop_event or release).wait(3)
+                return None
+
+        capture = WaitingCapture()
+        controller = self.make_controller(capture=capture)
+        try:
+            self.assertTrue(controller.start('capture'))
+            self.assertTrue(waiting.wait(2))
+            controller.cancel_work()
+            controller._wait_for_work(timeout=0.8)
+            self.assertFalse(controller.busy)
+            self.assertEqual(controller.latest['state'], 'cancelled')
+            self.assertEqual(capture.state, 'idle')
+            self.assertTrue(capture.stops)
+        finally:
+            release.set()
+            controller._wait_for_work()
+
+    def test_cancel_preserves_proxy_restoration_error(self):
+        class FailedRestoreCapture(FakeCapture):
+            def wait(self, timeout=None, on_tick=None, stop_event=None):
+                stop_event.set()
+                self.state = 'error'
+                self.message = '已停止采集，系统代理恢复失败'
+                return None
+
+        controller = self.make_controller(capture=FailedRestoreCapture())
+        self.assertTrue(controller.start('capture'))
+        controller._wait_for_work()
+        self.assertFalse(controller.busy)
+        self.assertEqual(controller.latest['state'], 'error')
+        self.assertIn('代理恢复失败', controller.latest['message'])
+
     def test_stopping_the_capture_returns_to_idle(self):
         controller = self.make_controller(capture=FakeCapture(
             cred=None, final={"state": "idle", "message": "已停止采集"}))
@@ -944,7 +1030,7 @@ class CaptureFlowTests(PanelTestCase):
                 # 这里保留「still waiting」才能验证异常收尾会停掉采集。
                 self.logs.append(message)
 
-            def wait(self, timeout=None, on_tick=None):
+            def wait(self, timeout=None, on_tick=None, stop_event=None):
                 if on_tick is not None:
                     on_tick()
                 raise RuntimeError("boom")

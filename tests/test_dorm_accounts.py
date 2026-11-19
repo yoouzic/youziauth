@@ -77,11 +77,11 @@ class RegistryTests(unittest.TestCase):
     def test_adding_activates_and_caps_the_count(self):
         registry = Registry(self.root)
         registry.ensure()
-        for index in range(2, dorm_accounts.MAX_ACCOUNTS + 1):
+        for index in range(2, 11):
             record = registry.add()
             self.assertEqual(record.name, f'账号 {index}')
-        self.assertEqual(len(registry.accounts()), dorm_accounts.MAX_ACCOUNTS)
-        with self.assertRaisesRegex(AccountError, '最多'):
+        self.assertEqual(len(registry.accounts()), 10)
+        with self.assertRaisesRegex(AccountError, '最多 10 个账号'):
             registry.add()
 
     def test_names_are_cleaned_and_must_be_unique(self):
@@ -237,6 +237,41 @@ class DormAccountsTests(unittest.TestCase):
         self.assertIs(self.accounts.controller, controller)
         self.assertTrue(controller.root.is_dir())
         self.assertEqual(controller.root.parent, Path(self.tmp.name) / 'accounts')
+
+    def test_concurrent_readers_share_the_cancellable_controller(self):
+        constructing = threading.Event()
+        release = threading.Event()
+        second_returned = threading.Event()
+        results = []
+
+        def factory(profile, stagger_seconds=0):
+            if not constructing.is_set():
+                constructing.set()
+                release.wait(3)
+            return FakeController(profile, stagger_seconds)
+
+        accounts = DormAccounts(Path(self.tmp.name) / 'accounts', controller_factory=factory)
+        first = threading.Thread(target=lambda: results.append(accounts.controller))
+
+        def read_second():
+            results.append(accounts.controller)
+            second_returned.set()
+
+        second = threading.Thread(target=read_second)
+        first.start()
+        try:
+            self.assertTrue(constructing.wait(2))
+            second.start()
+            self.assertFalse(second_returned.wait(0.3))
+        finally:
+            release.set()
+            first.join(2)
+            if second.ident is not None:
+                second.join(2)
+        self.assertEqual(len(results), 2)
+        self.assertIs(results[0], results[1])
+        accounts.cancel_all()
+        self.assertTrue(results[0].cancelled)
 
     def test_switching_is_a_view_change_and_leaves_every_controller_running(self):
         """第二阶段的关键变化：切换不再交接控制器，两个账号的控制器都活着。"""

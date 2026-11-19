@@ -997,6 +997,31 @@ class AccountSwitchTests(unittest.TestCase):
         self.assertIn('所有账号', result['message'])
         self.assertTrue(all(controller.cancelled for controller in controllers))
 
+    def test_cancellation_reaches_both_controllers_while_another_action_holds_the_lock(self):
+        dorm = self.accounts.controller
+        sport = MagicMock()
+        self.bridge._lptiyu_override = sport
+        finished = threading.Event()
+        results = []
+
+        def cancel():
+            try:
+                results.append(self.bridge.dispatch('dorm_cancel'))
+                results.append(self.bridge.dispatch('lptiyu_cancel'))
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=cancel)
+        try:
+            with self.bridge._mutation:
+                worker.start()
+                self.assertTrue(finished.wait(2), '取消请求在等待其他操作释放锁')
+                self.assertTrue(dorm.cancelled)
+                sport.cancel_work.assert_called_once_with()
+        finally:
+            worker.join()
+        self.assertEqual([result['ok'] for result in results], [True, True])
+
     def test_update_install_waits_for_every_account_not_just_the_active_one(self):
         self.accounts.add('张三')
         other = self.accounts.registry().accounts()[1]
@@ -1132,7 +1157,10 @@ class AccountSwitchTests(unittest.TestCase):
         """预览/演示 bridge 也要能完整演示切换器，且一个字节都不写。"""
         with patch('desktop_bridge.DormAccounts') as real_accounts:
             preview = PreviewBridge()
-            state = preview.snapshot()['accounts']
+            snapshot = preview.snapshot()
+            state = snapshot['accounts']
+            self.assertEqual(state['max'], 10)
+            self.assertEqual(snapshot['lptiyu']['members']['max'], 10)
             self.assertEqual([item['name'] for item in state['items']], ['演示账号一', '演示账号二'])
             self.assertEqual(state['active'], 'demo1')
             self.assertFalse(state['busy'])

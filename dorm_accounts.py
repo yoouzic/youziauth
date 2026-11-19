@@ -43,10 +43,10 @@ LEGACY_DORM_DIRNAME = 'dorm'
 LEGACY_IDM_DIRNAME = 'idm'
 # 账号数量上限：自动行为必须有硬上限（同 MAX_DAILY_LOGIN_RENEWALS 的理由）。
 # 每个账号都是一条独立的登录/打卡链路，数量无界增长只会把风控和账号安全风险乘上去。
-MAX_ACCOUNTS = 5
+MAX_ACCOUNTS = 10
 # 账号之间的错峰间隔：第 i 个账号当天第一次自动检查要等窗口开始 + i×90 秒。
 # 多账号共用同一个出口，同一秒一起打学校接口没有任何好处；90 秒也远小于常见时段长度
-# （默认窗口 21:00–23:15 共 135 分钟，5 个账号最后一个也只在 +6 分钟开始）。
+# （默认窗口 21:00–23:15 共 135 分钟，第 10 个账号在窗口开始 13 分 30 秒后执行第一次检查）。
 STAGGER_SECONDS = 90
 # 整机每天自动登录（拉起浏览器）的总次数上限。每个账号各 3 次是账号级的保护，
 # 但 2026-09-24 那次事故的后果是**本机账户被锁定** —— 那是机器级的，所以还需要这一层。
@@ -384,8 +384,8 @@ class DormAccounts:
         self.login_gate = login_gate if login_gate is not None else LOGIN_GATE
         self.login_budget = (login_budget if login_budget is not None
                              else MachineLoginBudget(self.root / MACHINE_LOGIN_LOG))
-        # 池闸：建/删控制器（可能关掉正在跑的控制器）与轮询之间互斥。
-        self._gate = threading.Lock()
+        # 轮询也会创建控制器，复用同一把池锁保护查找、创建和删除。
+        self._gate = threading.RLock()
         try:
             self._registry = Registry(self.root)
             self._registry.ensure()
@@ -421,20 +421,21 @@ class DormAccounts:
 
     def _controller_for(self, account, accounts=None):
         """取（必要时建立）这个账号的控制器。档案目录不在就抛，调用方决定怎么呈现。"""
-        if self._closed:
-            raise AccountError('程序正在退出，已停止打卡操作。')
-        controller = self._controllers.get(account.id)
-        if controller is not None:
+        with self._gate:
+            if self._closed:
+                raise AccountError('程序正在退出，已停止打卡操作。')
+            controller = self._controllers.get(account.id)
+            if controller is not None:
+                return controller
+            registry = self.registry()
+            if not registry.exists(account.id):
+                raise AccountError(
+                    f'账号「{account.name}」的本机档案目录不存在：打卡设置、打卡点和登录态都无法读取。'
+                    '请恢复该目录，或删除这个账号后新建。')
+            controller = self._factory(registry.profile(account.id),
+                                       stagger_seconds=self._stagger_for(account.id, accounts))
+            self._controllers[account.id] = controller
             return controller
-        registry = self.registry()
-        if not registry.exists(account.id):
-            raise AccountError(
-                f'账号「{account.name}」的本机档案目录不存在：打卡设置、打卡点和登录态都无法读取。'
-                '请恢复该目录，或删除这个账号后新建。')
-        controller = self._factory(registry.profile(account.id),
-                                   stagger_seconds=self._stagger_for(account.id, accounts))
-        self._controllers[account.id] = controller
-        return controller
 
     def any_busy(self) -> bool:
         return any(getattr(controller, 'busy', False)

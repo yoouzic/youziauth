@@ -10,7 +10,7 @@ function updateFixture(overrides={}){
   return {state:'idle',current_version:'1.4.4',latest_version:'',progress:0,downloaded_bytes:0,total_bytes:0,checked:'',message:'等待后台检查更新。',busy:false,...overrides};
 }
 function accountsFixture(overrides={}){
-  return {max:5,active:'a1',busy:false,error:'',items:[
+  return {max:10,active:'a1',busy:false,error:'',items:[
     {id:'a1',name:'账号 1',active:true,has_idm_credentials:true,idm_username:'2023123456',missing:false,
      enabled:true,state:'waiting',message:'等待学校时段',busy:false,signed_today:false},
     {id:'a2',name:'账号 2',active:false,has_idm_credentials:false,idm_username:'',missing:false,
@@ -101,7 +101,7 @@ function harness(source='windows',extras={}){
     if(action==='lptiyu_member_switch'){
       const items=(data.lptiyu.members?.items||[]).map(item=>({...item,active:item.id===payload.id}));
       const picked=items.find(item=>item.active);
-      data.lptiyu.members={...(data.lptiyu.members||{max:5,items:[]}),active:payload.id,items};
+      data.lptiyu.members={...(data.lptiyu.members||{max:10,items:[]}),active:payload.id,items};
       data.lptiyu.identity={name:picked?.name||'',student_num:picked?.student_num||''};
       return {ok:true,message:`已切换到「${picked?.name||payload.id}」`};
     }
@@ -1714,9 +1714,12 @@ test('an unreadable account list shows its own message and disables every accoun
 });
 
 test('the account limit disables adding and says how many are allowed',async()=>{
-  const h=harness('windows',{accounts:{max:2}});await settle();
+  const items=Array.from({length:10},(_,index)=>accountItem({
+    id:`a${index+1}`,name:`账号 ${index+1}`,active:index===0
+  }));
+  const h=harness('windows',{accounts:{items}});await settle();
   assert.equal(h.el('account-add').disabled,true);
-  assert.equal(h.el('account-state').textContent,'最多 2 个账号');
+  assert.equal(h.el('account-state').textContent,'最多 10 个账号');
   h.data.accounts.items.pop();await h.refresh();
   assert.equal(h.el('account-add').disabled,false);
   assert.equal(h.el('account-state').textContent,'');
@@ -1742,7 +1745,7 @@ function accountItem(overrides={}){
 }
 
 test('the account picker spells out each account with one status suffix',async()=>{
-  const h=harness('windows',{accounts:{max:11,items:[
+  const h=harness('windows',{accounts:{items:[
     accountItem({id:'a1',name:'账号 1',active:true,idm_username:'2023123456',enabled:true,state:'signed',signed_today:true}),
     accountItem({id:'a2',name:'账号 2',enabled:true,state:'waiting'}),
     accountItem({id:'a3',name:'账号 3'}),
@@ -1752,8 +1755,7 @@ test('the account picker spells out each account with one status suffix',async()
     accountItem({id:'a7',name:'账号 7',enabled:true,state:'location_required'}),
     accountItem({id:'a8',name:'账号 8',enabled:true,state:'network_error'}),
     accountItem({id:'a9',name:'账号 9',enabled:true,state:'error'}),
-    accountItem({id:'a10',name:'账号 10',enabled:true,state:'ready'}),
-    accountItem({id:'a11',name:'账号 11',enabled:true,state:'no_task'})]}});
+    accountItem({id:'a10',name:'账号 10',enabled:true,state:'ready'})]}});
   await settle();
   assert.deepEqual(h.el('dorm-account').options.map(option=>option.textContent),[
     '账号 1 · 2023123456 · 今日已完成',
@@ -1765,8 +1767,9 @@ test('the account picker spells out each account with one status suffix',async()
     '账号 7 · 需要检查定位',
     '账号 8 · 需要检查',
     '账号 9 · 需要检查',
-    '账号 10 · 今日待打卡',
-    '账号 11 · 今天暂无任务'],'后缀按优先级只取第一个命中的');
+    '账号 10 · 今日待打卡'],'后缀按优先级只取第一个命中的');
+  h.data.accounts.items[9].state='no_task';await h.refresh();
+  assert.equal(h.el('dorm-account').options[9].textContent,'账号 10 · 今天暂无任务');
 });
 
 test('the account bar summarises how many accounts auto check in and how many are done',async()=>{
@@ -1812,6 +1815,35 @@ test('cancelling reaches every account, so another account being busy enables th
   assert.deepEqual(JSON.parse(JSON.stringify(h.calls)),[{action:'dorm_cancel',payload:{}}]);
   h.data.accounts.busy=false;h.data.dorm.busy=true;await h.refresh();
   assert.equal(h.el('cancel-dorm').disabled,false,'当前账号自己在忙时同样可以取消');
+});
+
+test('both cancel buttons work while an unrelated bridge action is waiting',async()=>{
+  const h=harness('windows',{accounts:{busy:true},lptiyu:{busy:true}});
+  await settle();
+  const dispatch=h.api.dispatch;
+  let finishNetwork,finishDormCancel;
+  h.api.dispatch=(action,payload)=>{
+    const result=dispatch(action,payload);
+    if(action==='network_stop')return new Promise(resolve=>{finishNetwork=()=>resolve(result);});
+    if(action==='dorm_cancel')return new Promise(resolve=>{finishDormCancel=()=>resolve(result);});
+    return result;
+  };
+  h.stop.listeners.click();
+  try{
+    assert.equal(h.el('cancel-dorm').disabled,false);
+    assert.equal(h.el('lp-cancel').disabled,false);
+    h.el('cancel-dorm').listeners.click();
+    assert.equal(h.el('cancel-dorm').disabled,true,'同一项取消正在发送');
+    h.el('cancel-dorm').listeners.click();
+    h.el('lp-cancel').listeners.click();
+    await settle();
+    assert.deepEqual(h.calls.map(call=>call.action),['network_stop','dorm_cancel','lptiyu_cancel']);
+    assert.equal(h.el('lp-cancel').disabled,false,'乐跑取消已收到回复，网络操作还在等');
+  }finally{
+    finishDormCancel?.();
+    finishNetwork?.();
+    await settle();
+  }
 });
 
 test('a snapshot without the per-account status fields still renders the bar',async()=>{
@@ -2143,7 +2175,7 @@ test('a busy snapshot without progress keeps the strip hidden for old backends',
 });
 
 test('switching members updates the main card chip and flashes it',async()=>{
-  const h=await lptiyuPage({members:{max:5,active:'m1',error:'',items:[
+  const h=await lptiyuPage({members:{max:10,active:'m1',error:'',items:[
     {id:'m1',name:'张三',student_num:'2025001',uid:'u1',active:true,has_token:true,alive:true},
     {id:'m2',name:'李四',student_num:'2025002',uid:'u2',active:false,has_token:true,alive:true}]}});
   const chip=h.el('lp-active-member');
@@ -2161,12 +2193,23 @@ test('switching members updates the main card chip and flashes it',async()=>{
 });
 
 test('member labels mark who already ran today',async()=>{
-  const h=await lptiyuPage({members:{max:5,active:'m1',error:'',items:[
+  const h=await lptiyuPage({members:{max:10,active:'m1',error:'',items:[
     {id:'m1',name:'张三',student_num:'2025001',uid:'u1',active:true,has_token:true,alive:true,signed_today:true},
     {id:'m2',name:'李四',student_num:'2025002',uid:'u2',active:false,has_token:true,alive:true,signed_today:false}]}});
   const select=h.el('lp-member');
   assert.match(select.options[0].textContent,/张三 · 2025001 · 今日已跑/);
   assert.doesNotMatch(select.options[1].textContent,/今日已跑/);
+});
+
+test('the member limit disables adding at ten and re-enables it after removal',async()=>{
+  const items=Array.from({length:10},(_,index)=>({
+    id:`m${index+1}`,name:`成员 ${index+1}`,active:index===0
+  }));
+  const h=await lptiyuPage({members:{max:10,active:'m1',error:'',items}});
+  assert.equal(h.el('lp-member-add').disabled,true);
+  assert.equal(h.el('lp-member-state').textContent,'最多 10 个成员。');
+  h.data.lptiyu.members.items.pop();await h.refresh();
+  assert.equal(h.el('lp-member-add').disabled,false);
 });
 
 test('lptiyu without a credential shows the official first-use guide',async()=>{

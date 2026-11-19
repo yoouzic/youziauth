@@ -34,6 +34,7 @@ class ApiClient:
         self.proxy = proxy or None
         self.ca_bundle = ca_bundle or ""
         self.pace = pace            # 相邻请求最小间隔(秒), 0=不限
+        self.stop_event = None
         self._last = 0.0
         self.identity = {
             "uid": uid,
@@ -47,16 +48,25 @@ class ApiClient:
         }
 
     # -------------------------------------------------------------- 底层
+    def _check_cancelled(self):
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise ApiError(9, "interrupted (user stop)")
+
     def _throttle(self):
         if self.pace <= 0:
             return
         gap = time.time() - self._last
         if gap < self.pace:
-            time.sleep(self.pace - gap)
+            if self.stop_event is None:
+                time.sleep(self.pace - gap)
+            else:
+                self.stop_event.wait(self.pace - gap)
+                self._check_cancelled()
         self._last = time.time()
 
     def call(self, path: str, biz: dict = None, flag: bool = False) -> dict:
         """加密 POST → 解密响应 dict。status=101 抛 ApiError(101)。"""
+        self._check_cancelled()
         self._throttle()
         payload = dict(self.identity)
         payload.update({
@@ -75,6 +85,7 @@ class ApiClient:
         conn = wire.connect(self.host, 443, self.timeout, self.proxy,
                             ca_bundle=self.ca_bundle)
         try:
+            self._check_cancelled()
             resp = wire.post_form(conn, spec.API_ROOT + path, body, flag=flag)
             raw = resp.read()
             status = resp.status

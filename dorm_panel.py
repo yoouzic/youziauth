@@ -72,6 +72,7 @@ class DormController:
 
         def work():
             try:
+                self._check_cancel()
                 if action == 'login':
                     if not self.login_gate.acquire():
                         # 多账号：别的账号正在跑登录链路。人工操作不排队，直接说清楚。
@@ -84,6 +85,7 @@ class DormController:
                     result = Result('logged_in', '登录成功，凭据已在本机加密保存')
                 elif action == 'logout':
                     settings = self.store.settings()
+                    self._check_cancel()
                     self.store.save_settings(dataclasses.replace(settings, enabled=False))
                     self.store.clear_token()
                     result = Result('login_required', '登录凭据已清除，自动打卡已关闭')
@@ -103,6 +105,10 @@ class DormController:
 
         threading.Thread(target=work, name='youziauth-dorm-' + action, daemon=True).start()
         return True
+
+    def _check_cancel(self):
+        if self.engine.cancel.is_set():
+            raise CheckinError('cancelled', '本次操作已取消')
 
     def _check_window(self):
         """返回 (start, end) 文本；读不到设置就返回 None。"""
@@ -135,7 +141,12 @@ class DormController:
     def _run(self, action):
         automatic = action == 'automatic'
         result = self.engine.tick() if automatic else self.engine.run(submit=action == 'submit')
-        if result is None or result.state != 'login_required' or time.monotonic() < self._renew_at:
+        if result is None or result.state != 'login_required':
+            return result
+        cancelled = self._cancelled_renewal(result)
+        if cancelled is not None:
+            return cancelled
+        if time.monotonic() < self._renew_at:
             return result
         self._renew_at = time.monotonic() + 300
         # 只在检查时段内自动登录：用户要求「每天晚上 21 点才开始尝试自动登录」。
@@ -176,6 +187,9 @@ class DormController:
             # 还会把当天的额度耗在等待上），这一拍直接跳过，_renew_at 到点自然会再试。
             return Result('waiting', '等待其他账号完成登录')
         try:
+            cancelled = self._cancelled_renewal(result)
+            if cancelled is not None:
+                return cancelled
             if automatic and self.login_budget is not None:
                 self.login_budget.spend(today)
             try:
@@ -186,16 +200,31 @@ class DormController:
                 login(self.store, self.api, self.engine.cancel, interactive=False,
                       idm_store=self.idm_store)
             except CheckinError as exc:
+                cancelled = self._cancelled_renewal(result)
+                if cancelled is not None:
+                    return cancelled
                 result = Result(exc.state, str(exc), result.task, now().isoformat(timespec='seconds'))
                 self.store.record(result)
                 return result
         finally:
             self.login_gate.release()
+        cancelled = self._cancelled_renewal(result)
+        if cancelled is not None:
+            return cancelled
         # A known task may already have been submitted; renewal must never replay that write.
         result = self.engine.run(automatic=automatic, submit=(automatic or action == 'submit') and result.task is None)
         if result.state == 'login_required':
             self.store.clear_browser_session()
         return result
+
+    def _cancelled_renewal(self, result):
+        if not self.engine.cancel.is_set():
+            return None
+        # A POST may already have reached the school. Keep its unresolved result
+        # and pending marker; cancellation only skips this round's login/recheck.
+        if result.task is not None and self.store.pending(result.task.key):
+            return result
+        return Result('cancelled', '本次操作已取消')
 
     def _skip_login(self, message, result):
         """这一拍不动登录：把原因也写进状态与历史，再报给上层。
@@ -262,8 +291,9 @@ class DormController:
         except ValueError:
             return True
         current = self.engine.clock()
-        due = dt.datetime.combine(current.date(), start) + dt.timedelta(seconds=self.stagger_seconds)
-        return current.time() >= due.time()      # datetime.time() 不带 tzinfo，两边同为本地时刻
+        due = dt.datetime.combine(current.date(), start, tzinfo=current.tzinfo)
+        due += dt.timedelta(seconds=self.stagger_seconds)
+        return current >= due
 
     def poll(self):
         if self.closed or time.monotonic() < self._poll_at:
@@ -295,12 +325,13 @@ class DormController:
             self._poll_at = 0
 
     def cancel(self):
-        self.engine.cancel.set()
+        with self._gate:
+            self.engine.cancel.set()
 
     def close(self):
         with self._gate:
             self.closed = True
-            self.cancel()
+            self.engine.cancel.set()
 
     def schedule_text(self):
         try:

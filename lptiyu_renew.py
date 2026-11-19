@@ -53,13 +53,14 @@ class CredentialRenewer:
     grab() -> (ok, reason)           起一次主动采集(用户要在小程序点一次)
     """
 
-    def __init__(self, store, clock=None, probe=None, grab=None, can_capture=None):
+    def __init__(self, store, clock=None, probe=None, grab=None, can_capture=None, check_cancelled=None):
         self.store = store
         self._clock = clock or now
         self._probe = probe or (lambda record: (None, '未配置探活'))
         self._grab = grab or (lambda: (False, '未配置采集'))
         # 内置采集(不用研究库)能不能用: 由控制器按证书是否安装给出
         self._can_capture = can_capture or (lambda: False)
+        self._check_cancelled = check_cancelled or (lambda: None)
 
     # ------------------------------------------------------------- 何时该续
     def due(self, settings=None):
@@ -99,6 +100,7 @@ class CredentialRenewer:
         force=True 只越过「上次失败的冷却」(用户点了「立即续期」); 采集与探活的
         每日配额始终生效 —— 那两条是保护用户与接口的硬上限。
         """
+        self._check_cancelled()
         try:
             settings = self.store.settings()
         except Exception:                       # noqa: BLE001
@@ -183,6 +185,7 @@ class CredentialRenewer:
 
     def _check(self, record):
         """探活一次(计入每日配额), 返回 (True/False/None, 说明)。"""
+        self._check_cancelled()
         try:
             self.store.bump_daily(kind='probe')
         except Exception:                       # noqa: BLE001 —— 计数失败不拦主流程
@@ -190,22 +193,28 @@ class CredentialRenewer:
         try:
             alive, why = self._probe(record)
         except Exception as exc:                # noqa: BLE001 —— 探活自己崩了按「不知道」
+            self._check_cancelled()
             return None, exc.__class__.__name__
+        self._check_cancelled()
         if alive not in (True, False, None):
             alive = bool(alive)
         return alive, str(why or '')
 
     def _sync_lab(self):
         """从研究库取号(含被研究库记成 consumed 的), 拿到就返回记录, 否则 None。"""
+        self._check_cancelled()
         try:
             changes, _message = self.store.sync_from_lab(include_consumed=True)
         except Exception:                       # noqa: BLE001
+            self._check_cancelled()
             return None
+        self._check_cancelled()
         if 'token' not in (changes or []):
             return None
         return self._record()
 
     def _capture(self):
+        self._check_cancelled()
         try:
             self.store.bump_daily(kind='grab')
         except Exception:                       # noqa: BLE001
@@ -213,7 +222,9 @@ class CredentialRenewer:
         try:
             result = self._grab()
         except Exception as exc:                # noqa: BLE001
+            self._check_cancelled()
             return False, str(exc) or exc.__class__.__name__
+        self._check_cancelled()
         if isinstance(result, tuple):
             return bool(result[0]), str(result[1] or '')
         return bool(result), ''

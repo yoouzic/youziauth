@@ -6,8 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from lptiyu_members import (MAX_MEMBERS, REGISTRY_VERSION, MemberError,
-                            MemberRegistry)
+from lptiyu_members import REGISTRY_VERSION, MemberError, MemberRegistry
 
 
 def write_legacy_layout(root: Path, token='LEGACY-TOKEN'):
@@ -102,9 +101,10 @@ class RegistryTests(unittest.TestCase):
             registry = self.build(Path(tmp))
             first = registry.add()
             self.assertEqual(registry.active_id(), first.id, '空库的第一个成员直接成为活动成员')
-            for _ in range(MAX_MEMBERS - 1):
+            for _ in range(9):
                 registry.add()
-            with self.assertRaises(MemberError):
+            self.assertEqual(len(registry.members()), 10)
+            with self.assertRaisesRegex(MemberError, '最多保存 10 个成员'):
                 registry.add()
 
     def test_rename_rejects_empty_and_duplicates(self):

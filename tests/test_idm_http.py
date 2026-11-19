@@ -398,6 +398,22 @@ class SilentLoginPolicy(unittest.TestCase):
     def one_attempt_responses(self, headers, body=b""):
         return [(200, FakeHeaders(), JPEG), (200, headers, body)]
 
+    def test_cancel_during_captcha_recognition_does_not_send_login(self):
+        cancel = threading.Event()
+
+        class CancellingSolver:
+            def solve(self, _image):
+                cancel.set()
+                return "1234", 0.99
+
+        with install_client(self.one_attempt_responses(FakeHeaders({"X-AuthErrorCode": "0"}))):
+            result = idm_login.attempt_silent_login(
+                FakePage(), "20230001", "fixture-password", solver=CancellingSolver(),
+                cancel=cancel)
+
+        self.assertEqual(result.reason, "cancelled")
+        self.assertEqual([call["method"] for call in FakeClient.instances[0].calls], ["GET"])
+
     def test_bad_credentials_stop_immediately_without_a_second_attempt(self):
         """密码错时重试必然再错：必须立刻停手，不白烧第 2 次登录尝试。"""
         result, fresh_calls = self.run_attempts(

@@ -238,7 +238,7 @@ class LptiyuController:
         # 续期器也允许注入: 单测里给一个假的, 就不必碰网络和子进程。
         self.renewer = renewer or CredentialRenewer(
             self.store, clock=self._clock, can_capture=self.capture_ready,
-            probe=self._probe_record, grab=self._grab_via_lab)
+            probe=self._probe_record, grab=self._grab_via_lab, check_cancelled=self._check_cancelled)
         self.events = queue.Queue()
         self.busy = False
         self.closed = False
@@ -306,6 +306,7 @@ class LptiyuController:
 
         def work():
             try:
+                self._check_cancelled()
                 if action == 'sync':
                     result = self._sync()
                 elif action == 'zones':
@@ -332,9 +333,9 @@ class LptiyuController:
                 self._push(result)
             finally:
                 with self._gate:
+                    self._capture_auto = False
+                    self._capture_switch_intent = False
                     self.busy = False
-                self._capture_auto = False     # 自动标记只属于这一次采集
-                self._capture_switch_intent = False
 
         threading.Thread(target=work, name='youziauth-lptiyu-' + action,
                          daemon=True).start()
@@ -412,7 +413,13 @@ class LptiyuController:
                 return values
 
     def cancel_work(self):
-        self.cancel.set()
+        with self._gate:
+            self.cancel.set()
+            self._capture_requested = False
+
+    def _check_cancelled(self):
+        if self.cancel.is_set():
+            raise LptiyuError('cancelled', '已取消当前操作')
 
     def _wait_for_work(self, timeout=8.0):
         """等待在跑的一拍结束(测试与退出路径用)。"""
@@ -423,7 +430,7 @@ class LptiyuController:
     def close(self):
         with self._gate:
             self.closed = True
-            self.cancel_work()
+        self.cancel_work()
         try:
             self.capture.stop('idle', '')
         except Exception:  # noqa: BLE001 —— 退出流程不该被采集卡住
@@ -532,10 +539,10 @@ class LptiyuController:
                 self._set_latest('error', '跑步操作未完成，请稍后重试')
             finally:
                 with self._gate:
+                    self._capture_auto = False
+                    self._capture_switch_intent = False
+                    self._next_run_all = time.monotonic() + 120
                     self.busy = False
-                self._capture_auto = False
-                self._capture_switch_intent = False
-                self._next_run_all = time.monotonic() + 120
 
         threading.Thread(target=work, name='youziauth-lptiyu-run-all',
                          daemon=True).start()
@@ -734,15 +741,27 @@ class LptiyuController:
     def _capture_flow(self):
         """等一次小程序登录, 把 token 与身份一起落盘, 然后当真门探活。"""
         auto = self._capture_auto
+        self._check_cancelled()
         try:
-            self.capture.start()
+            self.capture.start(stop_event=self.cancel)
         except CaptureError as exc:
+            if self.cancel.is_set():
+                self._check_capture_error()
+                self._check_cancelled()
             raise LptiyuError('error', str(exc)) from exc
         try:
+            self._check_cancelled()
             return self._capture_until_done(auto)
         finally:
             # 任何提前返回/异常都不能把系统代理留在采集端口上: 那会让浏览器断网。
             self._stop_if_capturing()
+            if self.cancel.is_set():
+                self._check_capture_error()
+
+    def _check_capture_error(self):
+        status = self.capture.status()
+        if status.get('state') == 'error':
+            raise LptiyuError('error', status.get('message') or '采集停止时发生错误')
 
     def _stop_if_capturing(self):
         """兜底收尾: 采集还在等就立刻停掉(正常路径已经由 wait/poll 停过)。"""
@@ -793,7 +812,10 @@ class LptiyuController:
                     '还没看到流量：确认微信用的是系统代理（微信设置里不要单独设代理），'
                     '并真正打开小程序页', record=False)
 
-        cred = self.capture.wait(on_tick=tick)
+        self._check_cancelled()
+        cred = self.capture.wait(on_tick=tick, stop_event=self.cancel)
+        self._check_capture_error()
+        self._check_cancelled()
         if not cred:
             status = self.capture.status()
             if status.get('state') == 'idle':
@@ -817,7 +839,9 @@ class LptiyuController:
         try:
             alive = self._probe_alive(client)
         except ApiError as exc:
+            self._check_cancelled()
             raise LptiyuError('error', f'凭证已保存，但探活失败（{exc.code}）') from exc
+        self._check_cancelled()
         if not alive:
             self.slot.mark_dead()
             raise LptiyuError('need_token', '抓到的凭证当场失效了：在小程序里重新登录后再采集')
@@ -892,67 +916,86 @@ class LptiyuController:
     def _sync_zones(self):
         """把每个跑区的打卡点各抓一遍。
 
-        切跑区会改服务端上的「当前跑区」, 所以收尾必须切回用户选的那个:
-        同步是只读的准备工作, 不该顺手改掉用户的选择。
+        完成时保留用户选的跑区，取消时恢复同步前服务器上的跑区。
         """
         self._ensure_credentials()
+        self._check_cancelled()
         client = self.slot.make_client(pace=0.8)
         try:
             cfg = client.before_run()
         except ApiError as exc:
+            self._check_cancelled()
             raise LptiyuError('need_token' if exc.code == 101 else 'error',
                               '拉取跑区失败：凭证已失效' if exc.code == 101
                               else '拉取跑区失败，接口暂时不可用')
+        self._check_cancelled()
         if not isinstance(cfg, dict):
             raise LptiyuError('error', '跑区信息格式异常，稍后再试')
         zones = [zone for zone in (cfg.get('run_zone_list') or [])
                  if isinstance(zone, dict) and str(zone.get('id') or '')]
-        self.store.save_zone_list(zones)
         original = str(cfg.get('run_zone_id') or '')
+        if not original:
+            raise LptiyuError('error', '无法读取当前跑区，已停止同步')
+        self.store.save_zone_list(zones)
         # 用户自己选过跑区时, 服务器那块会被他在设置里指定的替换掉: 先把他的选择
         # 推上去, 再以它为准遍历 —— 否则同步完会乖乖还原成小程序里的旧场地。
         chosen = str(self.store.settings().zone_id or '')
-        if chosen and chosen != original:
-            try:
-                client.set_zone(chosen)
-                switched = client.before_run()
-                if isinstance(switched, dict) and \
-                        str(switched.get('run_zone_id') or '') == chosen:
-                    cfg, original = switched, chosen
-            except ApiError:
-                pass
-        if not chosen:
-            # 没选过就跟服务器走: 小程序里换了场地, 设置要跟着更新
-            self.store.save_zone_selection(original, str(cfg.get('run_zone_name') or ''))
-        last = original
+        current = last = original
+        switched_zone = False
         done = set()
-        if original:
-            self.store.save_zone_points(original, str(cfg.get('run_zone_name') or ''),
-                                        self._points_of(cfg))
-            done.add(original)
-        for zone in zones[:MAX_ZONE_SYNC]:
-            zone_id = str(zone.get('id') or '')
-            if not zone_id or zone_id in done:
-                continue
-            try:
-                client.set_zone(zone_id)
-                other = client.before_run()
-            except ApiError:
-                continue
-            last = zone_id
-            if not isinstance(other, dict) or str(other.get('run_zone_id') or '') != zone_id:
-                continue
-            self.store.save_zone_points(
-                zone_id, str(other.get('run_zone_name') or zone.get('name') or ''),
-                self._points_of(other))
-            done.add(zone_id)
-        # 收尾: 同步过程中账号被切到最后一个跑区, 必须切回用户选的那个。
-        target = str(self.store.settings().zone_id or original)
         try:
-            if target and target != last:
-                client.set_zone(target)
-        except ApiError:
-            pass
+            if chosen and chosen != original:
+                try:
+                    self._check_cancelled()
+                    switched_zone = True
+                    client.set_zone(chosen)
+                    self._check_cancelled()
+                    switched = client.before_run()
+                    self._check_cancelled()
+                    if isinstance(switched, dict) and str(switched.get('run_zone_id') or '') == chosen:
+                        cfg, current, last = switched, chosen, chosen
+                except ApiError:
+                    pass
+            if not chosen:
+                self.store.save_zone_selection(original, str(cfg.get('run_zone_name') or ''))
+            self.store.save_zone_points(current, str(cfg.get('run_zone_name') or ''),
+                                        self._points_of(cfg))
+            done.add(current)
+            for zone in zones[:MAX_ZONE_SYNC]:
+                self._check_cancelled()
+                zone_id = str(zone.get('id') or '')
+                if not zone_id or zone_id in done:
+                    continue
+                last = zone_id
+                try:
+                    switched_zone = True
+                    client.set_zone(zone_id)
+                    self._check_cancelled()
+                    other = client.before_run()
+                except ApiError:
+                    continue
+                self._check_cancelled()
+                if not isinstance(other, dict) or str(other.get('run_zone_id') or '') != zone_id:
+                    continue
+                self.store.save_zone_points(
+                    zone_id, str(other.get('run_zone_name') or zone.get('name') or ''),
+                    self._points_of(other))
+                done.add(zone_id)
+        finally:
+            target = chosen or original
+            if not self.cancel.is_set() and target != last:
+                try:
+                    switched_zone = True
+                    client.set_zone(target)
+                except (ApiError, OSError):
+                    pass
+            # 最后一次切换等待响应时也可能收到取消请求。
+            if self.cancel.is_set() and switched_zone:
+                try:
+                    client.set_zone(original)
+                except (ApiError, OSError) as exc:
+                    raise LptiyuError('error', '已停止同步，但未能恢复原跑区') from exc
+        self._check_cancelled()
         return self._set_latest('zones', f'已同步 {len(done)} 个跑区的点位')
 
     def _apply_zone(self):
@@ -966,6 +1009,7 @@ class LptiyuController:
         if not zone_id:
             raise LptiyuError('error', '先在跑步设置里选一个跑区')
         self._ensure_credentials()
+        self._check_cancelled()
         client = self.slot.make_client(pace=0.8)
         try:
             cfg = client.before_run()
@@ -973,10 +1017,13 @@ class LptiyuController:
             raise LptiyuError('need_token' if exc.code == 101 else 'error',
                               '读取跑区失败：凭证已失效' if exc.code == 101
                               else '读取跑区失败，接口暂时不可用') from exc
+        self._check_cancelled()
         current = str((cfg or {}).get('run_zone_id') or '')
         if current != zone_id:
             try:
                 client.set_zone(zone_id)
+                if self.cancel.is_set():
+                    return self._set_latest('cancelled', '跑区切换请求已发送，已停止后续确认')
                 cfg = client.before_run()
             except ApiError as exc:
                 raise LptiyuError('error', f'切换跑区失败：{exc}') from exc
@@ -1007,7 +1054,7 @@ class LptiyuController:
         结果只进内存态与续期台账, 不写 status.json —— 续期不是「今天的跑步」,
         重启后不该让界面把昨天的续期结果当成今天的任务状态。
         """
-        outcome = self.renewer.renew(force=True)
+        outcome = self._renew_credentials(force=True)
         return self._set_latest(RENEW_STATES.get(outcome.state, 'error'), outcome.message,
                                 record=False)
 
@@ -1018,13 +1065,19 @@ class LptiyuController:
         不写 latest: 续期是维护动作, 不该把「今日跑步已完成」顶成「凭证可用」;
         台账(renewal.json)里有痕, 界面那行「上次 13:49」就是它。
         """
-        outcome = self.renewer.renew(force=False)
+        outcome = self._renew_credentials(force=False)
         if (outcome.state == 'need_user'
                 and not self.store.is_signed_today(self._clock().date())):
             # 今天已经跑完了就别再喊「需要凭证」: 状态栏该留住「今日已完成」,
             # 这次失败在续期台账里(界面那行会写出原因), 明天到点前还会再试。
             return self._set_latest('need_token', outcome.message, record=False)
         return None
+
+    def _renew_credentials(self, force):
+        self._check_cancelled()
+        outcome = self.renewer.renew(force=force)
+        self._check_cancelled()
+        return outcome
 
     def _ensure_credentials(self, renew=True):
         """返回可用凭证; 拿不到就抛 LptiyuError(need_token)。
@@ -1036,7 +1089,8 @@ class LptiyuController:
         轮跑里给旁席成员跑一遍会把队列挂在没人打开的小程序上 —— 凭证是否
         还活着交给 _execute 里那一拍探活, 死号记台账跳过。
         """
-        outcome = self.renewer.renew(force=True) if renew else None
+        self._check_cancelled()
+        outcome = self._renew_credentials(force=True) if renew else None
         record = None
         try:
             record = self.store.token_record()
@@ -1067,6 +1121,7 @@ class LptiyuController:
         command += ['grab', '--timeout', '480']
         if selector:
             command += ['--member', selector]
+        self._check_cancelled()
         try:
             completed = subprocess.run(command, capture_output=True,
                                        timeout=GRAB_TIMEOUT_SECONDS,
@@ -1075,6 +1130,7 @@ class LptiyuController:
             return False, '采集等待超时'
         except OSError:
             return False, '采集链启动失败'
+        self._check_cancelled()
         return completed.returncode == 0, '' if completed.returncode == 0 else '采集链退出异常'
 
     def _probe_record(self, record=None):
@@ -1100,7 +1156,6 @@ class LptiyuController:
             if exc.code == 101:
                 return False
             raise                     # 网络类故障不判死, 让上层按 error 呈现
-        return True
 
     def _flow(self, settings, progress_fn=None):
         if self._flow_factory is not None:
@@ -1147,14 +1202,18 @@ class LptiyuController:
         except LptiyuError as exc:
             # 没有凭证但有采集能力: 交给下一拍自己采, 不用人点「同步凭证」。
             if exc.state == 'need_token' and self._auto_capture_due():
-                self._capture_requested = True
+                with self._gate:
+                    self._check_cancelled()
+                    self._capture_requested = True
                 raise LptiyuError(
                     'need_token',
                     '本机没有可用凭证：正在自动采集，微信打开小程序后就会继续') from None
             raise
         self._progress(1, total, labels, '凭证就绪，正在确认账号状态…')
         client = self.slot.make_client(pace=0.8)
-        if not self._probe_alive(client):
+        alive = self._probe_alive(client)
+        self._check_cancelled()
+        if not alive:
             self.slot.mark_dead()
             if self._sweeping_run:
                 # 多成员轮跑绝不中途开续期/采集阶梯: 那会挂起整个队列去等一个
@@ -1166,7 +1225,7 @@ class LptiyuController:
                                   f'{self.slot.label} 的凭证已失效，跳过（让本人重开一次小程序再导入）')
             # 续期刚过、起跑前这半秒号又死了(小程序那边刚重登): 再走一遍续期阶梯,
             # 拿到新号就直接继续, 不让这一拍白跑。
-            outcome = self.renewer.renew(force=True)
+            outcome = self._renew_credentials(force=True)
             fresh = None
             try:
                 fresh = self.store.token_record()
@@ -1178,9 +1237,12 @@ class LptiyuController:
                 raise LptiyuError('need_token', outcome.message)
             client = self.slot.make_client(pace=0.8)
 
+        self._check_cancelled()
         flow = self._flow(settings, progress_fn=lambda stage, text:
                           self._progress(stage, total, labels, text))
         summary, code = flow.run(submit=submit, zone_override=settings.zone_id or None)
+        if code == 9:
+            return self._set_latest('cancelled', '已取消当前操作')
         if submit and isinstance(summary, dict):
             self._record_sample(summary, settings)
         if not submit:
@@ -1190,7 +1252,7 @@ class LptiyuController:
                 return self._set_latest('need_token', '验证时发现凭证已失效，请先更新凭证')
             return self._set_latest('error', '验证未通过，请稍后重试')
 
-        if code in (0, 5) and isinstance(summary, dict):
+        if code in (0, 5, lptiyu_flow.SUBMITTED_REVIEW_CANCELLED) and isinstance(summary, dict):
             # 只把「学校受理、记录已创建」的提交计入今日次数; 额度满被拒的那一拍没有真实跑步
             self.store.bump_daily(kind='run')
             distance = summary.get('distance')
@@ -1203,6 +1265,9 @@ class LptiyuController:
             distance_text = f'{float(distance):.2f}km' if distance else ''
             pace_text = f' · 配速 {pace}/km' if pace else ''
             headline = f'今日跑步已完成 · {distance_text}{pace_text}'
+            if code == lptiyu_flow.SUBMITTED_REVIEW_CANCELLED:
+                return self._set_latest('uncertain', '记录已提交，已停止等待判定',
+                                        detail=f'{zone} · {distance_text}')
             if code == 5:
                 reason = summary.get('record_failed_reason') or ''
                 return self._set_latest('uncertain',
@@ -1216,8 +1281,6 @@ class LptiyuController:
         if code == 3:
             self.store.mark_signed(now().date().isoformat(), {'quota': True})
             return self._set_latest('quota', '今日额度已完成，无需再跑')
-        if code == 9:
-            return self._set_latest('cancelled', '已取消当前操作')
         if code == 2:
             raise LptiyuError('need_token', '凭证已失效：在小程序里打开一次跑步首页，然后点「同步凭证」')
         return self._set_latest('error', '提交未完成，请查看运行记录')

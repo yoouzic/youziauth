@@ -746,7 +746,9 @@ class CaptureSession:
             return False
 
     # ---------------------------------------------------------- 生命周期
-    def start(self):
+    def start(self, stop_event=None):
+        if stop_event is not None and stop_event.is_set():
+            raise CaptureError("本次采集已取消")
         with self._lifecycle:
             if self._server is not None:
                 raise CaptureError("本次采集已经开始")
@@ -756,7 +758,7 @@ class CaptureSession:
         with self._lifecycle:
             if self._server is not None:
                 raise CaptureError("本次采集已经开始")
-            if generation != self._stop_generation:
+            if generation != self._stop_generation or (stop_event is not None and stop_event.is_set()):
                 raise CaptureError("本次采集已取消")
             system_proxy = isinstance(self.proxy, SystemProxy)
             if not system_proxy and self.proxy.stale_backup():
@@ -775,6 +777,8 @@ class CaptureSession:
                 self._start_proxy_guard(port)
                 if not self._thread.is_alive():
                     raise CaptureError("本地采集监听未能启动")
+                if stop_event is not None and stop_event.is_set():
+                    raise CaptureError("本次采集已取消")
                 self.proxy.point_at(port)
             except Exception as exc:
                 self.stop()
@@ -912,7 +916,7 @@ class CaptureSession:
             self.stop("idle", "系统代理已由其他程序更改，已停止本次采集")
             return True
 
-    def wait(self, timeout=None, on_tick=None):
+    def wait(self, timeout=None, on_tick=None, stop_event=None):
         deadline = time.time() + (timeout if timeout is not None else self.timeout_s)
         last_tick = 0.0
         with self._lifecycle:
@@ -920,6 +924,9 @@ class CaptureSession:
         while time.time() < deadline:
             with self._lifecycle:
                 if generation != self._stop_generation or self._state != "waiting":
+                    return None
+                if stop_event is not None and stop_event.is_set():
+                    self.stop("idle", "已取消当前操作")
                     return None
                 cred = self.poll()
                 if cred:
@@ -932,10 +939,16 @@ class CaptureSession:
                         on_tick()
                     except Exception:      # noqa: BLE001 —— 诊断不能打断采集
                         pass
-            time.sleep(0.2)
+            if stop_event is None:
+                time.sleep(0.2)
+            else:
+                stop_event.wait(0.2)
         with self._lifecycle:
             if generation == self._stop_generation and self._state == "waiting":
-                self.stop("timeout", f"等待超时：没有看到小程序请求（微信连接 {self.connects} 次）")
+                if stop_event is not None and stop_event.is_set():
+                    self.stop("idle", "已取消当前操作")
+                else:
+                    self.stop("timeout", f"等待超时：没有看到小程序请求（微信连接 {self.connects} 次）")
         return None
 
     # ---------------------------------------------------------- 流量回调

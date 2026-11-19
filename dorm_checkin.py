@@ -326,7 +326,20 @@ class Store:
     def record_attempt(self, key, at):
         # Only today's task is ever retried, so an older entry is dropped instead of kept
         # as a permanent record of every submission this machine has made.
-        self._write('submit-attempts.json', {key: {'count': self.attempts(key)[0] + 1, 'at': at}})
+        previous = self.attempts(key)
+        self._write('submit-attempts.json', {key: {'count': previous[0] + 1, 'at': at}})
+        return previous
+
+    def undo_unsent_attempt(self, key, at, previous):
+        records = self._attempt_records()
+        count, previous_at = previous
+        if records.get(key) != {'count': count + 1, 'at': at}:
+            return
+        if count:
+            records[key] = {'count': count, 'at': previous_at}
+        else:
+            del records[key]
+        self._write('submit-attempts.json', records)
 
     def clear_attempts(self, key):
         if key in self._attempt_records():
@@ -417,6 +430,7 @@ class Engine:
         if not self.lock.acquire(blocking=False):
             return Result('busy', '打卡操作正在进行')
         task = None
+        submission_started = False
         try:
             settings = self.store.settings()
             self.next_tick = time.monotonic() + settings.interval
@@ -437,10 +451,13 @@ class Engine:
             if automatic and self._already_signed_today(current):
                 return self._result('signed', '今日打卡已完成，当天不再重复检查')
             token = self.store.token()
+            self._check_cancel()
             if not token:
                 return self._result('login_required', '请先登录统一身份认证')
             student = self.api.user(token)
+            self._check_cancel()
             task = self.api.today(token, student, current)
+            self._check_cancel()
             if task is None:
                 return self._result('no_task', '今天暂无查寝任务')
             if task.student != student:
@@ -456,6 +473,7 @@ class Engine:
                     return settled
                 # The school answered for this task and it is still unsigned, so the marker
                 # has done its job: nothing was recorded and a repeat cannot duplicate it.
+                self._check_cancel()
             if phase != 'ready':
                 return self._result(phase, '任务尚未开始' if phase == 'waiting' else '任务已过期，未提交', task)
             if not submit:
@@ -463,6 +481,7 @@ class Engine:
             allowed, blocked_state, blocked_message = self._submission_allowed(task, current, automatic)
             if not allowed:
                 return self._result(blocked_state, blocked_message, task)
+            self._check_cancel()
             position = self.location()
             self._check_cancel()
             self.api.verify(token, task, position)
@@ -486,12 +505,17 @@ class Engine:
                         raise CheckinError('disabled', '自动打卡已关闭，未提交')
                     if not parse_time(latest.start) <= current.time() < parse_time(latest.end):
                         raise CheckinError('waiting', '已离开自动检查时段，未提交')
+                at = int(current.timestamp())
+                previous = self.store.record_attempt(task.key, at)
+                if self.cancel.is_set():
+                    self.store.undo_unsent_attempt(task.key, at, previous)
+                    self._check_cancel()
             except Exception:
                 # No POST has been issued, so this marker is safe to remove.
                 self.store.clear_pending(task.key)
                 raise
-            self.store.record_attempt(task.key, int(current.timestamp()))
             reason = None
+            submission_started = True
             try:
                 recorded = self.api.submit(token, task, position) is True
             except CheckinError as exc:
@@ -508,11 +532,15 @@ class Engine:
                 return settled
             return self._unrecorded(task, reason)
         except CheckinError as exc:
+            if self.cancel.is_set() and not submission_started:
+                return self._result('cancelled', '本次操作已取消，未提交打卡' if submit else '本次操作已取消', task)
             # 传输层抖动（network_error）值得提前重试；等人处理的状态（login_required /
             # location_required）和格式类错误（error）不加密节奏。
             return self._result(exc.state, str(exc), task, detail=exc.detail,
                                 retry_soon=exc.state == 'network_error')
         except Exception:
+            if self.cancel.is_set() and not submission_started:
+                return self._result('cancelled', '本次操作已取消，未提交打卡' if submit else '本次操作已取消', task)
             return self._result('error', '操作未完成，请检查网络、配置或稍后重试', task)
         finally:
             self.lock.release()

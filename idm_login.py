@@ -222,13 +222,17 @@ def attempt_silent_login(
         _log(f"第 {n} 次：用会话 cookie 提交（{len(cookies)} 枚；站点动态防护那几枚"
              f"已剔除，带上它们会被判重放并回 400）")
         try:
-            outcome = idm_http.submit_login(info, cookies, username, password, solver, log=_log)
+            outcome = idm_http.submit_login(info, cookies, username, password, solver,
+                                            log=_log, cancel=cancel)
         except Exception as exc:  # noqa: BLE001
             record.note = f"submit_error: {type(exc).__name__}"
             result.attempts.append(record)
             _log(f"第 {n} 次：提交异常 {exc}")
             continue
 
+        if outcome.failure_kind == "cancelled":
+            result.reason = "cancelled"
+            return result
         record.captcha_code = outcome.code
         record.captcha_conf = float(outcome.confidence)
         record.submitted = outcome.submitted

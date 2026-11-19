@@ -795,6 +795,21 @@ class SessionLoginTests(unittest.TestCase):
         self.assertEqual(self.store.token(), 'old-token')
         self.assertIsNotNone(self.store.browser_session('old-token'))
 
+    def test_cancel_during_identity_retry_does_not_replace_saved_session(self):
+        self.seed_session()
+        cancel = threading.Event()
+
+        def cancel_retry(*_args):
+            cancel.set()
+            raise CheckinError('cancelled', '登录已取消')
+
+        with patch.object(dorm_login, 'identify_student', side_effect=cancel_retry):
+            with self.assertRaises(CheckinError) as caught:
+                dorm_login.login(self.store, self.api, cancel, interactive=False)
+        self.assertEqual(caught.exception.state, 'cancelled')
+        self.assertEqual(self.store.token(), 'old-token')
+        self.assertIsNotNone(self.store.browser_session('old-token'))
+
 
 @unittest.skipUnless(os.environ.get('YOUZIAUTH_BROWSER_TESTS') == '1', 'Opt-in native browser test')
 class BrowserSessionRuntimeTests(unittest.TestCase):

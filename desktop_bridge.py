@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 from app_update import UpdateController, read_current_version
@@ -26,6 +27,7 @@ from dorm_location import (PICK_SOURCE, distance_metres, gcj02_to_wgs84, map_pic
 # 默认控制器类型由 dorm_accounts 构造；这里保留导入是因为测试会用它断言
 # 「演示预览不得创建真实控制器」，并且它仍是本模块对外的控制器符号。
 from dorm_panel import DormController  # noqa: F401
+from lptiyu_members import MAX_MEMBERS
 
 # 乐跑小程序的 weixin:// 地址统一由 lptiyu_panel 提供（采集时会自动唤起它）。
 
@@ -337,6 +339,7 @@ class DesktopBridge(LocationProbe):
         # 乐跑：测试注入控制器；正式路径首次访问时才构造（加密库缺失时安静降级）。
         self._lptiyu_override = lptiyu
         self._lptiyu_instance = None
+        self._lptiyu_init_lock = threading.Lock()
         self._lptiyu_notice = None
         self._lock = threading.RLock()
         self._mutation = threading.Lock()
@@ -393,13 +396,14 @@ class DesktopBridge(LocationProbe):
         """乐跑控制器。加密依赖缺失时安静降级为 None —— 由快照呈现，不拖垮整页。"""
         if self._lptiyu_override is not None:
             return self._lptiyu_override
-        if self._lptiyu_instance is None:
-            try:
-                from lptiyu_panel import LptiyuController  # noqa: PLC0415
+        with self._lptiyu_init_lock:
+            if self._lptiyu_instance is None:
+                try:
+                    from lptiyu_panel import LptiyuController  # noqa: PLC0415
 
-                self._lptiyu_instance = LptiyuController()
-            except Exception:  # noqa: BLE001 —— 缺依赖/坏安装都不该让界面挂掉
-                return None
+                    self._lptiyu_instance = LptiyuController()
+                except Exception:  # noqa: BLE001 —— 缺依赖/坏安装都不该让界面挂掉
+                    return None
         return self._lptiyu_instance
 
     def _lptiyu_snapshot(self):
@@ -758,7 +762,9 @@ class DesktopBridge(LocationProbe):
             return {'ok': False, 'message': '设置格式无效'}
         if self._closed.is_set():
             return {'ok': False, 'message': '程序正在退出'}
-        with self._mutation:
+        # 取消只向已存在的控制器发送信号，不能等其他操作（例如 UAC）释放锁。
+        guard = nullcontext() if action in ('dorm_cancel', 'lptiyu_cancel') else self._mutation
+        with guard:
             try:
                 message = self._dispatch(action, payload or {})
                 return {'ok': True, 'message': message or '操作已完成'}
@@ -1004,9 +1010,10 @@ class DesktopBridge(LocationProbe):
             return (f'已导入「{filed.get("name")}」的凭证（文件 {found.name}）。'
                     + ('' if filed.get('is_active') else '在成员栏切换到 TA 即可代跑。'))
         if action == 'lptiyu_cancel':
-            controller = self._lptiyu
+            controller = (self._lptiyu_override if self._lptiyu_override is not None
+                          else self._lptiyu_instance)
             if controller is None:
-                raise RuntimeError('乐跑功能在本机暂不可用')
+                raise RuntimeError('没有正在进行的乐跑操作。')
             controller.cancel_work()
             return '已请求取消当前操作；已发出的提交不能撤回。'
         if action == 'lptiyu_save':
@@ -1461,7 +1468,7 @@ class PreviewBridge(LocationProbe):
                                              .isoformat(timespec='seconds'),
                                   'last_success':dt.datetime.now().isoformat(timespec='seconds'),
                                   'failures':0, 'interval_min':180, 'lead_min':45},
-                       'members':{'error':'', 'max':5, 'active':'demo-m1',
+                       'members':{'error':'', 'max':MAX_MEMBERS, 'active':'demo-m1',
                                   'items':[{'id':'demo-m1', 'name':'演示成员一',
                                             'student_num':'2026000000', 'uid':'1',
                                             'active':True, 'has_token':True,
@@ -1741,7 +1748,7 @@ class PreviewBridge(LocationProbe):
             elif action in ('lptiyu_member_switch', 'lptiyu_member_rename',
                             'lptiyu_member_delete'):
                 members = self._data['lptiyu'].setdefault(
-                    'members', {'error': '', 'max': 5, 'active': '', 'items': []})
+                    'members', {'error': '', 'max': MAX_MEMBERS, 'active': '', 'items': []})
                 member_id = str((payload or {}).get('id') or '')
                 if action == 'lptiyu_member_switch':
                     for item in members['items']:

@@ -241,6 +241,48 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.run(submit=True).state, 'cancelled')
         self.api.submit.assert_not_called()
 
+    def test_cancel_during_identity_query_stops_before_querying_today(self):
+        def user(_token):
+            self.engine.cancel.set()
+            return 'student'
+        self.api.user.side_effect = user
+        self.assertEqual(self.engine.run().state, 'cancelled')
+        self.api.today.assert_not_called()
+
+    def test_cancel_during_task_query_stops_before_location(self):
+        def today(*_args):
+            self.engine.cancel.set()
+            return self.task
+        self.api.today.side_effect = today
+        self.assertEqual(self.engine.run(submit=True).state, 'cancelled')
+        self.position.assert_not_called()
+        self.api.submit.assert_not_called()
+
+    def test_cancel_during_attempt_write_keeps_previous_attempt_and_does_not_submit(self):
+        previous_at = int(self.now.timestamp()) - 300
+        record_attempt = self.store.record_attempt
+        record_attempt(self.task.key, previous_at)
+
+        def record_then_cancel(key, at):
+            previous = record_attempt(key, at)
+            self.engine.cancel.set()
+            return previous
+        self.store.record_attempt = record_then_cancel
+        self.assertEqual(self.engine.run(submit=True).state, 'cancelled')
+        self.api.submit.assert_not_called()
+        self.assertFalse(self.store.pending(self.task.key))
+        self.assertEqual(self.store.attempts(self.task.key), (1, previous_at))
+
+    def test_cancel_during_a_sent_submission_still_returns_verified_result(self):
+        def submit(*_args):
+            self.engine.cancel.set()
+            raise TimeoutError()
+        self.api.submit.side_effect = submit
+        self.assertEqual(self.engine.run(submit=True).state, 'signed')
+        self.api.submit.assert_called_once()
+        self.api.is_signed.assert_called_once()
+        self.assertFalse(self.store.pending(self.task.key))
+
     def test_invalid_schedule_rejected(self):
         with self.assertRaises(ValueError):
             self.store.save_settings(Settings(start='23:00', end='21:00'))

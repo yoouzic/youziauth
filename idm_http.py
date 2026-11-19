@@ -355,7 +355,7 @@ def browser_cookies(context, page=None) -> dict[str, str]:
 
 
 def submit_login(info: dict, cookies: dict, username: str, password: str, solver,
-                 *, log=None) -> SubmitOutcome:
+                 *, log=None, cancel=None) -> SubmitOutcome:
     """用纯 HTTP 客户端提交 IDM 登录表单。
 
     返回 SubmitOutcome。`ok=True` 有两种判据来源（`accepted_by`）：
@@ -379,6 +379,8 @@ def submit_login(info: dict, cookies: dict, username: str, password: str, solver
     client = HttpClient(cookies, referer=page_url)
 
     for _ in range(CAPTCHA_TRIES):
+        if cancel is not None and cancel.is_set():
+            return SubmitOutcome(failure_kind="cancelled")
         try:
             status, _headers, body = client.request(
                 "GET", IDM_CAPTCHA_URL, accept="image/*,*/*;q=0.8", timeout=25)
@@ -387,6 +389,8 @@ def submit_login(info: dict, cookies: dict, username: str, password: str, solver
         if status != 200 or len(body) < 200:
             return SubmitOutcome(detail=f"captcha_http_{status}")
 
+        if cancel is not None and cancel.is_set():
+            return SubmitOutcome(failure_kind="cancelled")
         try:
             code, confidence = solver.solve(body)
         except Exception as exc:  # noqa: BLE001
@@ -402,10 +406,12 @@ def submit_login(info: dict, cookies: dict, username: str, password: str, solver
         payload["IDToken2"] = password
         payload["IDToken3"] = ""
         payload["validateCode"] = code
+        data = urllib.parse.urlencode(payload).encode("utf-8")
 
+        if cancel is not None and cancel.is_set():
+            return SubmitOutcome(failure_kind="cancelled")
         try:
-            status, headers, body = client.request(
-                "POST", action, data=urllib.parse.urlencode(payload).encode("utf-8"))
+            status, headers, body = client.request("POST", action, data=data)
         except Exception as exc:  # noqa: BLE001
             # ⚠ POST **已经发出去了**，只是没拿到响应（超时/连接被重置/代理断流）。
             # 这**不等于**「没提交」：服务端可能已经认证成功。标记为未确认，

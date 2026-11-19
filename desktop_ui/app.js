@@ -2,6 +2,7 @@
 const $ = id => document.getElementById(id);
 const titles = {overview:'今日概览',network:'校园网',dorm:'寝室打卡',lptiyu:'乐跑',records:'运行记录',updates:'软件更新'};
 let state = null, logType = 'network', pending = false, refreshTask = null, epoch = 0, syncedEpoch = -1, timer, proxyIgnored = false;
+const cancelPending = new Set();
 const dirty = {network:false, dorm:false, lptiyu:false};
 const revisions = {network:0, dorm:0, lptiyu:0};
 let sourceDirty = false, sourceRevision = 0;
@@ -457,7 +458,7 @@ function render() {
   document.querySelectorAll('[data-action="dorm_login"],[data-action="dorm_query"]').forEach(b=>b.disabled=pending||d.busy);
   $('submit-dorm').disabled=pending||syncedEpoch!==epoch||d.busy||!['ready','uncertain'].includes(d.state);
   $('submit-dorm').firstChild.textContent=d.state==='uncertain'?'回查提交结果 ':'提交今日打卡 ';
-  $('cancel-dorm').disabled=pending||!(d.busy||state.accounts?.busy);   // 别的账号在忙时也要能取消
+  $('cancel-dorm').disabled=cancelPending.has('dorm_cancel')||!(d.busy||state.accounts?.busy);
   $('logout-dorm').disabled=pending||d.busy;
   renderLogin(d,pending);
   $('idm-clear').disabled=!d.has_idm_credentials||pending||d.busy;
@@ -590,8 +591,26 @@ function actBlocksOnUac(action,payload){
   // The bridge waits for the elevated helper, so the form is blocked until UAC is answered.
   return action==='network_save'&&!!state&&payload.startup!==state.network.startup;
 }
+async function cancelOperation(action){
+  if(cancelPending.has(action))return;
+  cancelPending.add(action);
+  render();
+  try{
+    const result=await api.dispatch(action,{});
+    notify(result.message,!result.ok);
+  }catch(error){
+    notify('未收到取消结果，请检查后台连接后重试。',true);
+  }finally{
+    cancelPending.delete(action);
+    render();
+    if(refreshTask)await refreshTask;
+    await refresh();
+  }
+}
 async function act(action,payload={}){
-  if(!api||pending)return false;
+  if(!api)return false;
+  if(action==='dorm_cancel'||action==='lptiyu_cancel')return cancelOperation(action);
+  if(pending)return false;
   const simulation=savedLocationSource()==='simulation'&&(action==='location_authorize'||(action==='dorm_submit'&&state.dorm.state!=='uncertain'));
   pending=true;epoch++;render();
   if(actBlocksOnUac(action,payload))notify('请在 Windows 提示中选择“是”以授予管理员授权，页面会在授权结束后继续。');
@@ -834,7 +853,7 @@ function renderRunStatus(lp,s){
   }
   $('lp-auto-summary').textContent=s.enabled?`${s.run_time||'06:30'} 自动`:'未开启';
   $('lp-submit').disabled=pending||syncedEpoch!==epoch||lp.busy||['signed','quota'].includes(lp.state);
-  $('lp-cancel').disabled=pending||!lp.busy;
+  $('lp-cancel').disabled=cancelPending.has('lptiyu_cancel')||!lp.busy;
   $('lp-dry').disabled=pending||lp.busy;
 }
 function renderRunSettings(lp,s){

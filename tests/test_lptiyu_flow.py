@@ -4,12 +4,13 @@ import json
 import math
 import random
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from lptiyu import flow as lptiyu_flow
-from lptiyu.client import ApiError
+from lptiyu.client import ApiClient, ApiError
 from lptiyu.tracks import TemplateShift
 
 
@@ -176,6 +177,48 @@ def make_flow(slot, policy=None, template_path='', zone_tuning=None, zone_sink=N
 
 
 class DryRunTests(unittest.TestCase):
+    def test_cancellation_while_connecting_does_not_send_a_request(self):
+        client = ApiClient(uid=1, token='synthetic', school_id=1)
+        client.stop_event = threading.Event()
+        with (
+            patch('lptiyu.client.wire.connect') as connect,
+            patch('lptiyu.client.wire.post_form') as post,
+        ):
+            connection = connect.return_value
+
+            def connect_and_cancel(*args, **kwargs):
+                client.stop_event.set()
+                return connection
+
+            connect.side_effect = connect_and_cancel
+            with self.assertRaises(ApiError) as caught:
+                client.term_list()
+            self.assertEqual(caught.exception.code, 9)
+            post.assert_not_called()
+            connection.close.assert_called_once()
+
+    def test_cancellation_before_start_prevents_api_calls(self):
+        slot = FakeSlot()
+        slot.client = FakeClient({})
+        flow = make_flow(slot)
+        flow.stop_event.set()
+        self.assertEqual(flow.run(submit=False), (None, 9))
+        self.assertEqual(slot.client.calls, [])
+
+    def test_cancellation_after_first_query_prevents_followup_query(self):
+        slot = FakeSlot()
+        flow = make_flow(slot)
+
+        class CancelAfterQuery(FakeClient):
+            def term_list(self):
+                result = super().term_list()
+                flow.stop_event.set()
+                return result
+
+        slot.client = CancelAfterQuery({})
+        self.assertEqual(flow.run(submit=False), (None, 9))
+        self.assertEqual(slot.client.calls, ['term_list'])
+
     def test_dry_run_never_touches_write_endpoints(self):
         slot = FakeSlot()
         slot.client = FakeClient({})
@@ -307,6 +350,22 @@ class SubmitTests(unittest.TestCase):
         self.assertEqual(slot.after_calls, 1)
         self.assertEqual(slot.dead_calls, 0)
         self.assertEqual(summary['record_id'], 'R1')
+
+    def test_cancelling_after_submission_keeps_the_record_id(self):
+        slot = FakeSlot()
+        slot.client = FakeClient({})
+        flow = make_flow(slot, template_path=self.template)
+
+        def cancel_when_acknowledged(stage, _message):
+            if stage == 4:
+                flow.stop_event.set()
+
+        flow.progress_fn = cancel_when_acknowledged
+        summary, code = flow.run(submit=True)
+        self.assertEqual(code, lptiyu_flow.SUBMITTED_REVIEW_CANCELLED)
+        self.assertEqual(summary['record_id'], 'R1')
+        self.assertNotIn('record_detail', slot.client.calls)
+        self.assertEqual(slot.after_calls, 0)
 
     def test_invalid_judgement_returns_code_5(self):
         slot = FakeSlot()

@@ -87,6 +87,17 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(settings.enabled)
         self.assertEqual(settings.location_source, 'simulation')
 
+    def test_cancel_before_worker_starts_keeps_logout_from_changing_settings(self):
+        self.store.save_settings(Settings(enabled=True))
+        with patch.object(self.store, 'clear_token') as clear_token, patch(
+            'dorm_panel.threading.Thread',
+            side_effect=lambda target, **_kw: Mock(start=lambda: (self.controller.cancel(), target())),
+        ):
+            self.assertTrue(self.controller.start('logout'))
+        self.assertTrue(self.store.settings().enabled)
+        clear_token.assert_not_called()
+        self.assertEqual(self.controller.drain()[-1].state, 'cancelled')
+
     def test_legacy_settings_save_preserves_global_location_source(self):
         from dorm_panel import DormPanel
         self.assertIn('location_source', Settings.__dataclass_fields__)
@@ -268,6 +279,14 @@ class SchedulingConstraintTests(unittest.TestCase):
         controller = self.build(stagger_seconds=90)
         # 时段读不出来时该由 Engine fail-closed，这里不替它做决定。
         self.assertTrue(controller._stagger_ready(Mock(start='25:00')))
+
+    def test_a_tenth_accounts_stagger_does_not_wrap_to_an_early_check(self):
+        self.store.save_settings(Settings(enabled=True, start='23:50', end='23:59'))
+        controller = self.build(stagger_seconds=9 * 90)
+        self.at(23, 58, 59)
+        controller.poll()
+        self.wait(controller)
+        self.engine.tick.assert_not_called()
 
     # ---- 机器级登录闸 ---------------------------------------------------------
     def test_automatic_renewal_skips_while_another_account_is_logging_in(self):
@@ -543,6 +562,21 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(self.renewals, 1)
         self.assertEqual(self.api.submit.call_count, 1)
         self.assertFalse(self.store.pending(self.task.key))
+
+    def test_cancelled_submitted_action_preserves_pending_result_without_renewal(self):
+        self.store.save_browser_session('valid-token', 'student', [dict(
+            name='SSO', value='cookie', domain='idm.swu.edu.cn', path='/', expires=-1)])
+
+        def submit(*_args):
+            self.controller.cancel()
+            raise TimeoutError()
+        self.api.submit.side_effect = submit
+        self.api.is_signed.side_effect = CheckinError('login_required', '登录已失效')
+        result = self.run_action('submit')
+        self.assertEqual(result.state, 'login_required')
+        self.assertIn('结果待确认', result.message)
+        self.assertTrue(self.store.pending(self.task.key))
+        self.login.assert_not_called()
 
     def test_renewal_does_not_resubmit_a_rejected_write_in_same_action(self):
         self.store.save_browser_session('valid-token', 'student', [dict(

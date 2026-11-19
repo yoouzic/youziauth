@@ -476,6 +476,31 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(session.status()["port"], 0)
         self.assertEqual(session.status()["message"], "已停止采集")
 
+    def test_wait_releases_proxy_when_cancelled(self):
+        session, proxy, _ca = self.session()
+        stop_event = threading.Event()
+        session.start(stop_event=stop_event)
+        try:
+            self.assertIsNone(session.wait(on_tick=stop_event.set, stop_event=stop_event))
+            self.assertEqual(session.status()["state"], "idle")
+            self.assertEqual(session.status()["port"], 0)
+            self.assertEqual(proxy.restored, 1)
+        finally:
+            session.stop()
+
+    def test_cancel_during_guard_setup_does_not_switch_proxy(self):
+        stop_event = threading.Event()
+
+        def start_guard(*_):
+            stop_event.set()
+            return SimpleNamespace(pid=4321)
+
+        session, proxy, _ca = self.session(guard_factory=start_guard)
+        with self.assertRaisesRegex(cap.CaptureError, "已取消"):
+            session.start(stop_event=stop_event)
+        self.assertEqual(proxy.pointed, 0)
+        self.assertEqual(session.status()["port"], 0)
+
     def test_an_old_wait_does_not_stop_a_new_capture(self):
         session, proxy, _ca = self.session()
         session.start()

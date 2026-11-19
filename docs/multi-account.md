@@ -100,7 +100,7 @@ restart reuses the same account.
 
 | Item | Value |
 | --- | --- |
-| Accounts | at most 5 (`MAX_ACCOUNTS`); the last one cannot be deleted |
+| Accounts | up to 10 (`MAX_ACCOUNTS`). The last one cannot be deleted. |
 | Active account | `accounts.json → active`; selects what the 寝室打卡 page shows and edits. Switching is a view change and is never refused |
 | Per-account state | schedule, check-in points, simulated sample, school session, unified credentials, daily counters, history |
 | Automatic check-in | **every account with `enabled`**, on its own controller, its own window, its own interval, its own stagger offset |
@@ -179,9 +179,8 @@ restart reuses the same account.
 
 - **Sequential, not parallel.** Accounts are staggered and share one login chain by design; a
   second account that needs to log in while the first is mid-login simply skips that tick and
-  retries on its own `_renew_at` cadence (5 minutes). With 5 accounts the last one starts its
-  evening 6 minutes after the window opens, which is fine for a two-hour window but worth knowing
-  if someone configures a very short one.
+  retries on its own `_renew_at` cadence (5 minutes). With 10 accounts, the last one's first check
+  is due 13 minutes and 30 seconds after the window opens. A shorter window can end before that check is due.
 - **Submissions are still per account and per task.** Nothing about the school's own windows,
   radius checks or read-back rules changed; each account is checked exactly as it was alone.
 - **One machine, one IP.** Every account's browser login and API traffic leaves from the same
