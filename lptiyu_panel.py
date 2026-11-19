@@ -118,6 +118,7 @@ MAX_DAILY_AUTO_ATTEMPTS = 3
 AUTO_CAPTURE_COOLDOWN_MIN = 20
 AUTO_CAPTURE_DAILY_CAP = 3
 GRAB_TIMEOUT_SECONDS = 540
+VERIFY_PROBE_TIMEOUT_SECONDS = 15
 MAX_ZONE_SYNC = 8                # 同步跑区时最多切几次场地(服务端一般就 4 个)
 
 # 续期结果 → 界面状态词(与前端 LP_NAMES 对齐)。
@@ -245,6 +246,7 @@ class LptiyuController:
         self._gate = threading.Lock()
         self._poll_at = 0.0
         self.cancel = threading.Event()
+        self._verification_probe = None
         self.latest = None
         # 多成员轮跑: 前缀贴到每个进度文案上, 告诉界面现在跑的是谁。
         self._run_member_prefix = ''
@@ -1084,11 +1086,11 @@ class LptiyuController:
         """返回可用凭证; 拿不到就抛 LptiyuError(need_token)。
 
         阶梯统一交给 renewer: 探活 → 研究库 → 主动采集(借用研究库采集链),
-        每一步都用真门探活收尾。到点自动跑或用户手动点, 都按 force=True 走 ——
+        每一步都用真门探活收尾。到点自动跑或用户手动提交, 都按 force=True 走 ——
         用户/日程已经表达了「现在要用凭证」, 不该再被台账冷却挡回去。
         多成员轮跑传 renew=False: 台账/采集阶梯是为「当前活动成员」设计的,
-        轮跑里给旁席成员跑一遍会把队列挂在没人打开的小程序上 —— 凭证是否
-        还活着交给 _execute 里那一拍探活, 死号记台账跳过。
+        轮跑里给旁席成员跑一遍会把队列挂在没人打开的小程序上。手动验证也只检查
+        当前凭证, 由 _execute 决定如何处理探活结果。
         """
         self._check_cancelled()
         outcome = self._renew_credentials(force=True) if renew else None
@@ -1158,6 +1160,46 @@ class LptiyuController:
                 return False
             raise                     # 网络类故障不判死, 让上层按 error 呈现
 
+    def _probe_for_verification(self, client):
+        self._check_cancelled()
+        if self._verification_probe is not None and self._verification_probe.is_alive():
+            raise LptiyuError('error', '上次凭证查询仍在结束，请稍后重试')
+
+        stop = threading.Event()
+        if isinstance(client, ApiClient):
+            client.stop_event = stop
+        responses = queue.Queue(maxsize=1)
+
+        def probe():
+            # DNS 或接收响应可能阻塞。只有当前验证能根据返回值修改凭证。
+            try:
+                alive = self._probe_alive(client)
+            except Exception:  # noqa: BLE001
+                responses.put(None)
+            else:
+                responses.put(alive)
+
+        self._verification_probe = threading.Thread(target=probe, daemon=True,
+                                                    name='youziauth-lptiyu-verify-credential')
+        self._verification_probe.start()
+        deadline = time.monotonic() + VERIFY_PROBE_TIMEOUT_SECONDS
+        try:
+            while True:
+                self._check_cancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise LptiyuError('error', '凭证查询超时，请稍后重试')
+                try:
+                    alive = responses.get(timeout=min(0.1, remaining))
+                except queue.Empty:
+                    continue
+                self._check_cancelled()
+                if alive is None:
+                    raise LptiyuError('error', '暂时无法确认凭证，请检查网络后重试')
+                return alive
+        finally:
+            stop.set()
+
     def _flow(self, settings, progress_fn=None):
         if self._flow_factory is not None:
             flow = self._flow_factory(self.slot, settings)
@@ -1212,9 +1254,11 @@ class LptiyuController:
                        else '开始验证：正在检查凭证与账号状态…')
         settings = self.store.settings()
         try:
-            record = self._ensure_credentials(renew=not self._sweeping_run)
+            record = self._ensure_credentials(renew=submit and not self._sweeping_run)
         except LptiyuError as exc:
             # 没有凭证但有采集能力: 交给下一拍自己采, 不用人点「同步凭证」。
+            if exc.state == 'need_token' and not submit:
+                raise LptiyuError('need_token', '当前成员没有可用凭证，请更新或导入凭证后再验证') from None
             if exc.state == 'need_token' and self._auto_capture_due():
                 with self._gate:
                     self._check_cancelled()
@@ -1225,16 +1269,17 @@ class LptiyuController:
             raise
         self._progress(1, total, labels, '凭证就绪，正在确认账号状态…')
         client = self.slot.make_client(pace=0.8)
-        alive = self._probe_alive(client)
+        alive = self._probe_alive(client) if submit else self._probe_for_verification(client)
         self._check_cancelled()
         if not alive:
             self.slot.mark_dead()
+            if not submit:
+                raise LptiyuError('need_token', '凭证已失效，请更新或导入凭证后再验证')
             if self._sweeping_run:
                 # 多成员轮跑绝不中途开续期/采集阶梯: 那会挂起整个队列去等一个
                 # 不会有人打开的小程序。谁的号死了记下来跳过, 让本人重开小程序
                 # 或导入新文件后再说。
-                if submit:
-                    self.store.bump_daily(kind='run')
+                self.store.bump_daily(kind='run')
                 raise LptiyuError('need_token',
                                   f'{self.slot.label} 的凭证已失效，跳过（让本人重开一次小程序再导入）')
             # 续期刚过、起跑前这半秒号又死了(小程序那边刚重登): 再走一遍续期阶梯,
@@ -1246,8 +1291,7 @@ class LptiyuController:
             except OSError:
                 self.store.clear_token()
             if not fresh or not fresh.get('token') or fresh['token'] == record['token']:
-                if submit:
-                    self.store.bump_daily(kind='run')
+                self.store.bump_daily(kind='run')
                 raise LptiyuError('need_token', outcome.message)
             client = self.slot.make_client(pace=0.8)
 

@@ -86,6 +86,10 @@ class ApiClient:
                             ca_bundle=self.ca_bundle)
         try:
             self._check_cancelled()
+            if path == spec.EP_TERM_LIST and self.stop_event is not None:
+                # 建连独立于发送，DNS 或 TLS 完成后先检查凭证探测是否已取消。
+                conn.connect()
+                self._check_cancelled()
             resp = wire.post_form(conn, spec.API_ROOT + path, body, flag=flag)
             raw = resp.read()
             status = resp.status

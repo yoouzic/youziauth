@@ -1371,6 +1371,20 @@ class LptiyuBridgeTests(unittest.TestCase):
         state = self.bridge.snapshot()['lptiyu']
         self.assertIsNone(state['progress'])
 
+    def test_signed_today_does_not_hide_busy_dry_run_progress(self):
+        self.store.mark_signed(dt.date.today().isoformat(), {'distance': '2.3 km'})
+        self.assertEqual(self.bridge.snapshot()['lptiyu']['state'], 'signed')
+
+        labels = ['准备凭证', '生成轨迹', '本地校验']
+        message = '开始验证：正在检查凭证与账号状态…'
+        self.controller._progress(1, len(labels), labels, message)
+        with patch.object(self.controller, 'busy', True):
+            state = self.bridge.snapshot()['lptiyu']
+        self.assertTrue(state['busy'])
+        self.assertEqual(state['state'], 'running')
+        self.assertEqual(state['message'], message)
+        self.assertEqual(state['progress'], {'step': 1, 'total': 3, 'labels': labels})
+
     def test_lptiyu_term_status_belongs_to_the_active_member(self):
         self.assertTrue(self._save_term_limit(28)['ok'])
         first_id = self.store.active_member_id()

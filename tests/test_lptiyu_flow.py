@@ -206,6 +206,27 @@ class DryRunTests(unittest.TestCase):
             post.assert_not_called()
             connection.close.assert_called_once()
 
+    def test_term_list_cancellation_while_opening_transport_prevents_post(self):
+        client = ApiClient(uid=1, token='synthetic', school_id=1)
+        client.stop_event = threading.Event()
+        with (
+            patch('lptiyu.client.wire.connect') as create_connection,
+            patch('lptiyu.client.wire.post_form') as post,
+        ):
+            connection = create_connection.return_value
+            connection.connect.side_effect = client.stop_event.set
+            post.return_value.read.return_value = b'[]'
+            post.return_value.status = 200
+            post.return_value.getheader.return_value = None
+
+            with self.assertRaises(ApiError) as caught:
+                client.term_list()
+
+            self.assertEqual(caught.exception.code, 9)
+            connection.connect.assert_called_once()
+            post.assert_not_called()
+            connection.close.assert_called_once()
+
     def test_cancellation_before_start_prevents_api_calls(self):
         slot = FakeSlot()
         slot.client = FakeClient({})

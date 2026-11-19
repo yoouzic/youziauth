@@ -466,7 +466,8 @@ class DesktopBridge(LocationProbe):
             elif state == 'idle' and status_state:
                 state = status_state
                 message = status.get('message') or message
-            if store.is_signed_today() and state in ('idle', 'running'):
+            if (state in ('idle', 'running') and not (busy and progress is not None)
+                    and store.is_signed_today()):
                 signed = store.signed_record()
                 state = 'signed'
                 message = '今日跑步已完成' + (

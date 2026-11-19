@@ -198,6 +198,87 @@ class ExecuteTests(PanelTestCase):
         self.assertFalse(controller.store.is_signed_today())
         self.assertTrue(controller.store.has_token())
 
+    def test_expired_credential_finishes_verification_without_waiting_for_capture(self):
+        controller = self.make_controller()
+        grab_started = threading.Event()
+        release_grab = threading.Event()
+
+        def grab():
+            grab_started.set()
+            release_grab.wait(3)
+            return False, '采集未完成'
+
+        controller.renewer = CredentialRenewer(
+            self.store, clock=CLOCK, probe=controller._probe_record, grab=grab)
+        with patch.object(controller, '_probe_alive', return_value=False), \
+                patch.object(self.store, 'lab_dir', return_value='test-lab'), \
+                patch.object(self.store, 'sync_from_lab', return_value=([], '')):
+            try:
+                self.assertTrue(controller.start('dry'))
+                controller._wait_for_work(0.8)
+                self.assertFalse(controller.busy)
+                self.assertFalse(grab_started.is_set())
+                self.assertEqual(controller.latest['state'], 'need_token')
+                self.assertIn('凭证已失效', controller.latest['message'])
+                self.assertFalse(self.store.has_token())
+                self.assertFalse(controller._capture_requested)
+                self.assertEqual(self.flows, [])
+            finally:
+                release_grab.set()
+                controller._wait_for_work()
+
+    def test_cancel_releases_a_blocked_verification_probe_without_clearing_token(self):
+        controller = self.make_controller()
+        probing = threading.Event()
+        release_probe = threading.Event()
+
+        def probe(_client):
+            probing.set()
+            release_probe.wait(3)
+            return False
+
+        with patch.object(controller, '_probe_alive', side_effect=probe) as probe_call:
+            try:
+                self.assertTrue(controller.start('dry'))
+                self.assertTrue(probing.wait(2))
+                controller.cancel_work()
+                controller._wait_for_work(0.8)
+                self.assertFalse(controller.busy)
+                self.assertEqual(controller.latest['state'], 'cancelled')
+                self.assertTrue(probe_call.call_args.args[0].stop_event.is_set())
+                self.assertTrue(controller.start('dry'))
+                controller._wait_for_work(0.8)
+                self.assertEqual(probe_call.call_count, 1, '上次网络查询仍在结束时不能叠加发请求')
+            finally:
+                release_probe.set()
+                controller._wait_for_work()
+        if controller._verification_probe is not None:
+            controller._verification_probe.join(1)
+        self.assertTrue(self.store.has_token())
+        self.assertEqual(self.flows, [])
+
+    def test_blocked_verification_probe_times_out_and_preserves_credential(self):
+        controller = self.make_controller()
+        release_probe = threading.Event()
+
+        def blocked_probe(_client):
+            release_probe.wait(3)
+            return False
+
+        with patch.object(controller, '_probe_alive', side_effect=blocked_probe), \
+                patch.object(lptiyu_panel, 'VERIFY_PROBE_TIMEOUT_SECONDS', 0.1):
+            try:
+                self.assertTrue(controller.start('dry'))
+                controller._wait_for_work(0.8)
+                self.assertFalse(controller.busy)
+                self.assertEqual(controller.latest['state'], 'error')
+                self.assertIn('凭证查询超时', controller.latest['message'])
+                self.assertEqual(self.flows, [])
+            finally:
+                release_probe.set()
+                controller._wait_for_work()
+        self.assertTrue(self.store.has_token())
+
 
 class GateTests(PanelTestCase):
     def test_busy_rejects_second_action(self):
@@ -217,18 +298,13 @@ class GateTests(PanelTestCase):
             controller._execute(submit=False)
         self.assertEqual(caught.exception.state, 'need_token')
 
-    def test_missing_token_reports_need_token_without_lab(self):
+    def test_missing_token_prompts_to_update_before_verifying(self):
         controller = self.make_controller()
         controller.store.clear_token()
-        # 这条要看真续期器的文案: 假续期器只会回放预设结果。
-        controller.renewer = CredentialRenewer(
-            controller.store, clock=CLOCK,
-            probe=controller._probe_record, grab=controller._grab_via_lab)
         with self.assertRaises(LptiyuError) as caught:
             controller._execute(submit=False)
         self.assertEqual(caught.exception.state, 'need_token')
-        self.assertIn('研究库', caught.exception.message,
-                      '没有采集组件时要直说, 不能让人去点必然失败的「同步凭证」')
+        self.assertIn('导入', caught.exception.message)
 
 
 class PollTests(PanelTestCase):
@@ -873,10 +949,19 @@ class AutoCaptureTests(PanelTestCase):
         controller = self.make_controller(capture=FakeCapture(installed=True))
         controller.store.clear_token()
         with self.assertRaises(LptiyuError) as caught:
-            controller._execute(submit=False)
+            controller._execute(submit=True)
         self.assertEqual(caught.exception.state, 'need_token')
         self.assertIn('自动采集', caught.exception.message)
         self.assertTrue(controller._capture_requested)
+
+    def test_verification_does_not_schedule_capture_without_a_credential(self):
+        controller = self.make_controller(capture=FakeCapture(installed=True))
+        controller.store.clear_token()
+        with self.assertRaises(LptiyuError) as caught:
+            controller._execute(submit=False)
+        self.assertEqual(caught.exception.state, 'need_token')
+        self.assertFalse(controller._capture_requested)
+        self.assertEqual(self.renewer.calls, [])
 
     def test_poll_picks_the_request_up_by_itself(self):
         capture = FakeCapture(cred=self.CRED, installed=True)
