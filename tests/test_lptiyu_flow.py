@@ -168,6 +168,15 @@ class FakeClient:
                            'distance': 2.31})
 
 
+class TermTotalClient(FakeClient):
+    def __init__(self, total, script=None):
+        super().__init__(script or {})
+        self.total = total
+
+    def before_run(self):
+        return dict(super().before_run(), total_num=self.total)
+
+
 def make_flow(slot, policy=None, template_path='', zone_tuning=None, zone_sink=None):
     flow = lptiyu_flow.DailyFlow(slot, policy=policy, log_fn=lambda message: None,
                                  template_path=template_path,
@@ -272,6 +281,160 @@ class DryRunTests(unittest.TestCase):
         self.assertGreater(out['track_points'], 50)
 
 
+class TermRunLimitTests(unittest.TestCase):
+    def test_reaching_the_limit_uses_the_schools_aggregate_before_writes(self):
+        slot = FakeSlot()
+        slot.client = TermTotalClient('28')
+        flow = make_flow(slot, policy={'term_run_limit': 28})
+
+        summary, code = flow.run(submit=True, zone_override='1875')
+
+        self.assertEqual(code, lptiyu_flow.TERM_QUOTA_REACHED)
+        self.assertEqual(summary, {'term_id': '13103', 'term_count': 28,
+                                   'term_run_limit': 28})
+        self.assertEqual(slot.client.calls, ['term_list', 'school_info', 'before_run'])
+
+    def test_counts_distinct_confirmed_records_across_pages_before_writes(self):
+        valid = {'id': 11, 'record_status': 1, 'distance': 2.3}
+        second = {'id': 22, 'record_status': '1', 'distance': '2.3'}
+        third = {'id': 33, 'record_status': 1, 'distance': 2.4}
+        slot = FakeSlot()
+        slot.client = FakeClient({
+            ('term_records', 1): {'list': [
+                valid,
+                {'id': 12, 'record_status': 3, 'distance': 2.3},
+            ]},
+            ('term_records', 2): {'list': [
+                dict(valid, id='11'),
+                second,
+                {'id': 23, 'record_status': 1, 'distance': 2.3,
+                 'record_failed_reason': '打卡点异常'},
+            ]},
+            ('term_records', 3): {'list': [
+                third,
+                {'id': 34, 'record_status': 0, 'distance': 2.4},
+                {'id': 35, 'record_status': 1, 'distance': 0},
+            ]},
+        })
+        flow = make_flow(slot, policy={'term_run_limit': 2})
+
+        summary, code = flow.run(submit=True, zone_override='1875')
+
+        self.assertEqual(code, 7)
+        self.assertEqual(summary, {'term_id': '13103', 'term_count': 3,
+                                   'term_run_limit': 2})
+        self.assertEqual(slot.client.calls, [
+            'term_list', 'school_info', 'before_run',
+            ('term_records', 1), ('term_records', 2),
+            ('term_records', 3), ('term_records', 4),
+        ])
+
+    def test_below_limit_still_checks_the_daily_quota(self):
+        now = int(datetime.datetime.now().timestamp())
+        valid = {'id': 11, 'record_status': 1, 'distance': 2.3, 'start_time': now}
+        slot = FakeSlot()
+        slot.client = FakeClient({('term_records', 1): {'list': [valid]}})
+        flow = make_flow(slot, policy={'term_run_limit': 2})
+
+        self.assertEqual(flow.run(submit=True), (None, 3))
+        self.assertNotIn('oss_sts', slot.client.calls)
+
+    def test_dry_run_does_not_query_the_full_term(self):
+        slot = FakeSlot()
+        slot.client = FakeClient({
+            ('term_records', 1): {'list': [
+                {'id': 11, 'record_status': 1, 'distance': 2.3},
+            ]},
+            ('term_records', 2): {'list': [
+                {'id': 22, 'record_status': 1, 'distance': 2.3},
+            ]},
+        })
+        flow = make_flow(slot, policy={'term_run_limit': 1})
+
+        self.assertEqual(flow.run(submit=False)[1], 0)
+        self.assertNotIn(('term_records', 3), slot.client.calls)
+
+    def test_unknown_count_prevents_writes(self):
+        for reply in ({'list': 'invalid'}, {'status': 503, 'list': []},
+                      {'list': [{'id': 123, 'record_status': 1}]},
+                      {'list': [{'id': 123, 'distance': 2.3}]},
+                      OSError('offline'), ApiError(3, 'service rejected')):
+            with self.subTest(reply=reply):
+                slot = FakeSlot()
+                slot.client = FakeClient({('term_records', 1): reply})
+                flow = make_flow(slot, policy={'term_run_limit': 28})
+
+                self.assertEqual(flow.run(submit=True, zone_override='1875'), (None, 8))
+                self.assertEqual(slot.client.calls[-1], ('term_records', 1))
+
+    def test_repeated_page_prevents_writes(self):
+        page = {'list': [{'id': 123, 'record_status': 1, 'distance': 2.3}]}
+        slot = FakeSlot()
+        slot.client = FakeClient({
+            ('term_records', 1): page, ('term_records', 2): page,
+        })
+        flow = make_flow(slot, policy={'term_run_limit': 28})
+
+        self.assertEqual(flow.run(submit=True, zone_override='1875'), (None, 8))
+        self.assertEqual(slot.client.calls[-1], ('term_records', 2))
+
+    def test_expiration_during_count_marks_token_dead(self):
+        for reply in (ApiError(101, 'expired'), {'status': '101'}):
+            with self.subTest(reply=reply):
+                slot = FakeSlot()
+                slot.client = FakeClient({('term_records', 1): reply})
+                flow = make_flow(slot, policy={'term_run_limit': 28})
+
+                self.assertEqual(flow.run(submit=True, zone_override='1875'), (None, 2))
+                self.assertEqual(slot.dead_calls, 1)
+                self.assertEqual(slot.client.calls[-1], ('term_records', 1))
+
+    def test_missing_term_id_prevents_writes(self):
+        class MissingTerm(TermTotalClient):
+            def before_run(self):
+                result = super().before_run()
+                del result['term_id']
+                return result
+
+        slot = FakeSlot()
+        slot.client = MissingTerm(28)
+        flow = make_flow(slot, policy={'term_run_limit': 28})
+
+        self.assertEqual(flow.run(submit=True, zone_override='1875'), (None, 8))
+        self.assertEqual(slot.client.calls, ['term_list', 'school_info', 'before_run'])
+
+    def test_invalid_aggregate_falls_back_to_confirmed_records(self):
+        records = {('term_records', 1): {'list': [
+            {'id': 11, 'record_status': '1', 'distance': '2.3'},
+        ]}}
+        for value in (None, -1, False, 1.4, 'invalid'):
+            with self.subTest(value=value):
+                slot = FakeSlot()
+                slot.client = TermTotalClient(value, records)
+                flow = make_flow(slot, policy={'term_run_limit': 1})
+
+                summary, code = flow.run(submit=True)
+
+                self.assertEqual(code, lptiyu_flow.TERM_QUOTA_REACHED)
+                self.assertEqual(summary['term_count'], 1)
+                self.assertIn(('term_records', 2), slot.client.calls)
+
+    def test_cancellation_after_read_prevents_followup_requests(self):
+        slot = FakeSlot()
+        flow = make_flow(slot, policy={'term_run_limit': 28})
+
+        class CancelOnRecords(FakeClient):
+            def term_records(self, term_id, page=1):
+                result = super().term_records(term_id, page)
+                flow.stop_event.set()
+                return result
+
+        slot.client = CancelOnRecords({})
+
+        self.assertEqual(flow.run(submit=True, zone_override='1875'), (None, 9))
+        self.assertEqual(slot.client.calls[-1], ('term_records', 1))
+
+
 class ZoneSwitchClient(FakeClient):
     """模拟服务端跑区状态: setRunZone 成功才换 beforeRun 的点位; refuse=True 时拒绝切换。"""
 
@@ -307,6 +470,41 @@ class ZoneSwitchClient(FakeClient):
 
 class ZoneSwitchTests(unittest.TestCase):
     """切换跑区必须真的换掉提交的场地: 服务器拒绝时不得拿旧点位冒充新跑区。"""
+
+    def test_term_change_after_switch_prevents_submission(self):
+        class TermChangingClient(ZoneSwitchClient):
+            def before_run(self):
+                result = super().before_run()
+                if self.current == '1873':
+                    result['term_id'] = 13104
+                return result
+
+        slot = FakeSlot()
+        slot.client = TermChangingClient()
+        flow = make_flow(slot, policy={'term_run_limit': 28})
+
+        self.assertEqual(flow.run(submit=True, zone_override='1873'),
+                         (None, lptiyu_flow.TERM_COUNT_UNAVAILABLE))
+        self.assertNotIn('oss_sts', slot.client.calls)
+        self.assertNotIn('stop_run', slot.client.calls)
+
+    def test_rechecks_the_aggregate_after_switching_zones(self):
+        class TotalChangingClient(ZoneSwitchClient):
+            def before_run(self):
+                total = 28 if self.current == '1873' else 27
+                return dict(super().before_run(), total_num=total)
+
+        slot = FakeSlot()
+        slot.client = TotalChangingClient()
+        flow = make_flow(slot, policy={'term_run_limit': 28})
+
+        summary, code = flow.run(submit=True, zone_override='1873')
+
+        self.assertEqual(code, lptiyu_flow.TERM_QUOTA_REACHED)
+        self.assertEqual(summary['term_count'], 28)
+        self.assertEqual(slot.client.calls, [
+            'term_list', 'school_info', 'before_run', ('set_zone', '1873'), 'before_run',
+        ])
 
     def test_refused_switch_aborts_before_generating_or_submitting(self):
         slot = FakeSlot()
@@ -350,6 +548,41 @@ class SubmitTests(unittest.TestCase):
         self.assertEqual(slot.after_calls, 1)
         self.assertEqual(slot.dead_calls, 0)
         self.assertEqual(summary['record_id'], 'R1')
+
+    def test_aggregate_below_28_only_needs_the_daily_query(self):
+        for total in (27, 0, '0'):
+            with self.subTest(total=total):
+                slot = FakeSlot()
+                slot.client = TermTotalClient(total)
+                flow = make_flow(slot, policy={'term_run_limit': 28}, template_path=self.template)
+
+                summary, code = flow.run(submit=True)
+
+                self.assertEqual(code, 0)
+                self.assertEqual(summary['record_id'], 'R1')
+                self.assertEqual(slot.client.calls.count(('term_records', 1)), 1)
+
+    def test_27_valid_historical_runs_still_allow_one_submission_under_28_limit(self):
+        yesterday = datetime.date.today() - datetime.timedelta(days=1)
+        start_time = int(datetime.datetime.combine(yesterday, datetime.time(7)).timestamp())
+        records = [
+            {'id': number, 'record_status': 1, 'distance': 2.31, 'start_time': start_time}
+            for number in range(1, 28)
+        ]
+        records.append({'id': 28, 'record_status': 2, 'distance': 2.31, 'start_time': start_time})
+        slot = FakeSlot()
+        slot.client = FakeClient({
+            ('term_records', page): {'list': records[start:start + 10]}
+            for page, start in enumerate(range(0, len(records), 10), 1)
+        })
+        flow = make_flow(slot, policy={'term_run_limit': 28}, template_path=self.template)
+
+        summary, code = flow.run(submit=True)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(summary['record_id'], 'R1')
+        self.assertIn(('term_records', 3), slot.client.calls)
+        self.assertIn('stop_run', slot.client.calls)
 
     def test_cancelling_after_submission_keeps_the_record_id(self):
         slot = FakeSlot()

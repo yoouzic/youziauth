@@ -1333,6 +1333,10 @@ class LptiyuBridgeTests(unittest.TestCase):
             self.bridge = DesktopBridge(Path(self.tmp.name) / 'config.ini',
                                         dorm=MagicMock(), lptiyu=self.controller)
 
+    def _save_term_limit(self, limit):
+        return self.bridge.dispatch('lptiyu_save', {
+            'member_id': self.store.active_member_id(), 'term_run_limit': limit})
+
     def test_snapshot_exposes_state_without_the_token_itself(self):
         state = self.bridge.snapshot()['lptiyu']
         self.assertTrue(state['available'])
@@ -1366,6 +1370,52 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.controller._set_latest('signed', '今日跑步已完成')
         state = self.bridge.snapshot()['lptiyu']
         self.assertIsNone(state['progress'])
+
+    def test_lptiyu_term_status_belongs_to_the_active_member(self):
+        self.assertTrue(self._save_term_limit(28)['ok'])
+        first_id = self.store.active_member_id()
+        second = self.store.file_captured_credential({
+            'token': 'STRANGER-TOKEN', 'uid': 17980009, 'student_num': '2025009',
+            'school_id': '837', 'card_id': '2025009', 'source': 'capture'})
+        self.store.switch_member(second['id'])
+        self.controller._set_latest('term_count_unavailable', '第二位成员读取次数失败')
+        self.assertTrue(self.bridge.dispatch('lptiyu_member_switch', {'id': first_id})['ok'])
+        self.assertEqual(self.bridge.snapshot()['lptiyu']['state'], 'idle')
+
+        self.controller._set_latest('term_quota', '第一位成员本学期有效跑步 28 次')
+        self.store.switch_member(second['id'])
+        self.controller._set_latest('signed', '第二位成员今日跑步已完成')
+        self.store.switch_member(first_id)
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertEqual(state['state'], 'term_quota')
+        self.assertEqual(state['message'], '第一位成员本学期有效跑步 28 次')
+
+    def test_lptiyu_term_status_is_historical_when_limit_cleared(self):
+        self.assertTrue(self._save_term_limit(28)['ok'])
+        self.controller._set_latest('term_quota', '本学期有效跑步 28 次')
+        self.assertTrue(self._save_term_limit(None)['ok'])
+        self.assertEqual(self.bridge.snapshot()['lptiyu']['state'], 'idle')
+        self.store.mark_signed(dt.date.today().isoformat(), {'distance': '2.3 km'})
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertEqual(state['state'], 'signed')
+        self.assertIn('2.3 km', state['message'])
+
+    def test_lptiyu_term_status_does_not_hide_busy_run_progress(self):
+        self.assertTrue(self._save_term_limit(28)['ok'])
+        self.controller._set_latest('term_quota', '本学期有效跑步 28 次')
+        self.controller._progress(2, 4, ['凭证', '次数', '提交', '判定'], '正在读取次数')
+        with patch.object(self.controller, 'busy', True):
+            state = self.bridge.snapshot()['lptiyu']
+        self.assertEqual(state['state'], 'running')
+        self.assertEqual(state['progress']['step'], 2)
+
+    def test_lptiyu_term_status_is_historical_when_limit_is_raised(self):
+        self.assertTrue(self._save_term_limit(28)['ok'])
+        self.store._m_write('status.json', {
+            'state': 'term_quota', 'message': '已达上限（28/28 次）', 'term_run_limit': 28})
+        self.assertEqual(self.bridge.snapshot()['lptiyu']['state'], 'term_quota')
+        self.assertTrue(self._save_term_limit(32)['ok'])
+        self.assertEqual(self.bridge.snapshot()['lptiyu']['state'], 'idle')
 
     def test_snapshot_exposes_the_member_list_without_secrets(self):
         state = self.bridge.snapshot()['lptiyu']
@@ -1471,6 +1521,57 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertTrue(settings.enabled)
         self.assertEqual(settings.pace_range(), (245, 280))
 
+    def test_lptiyu_term_limit_is_saved_preserved_on_partial_updates_and_removable(self):
+        self.assertIsNone(self.bridge.snapshot()['lptiyu']['settings'].get('term_run_limit'))
+        result = self._save_term_limit(28)
+        self.assertTrue(result['ok'])
+        self.assertEqual(self.bridge.snapshot()['lptiyu']['settings'].get('term_run_limit'), 28)
+
+        result = self.bridge.dispatch('lptiyu_save', {'zone_id': '1874'})
+        self.assertTrue(result['ok'])
+        self.assertEqual(self.store.settings().term_run_limit, 28)
+
+        result = self._save_term_limit(None)
+        self.assertTrue(result['ok'])
+        self.assertIsNone(self.store.settings().term_run_limit)
+
+    def test_lptiyu_invalid_term_limit_keeps_saved_settings(self):
+        self._save_term_limit(28)
+        for invalid in (0, -1, 2.5, True, '28', ''):
+            with self.subTest(invalid=invalid):
+                result = self._save_term_limit(invalid)
+                self.assertFalse(result['ok'])
+                self.assertIn('学期跑步上限', result['message'])
+                self.assertEqual(self.store.settings().term_run_limit, 28)
+
+    def test_lptiyu_limit_follows_member_switch_and_rejects_stale_save(self):
+        first = self.store.active_member_id()
+        second = self.store.file_captured_credential({
+            'token': 'SECOND-TOKEN', 'uid': 17980009, 'student_num': '2025009',
+            'school_id': '837', 'card_id': '2025009', 'source': 'capture'})['id']
+        self.assertTrue(self.bridge.dispatch('lptiyu_save', {
+            'member_id': first, 'term_run_limit': 28})['ok'])
+        self.assertTrue(self.bridge.dispatch('lptiyu_member_switch', {'id': second})['ok'])
+        self.assertIsNone(self.bridge.snapshot()['lptiyu']['settings']['term_run_limit'])
+        self.assertFalse(self.bridge.dispatch('lptiyu_save', {
+            'member_id': first, 'term_run_limit': 30})['ok'])
+        self.assertFalse(self.bridge.dispatch('lptiyu_save', {'term_run_limit': 30})['ok'])
+        self.assertTrue(self.bridge.dispatch('lptiyu_save', {
+            'member_id': second, 'term_run_limit': 32, 'run_time': '07:00'})['ok'])
+        self.assertEqual(self.bridge.snapshot()['lptiyu']['settings']['term_run_limit'], 32)
+        self.assertTrue(self.bridge.dispatch('lptiyu_member_switch', {'id': first})['ok'])
+        settings = self.bridge.snapshot()['lptiyu']['settings']
+        self.assertEqual(settings['term_run_limit'], 28)
+        self.assertEqual(settings['run_time'], '07:00')
+
+    def test_lptiyu_limit_requires_an_active_member(self):
+        self.store.remove_member(self.store.active_member_id())
+        result = self.bridge.dispatch('lptiyu_save', {'term_run_limit': 28})
+        self.assertFalse(result['ok'])
+        self.assertIn('成员', result['message'])
+        self.assertTrue(self.bridge.dispatch('lptiyu_save', {'run_time': '07:00'})['ok'])
+        self.assertIsNone(self.store.settings().term_run_limit)
+
     def test_saving_a_range_clears_the_legacy_single_pace(self):
         from lptiyu_store import Settings as LptiyuSettings
 
@@ -1505,6 +1606,17 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertTrue(self.bridge.dispatch('lptiyu_cancel')['ok'])
         # sync 在后台线程写状态文件, 等它收尾再进入临时目录清理, 否则清理会撞上写入
         self.controller._wait_for_work()
+
+    def test_lptiyu_collect_drains_results_but_does_not_poll_during_dispatch(self):
+        with patch.object(self.controller, 'poll') as poll, \
+             patch.object(self.controller, 'drain', return_value=[]) as drain:
+            with self.bridge._mutation:
+                self.bridge._collect_lptiyu()
+                poll.assert_not_called()
+                drain.assert_called_once_with()
+            self.bridge._collect_lptiyu()
+            poll.assert_called_once_with()
+            self.assertEqual(drain.call_count, 2)
 
     def test_credential_age_counts_from_the_local_sync_not_the_issue_time(self):
         self.store.save_token_record('LP-SECRET-TOKEN', issued_at='2026-11-11T02:00:00')
@@ -1722,6 +1834,17 @@ class LptiyuBridgeTests(unittest.TestCase):
             result = self.bridge.dispatch('lptiyu_cert_install')
         self.assertTrue(result['ok'])
         self.assertIn('证书', result['message'])
+
+    def test_preview_bridge_keeps_term_limits_independent(self):
+        preview = PreviewBridge()
+        self.assertTrue(preview.dispatch('lptiyu_save', {
+            'member_id': 'demo-m1', 'term_run_limit': 28})['ok'])
+        self.assertTrue(preview.dispatch('lptiyu_member_switch', {'id': 'demo-m2'})['ok'])
+        self.assertIsNone(preview.snapshot()['lptiyu']['settings']['term_run_limit'])
+        self.assertTrue(preview.dispatch('lptiyu_save', {
+            'member_id': 'demo-m2', 'term_run_limit': 32})['ok'])
+        self.assertTrue(preview.dispatch('lptiyu_member_switch', {'id': 'demo-m1'})['ok'])
+        self.assertEqual(preview.snapshot()['lptiyu']['settings']['term_run_limit'], 28)
 
     def test_preview_bridge_has_a_self_consistent_lptiyu_block(self):
         preview = PreviewBridge()

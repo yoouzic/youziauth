@@ -224,6 +224,11 @@
               <label for="lp-run-time">开始时间</label>
               <input id="lp-run-time" type="time" value="06:30" required>
             </div>
+            <div class="lp-field">
+              <label for="lp-term-run-limit">学期跑步上限（次）</label>
+              <input id="lp-term-run-limit" type="number" min="1" step="1" placeholder="不限" aria-describedby="lp-term-run-limit-hint" disabled>
+              <p class="field-hint" id="lp-term-run-limit-hint">添加或导入成员后可设置。</p>
+            </div>
             <fieldset class="lp-field">
               <legend>距离范围（公里）</legend>
               <div class="lp-range">

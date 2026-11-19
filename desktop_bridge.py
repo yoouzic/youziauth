@@ -127,9 +127,8 @@ def dorm_settings(payload):
 def lptiyu_settings(payload, previous=None):
     """把界面提交的字段收成 Settings；**没提到的字段沿用上一份**。
 
-    界面只露出开关/时间/距离/配速/精度。跑区、每日次数、有效时段、研究库目录、
-    续期节奏这些只在配置里出现的字段，不能因为按一次「保存设置」就被重置回默认 ——
-    否则用户手调的续期间隔会在下一次点开关时静默消失。
+    表单可以只提交部分字段，例如快速切换跑区。配置文件里的每日次数、有效时段
+    和续期节奏也沿用已有设置。
     """
     from lptiyu_store import Settings as LptiyuSettings  # noqa: PLC0415
 
@@ -177,7 +176,21 @@ def lptiyu_settings(payload, previous=None):
         renew_lead_min=_int('renew_lead_min', 45),
         renew_interval_min=_int('renew_interval_min', 180),
         run_all_members=_flag('run_all_members'),
+        term_run_limit=payload.get('term_run_limit', base.term_run_limit),
     ).validate()
+
+
+def _active_lptiyu_member(members):
+    return next((item for item in members['items'] if item['id'] == members['active']), {})
+
+
+def _check_lptiyu_limit_member(payload, active_id):
+    if 'term_run_limit' not in payload:
+        return
+    if not active_id:
+        raise ValueError('请先添加成员，再设置学期跑步上限。')
+    if payload.get('member_id') != active_id:
+        raise ValueError('请确认当前乐跑成员后重新保存学期上限。')
 
 
 def sample_point(sample):
@@ -431,6 +444,7 @@ class DesktopBridge(LocationProbe):
             daily = store.daily()
             latest = controller.latest or {}
             status = store.status()
+            busy = bool(controller.busy)
             state = latest.get('state') or 'idle'
             message = latest.get('message') or ''
             # 跑步进行中的一拍进度(step/total/labels): 原样透传, 界面画分段进度条。
@@ -438,8 +452,19 @@ class DesktopBridge(LocationProbe):
             progress = latest.get('progress')
             if not isinstance(progress, dict):
                 progress = None
-            if state == 'idle' and status.get('state'):
-                state = status['state']
+            status_state = status.get('state')
+            term_states = ('term_quota', 'term_count_unavailable')
+            if not busy and (state in term_states or status_state in term_states):
+                # 轮跑收尾后的 latest 可能属于其他成员，学期结果跟当前成员走。
+                if status_state in term_states:
+                    limit = settings.term_run_limit
+                    if limit is None or status.get('term_run_limit', limit) != limit:
+                        status_state = None
+                state = status_state or 'idle'
+                message = (status.get('message') if status_state else '') or empty['message']
+                progress = None
+            elif state == 'idle' and status_state:
+                state = status_state
                 message = status.get('message') or message
             if store.is_signed_today() and state in ('idle', 'running'):
                 signed = store.signed_record()
@@ -476,16 +501,19 @@ class DesktopBridge(LocationProbe):
             zones.sort(key=lambda zone: (not zone['default'], zone['name'] or zone['id']))
             selected = str(settings.zone_id or '')
             default_name = next((z['name'] for z in zones if z['default']), '')
+            members = self._lptiyu_members_snapshot(store)
+            settings_data = dataclasses.asdict(settings)
+            settings_data['term_run_limit'] = _active_lptiyu_member(members).get('term_run_limit')
             return {
-                'state': state, 'message': message, 'busy': bool(controller.busy),
+                'state': state, 'message': message, 'busy': busy,
                 'available': True, 'progress': progress,
-                'settings': dataclasses.asdict(settings),
+                'settings': settings_data,
                 'schedule': controller.schedule_text(),
                 'identity': {'name': identity.get('name', ''),
                              'student_num': identity.get('student_num', '')},
                 'has_token': store.has_token(),
                 'token_age_hours': age,
-                'members': self._lptiyu_members_snapshot(store),
+                'members': members,
                 'today_done': int(daily.get('run', 0)),
                 'today_max': settings.max_per_day,
                 'last': last,
@@ -1022,11 +1050,15 @@ class DesktopBridge(LocationProbe):
                 raise RuntimeError('乐跑功能在本机暂不可用')
             if controller.busy:
                 raise RuntimeError('请等待当前跑步操作完成后再保存设置。')
+            store = controller.store
             try:
-                previous = controller.store.settings()
+                previous = store.settings()
             except Exception:  # noqa: BLE001 —— 设置坏了按默认起步, 由 validate 兜底
                 previous = None
+            save_term_run_limit = 'term_run_limit' in payload
+            active_id = store.active_member_id() if save_term_run_limit else None
             try:
+                _check_lptiyu_limit_member(payload, active_id)
                 settings = lptiyu_settings(payload, previous=previous)
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from None
@@ -1035,10 +1067,14 @@ class DesktopBridge(LocationProbe):
                 if not (lab_path / 'lpctl.py').is_file():
                     raise RuntimeError(
                         f'这个目录里没有 lpctl.py，不是研究库：{lab_path}')
-            controller.store.save_settings(settings)
+            try:
+                store.save_settings(settings, save_term_run_limit=save_term_run_limit,
+                                    expected_member_id=active_id)
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from None
             if settings.zone_id and any(key in payload for key in
                                         ('zone_direction', 'zone_anchor_m', 'zone_lane_m')):
-                controller.store.save_zone_tuning(settings.zone_id, {
+                store.save_zone_tuning(settings.zone_id, {
                     'direction': payload.get('zone_direction', 'auto'),
                     'anchor_m': payload.get('zone_anchor_m', 0),
                     'lane_m': payload.get('zone_lane_m', 0)})
@@ -1341,7 +1377,12 @@ class DesktopBridge(LocationProbe):
         if controller is None:
             return
         try:
-            controller.poll()
+            # 排程启动和保存设置、切换成员共用一把锁，已完成的事件照常取出。
+            if self._mutation.acquire(blocking=False):
+                try:
+                    controller.poll()
+                finally:
+                    self._mutation.release()
             events = controller.drain()
         except Exception:  # noqa: BLE001
             return
@@ -1596,7 +1637,10 @@ class PreviewBridge(LocationProbe):
             elif elapsed >= 2:
                 update.update(state='verifying', progress=100, downloaded_bytes=update['total_bytes'],
                               message='正在演示签名校验，未运行系统校验程序。')
-        return dict(copy.deepcopy(self._data),
+        data = copy.deepcopy(self._data)
+        lp = data['lptiyu']
+        lp['settings']['term_run_limit'] = _active_lptiyu_member(lp['members']).get('term_run_limit')
+        return dict(data,
                     location=self._location_snapshot(self._data['dorm']['settings']['location_source']),
                     location_diagnostic=self._real_location)
 
@@ -1688,7 +1732,16 @@ class PreviewBridge(LocationProbe):
             elif action == 'lptiyu_save':
                 lp = self._data['lptiyu']
                 previous = lptiyu_settings(lp['settings'])
-                lp['settings'] = dataclasses.asdict(lptiyu_settings(payload, previous=previous))
+                member = _active_lptiyu_member(lp['members'])
+                try:
+                    _check_lptiyu_limit_member(payload, member.get('id', ''))
+                    settings = lptiyu_settings(payload, previous=previous)
+                except ValueError as exc:
+                    return {'ok': False, 'message': str(exc)}
+                lp['settings'] = dataclasses.asdict(settings)
+                term_limit = lp['settings'].pop('term_run_limit')
+                if member and 'term_run_limit' in payload:
+                    member['term_run_limit'] = term_limit
                 lp['schedule'] = '自动跑步：' + ('开启（演示）' if lp['settings']['enabled'] else '关闭')
                 lp['renewal']['auto'] = bool(lp['settings']['auto_renew'])
                 lp['renewal']['interval_min'] = int(lp['settings']['renew_interval_min'])

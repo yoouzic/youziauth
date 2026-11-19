@@ -1,8 +1,9 @@
 """乐跑模块的本地存储: 设置、身份、凭证(DPAPI 加密)、状态与历史。
 
 多成员模型(2026-11-13 起): 成员级数据(身份/凭证/状态/台账)一份一份挂在
-`members/<id>/` 下, 登记表在 `members.json`(lptiyu_members.py); settings、
-跑区几何、样本、采集组件是本机共享的, 留在根目录。所有成员级读写在没有
+`members/<id>/` 下, 登记表在 `members.json`(lptiyu_members.py); 跑区几何、
+样本、采集组件和共享设置留在根目录。每个成员的学期跑步上限按 id 和共享设置
+一起保存在 settings.json。其他成员级读写在没有
 活动成员时降级为空值, 写入时自动建「成员 1」—— 老的单槽位调用方(以及
 既有测试)由此保持原样。
 
@@ -25,12 +26,15 @@ import json
 import os
 import re
 import shutil
+import threading
 from pathlib import Path
 
 from windows_credentials import CredentialStore, DpapiProtector, atomic_write_bytes
 from lptiyu_members import MAX_MEMBERS, MemberError, MemberRegistry
 
 HISTORY_MAX_LINES = 99
+_MEMBER_TERM_LIMITS = 'member_term_run_limits'
+_SETTINGS_LOCK = threading.Lock()
 
 # 自动命名的成员名(成员 1…)。身份里出现真名时, 这类名字让位给真名。
 _AUTO_MEMBER_NAME = re.compile(r'成员 \d+$')
@@ -43,6 +47,11 @@ def now():
 def parse_time(text):
     hour, minute = str(text).strip().split(':')
     return dt.time(int(hour), int(minute))
+
+
+def _validate_term_run_limit(value):
+    if value is not None and (type(value) is not int or value < 1):
+        raise ValueError('学期跑步上限须为正整数，留空表示不限。')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,6 +75,7 @@ class Settings:
     renew_lead_min: int = 45     # 跑步前多久做一次「今天必过」的保活
     renew_interval_min: int = 180  # 低频探活间隔(token 没有绝对过期时间, 只需确认还活着)
     run_all_members: bool = True   # 多成员自动跑步: 到点后把每个已添加的账号都跑一遍
+    term_run_limit: int | None = None
 
     def pace_range(self):
         """有效的配速区间 (lo, hi) 秒/公里; (0, 0) = 交给模板。
@@ -110,6 +120,7 @@ class Settings:
             raise ValueError('采点精度无效：需在 5–40 米之间')
         if not (1 <= self.max_per_day <= 3):
             raise ValueError('每日次数无效：需在 1–3 次之间')
+        _validate_term_run_limit(self.term_run_limit)
         try:
             lead = int(self.renew_lead_min)
             interval = int(self.renew_interval_min)
@@ -177,13 +188,12 @@ class Store:
         create=True 且登记表还没有成员时自动建「成员 1」; 读路径不建,
         没有活动成员时返回 None, 各读方法降级成空值。
         """
-        registry = self._registry()
-        registry.ensure()
-        active = registry.active_id()
+        active = self.active_member_id()
         if active:
-            return registry.member_dir(active)
+            return self._registry().member_dir(active)
         if not create:
             return None
+        registry = self._registry()
         return registry.member_dir(registry.add('').id)
 
     def _m_read(self, name, default):
@@ -196,11 +206,57 @@ class Store:
         self._write_path(self._member_dir(create=True) / name, data)
 
     # ------------------------------------------------------------- 设置与身份
-    def settings(self):
-        return Settings(**self._read('settings.json', {})).validate()
+    def _read_settings_document(self, *, repair_root=False):
+        try:
+            payload = self._read('settings.json', {})
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            if not repair_root:
+                raise
+            payload = None
+        if not isinstance(payload, dict):
+            if repair_root:
+                return {}, {}
+            raise ValueError('乐跑设置格式有误。')
+        limits = payload.pop(_MEMBER_TERM_LIMITS, {})
+        if not isinstance(limits, dict):
+            raise ValueError('成员学期跑步上限格式有误。')
+        _validate_term_run_limit(payload.get('term_run_limit'))
+        for limit in limits.values():
+            _validate_term_run_limit(limit)
+        return payload, limits
 
-    def save_settings(self, settings):
-        self._write('settings.json', dataclasses.asdict(settings.validate()))
+    def _write_settings_document(self, payload, limits):
+        if limits:
+            payload[_MEMBER_TERM_LIMITS] = limits
+        self._write('settings.json', payload)
+
+    def settings(self):
+        payload, limits = self._read_settings_document()
+        legacy_limit = payload.get('term_run_limit')
+        if limits or legacy_limit is not None:
+            active = self.active_member_id()
+            payload['term_run_limit'] = limits.get(active, legacy_limit) if active else None
+        return Settings(**payload).validate()
+
+    def save_settings(self, settings, *, save_term_run_limit=True, expected_member_id=None):
+        """保存共享设置，可同时更新活动成员的上限。旧全局上限作为默认值保留。"""
+        payload = dataclasses.asdict(settings.validate())
+        with _SETTINGS_LOCK:
+            previous, limits = self._read_settings_document(repair_root=True)
+            legacy_limit = previous.get('term_run_limit')
+            if save_term_run_limit and (limits or legacy_limit is not None
+                                        or settings.term_run_limit is not None
+                                        or expected_member_id is not None):
+                active = self.active_member_id()
+                if expected_member_id is not None and expected_member_id != active:
+                    raise ValueError('乐跑成员已切换，请重新保存学期跑步上限。')
+                if active:
+                    # None 是成员显式设置的「不限」，也覆盖旧全局上限。
+                    limits[active] = settings.term_run_limit
+                elif settings.term_run_limit is not None:
+                    raise ValueError('请先添加乐跑成员，再设置学期跑步上限。')
+            payload['term_run_limit'] = legacy_limit
+            self._write_settings_document(payload, limits)
 
     def save_zone_selection(self, zone_id, zone_name=''):
         """把「当前跑区」写进设置。返回是否真的变了。
@@ -223,7 +279,7 @@ class Store:
         updated = dataclasses.replace(
             current, zone_id=zone_id,
             zone_name=name or current.zone_name)
-        self.save_settings(updated)
+        self.save_settings(updated, save_term_run_limit=False)
         return True
 
     def identity(self):
@@ -340,10 +396,12 @@ class Store:
         atomic_write_bytes(path,
                            ('\n'.join(lines[-HISTORY_MAX_LINES:]) + '\n').encode('utf-8'))
 
-    def record(self, state, message, detail='', at=None):
+    def record(self, state, message, detail='', at=None, *, term_run_limit=None):
         stamp = (at or now()).isoformat(timespec='seconds')
-        self._m_write('status.json', {'state': state, 'message': message,
-                                      'detail': detail, 'at': stamp})
+        status = {'state': state, 'message': message, 'detail': detail, 'at': stamp}
+        if term_run_limit is not None:
+            status['term_run_limit'] = term_run_limit
+        self._m_write('status.json', status)
         line = f'{stamp} [{state}] {message}' + (f' · {detail}' if detail else '')
         self._append_history(line)
 
@@ -868,17 +926,23 @@ class Store:
             return [], '本机凭证已是最新'
         settings = self.settings()
         if not settings.lab_dir:
-            self.save_settings(dataclasses.replace(settings, lab_dir=lab))
+            self.save_settings(dataclasses.replace(settings, lab_dir=lab),
+                               save_term_run_limit=False)
         return changes, '已同步研究库的最新凭证'
 
     # ------------------------------------------------------------- 成员管理
+    def active_member_id(self):
+        return self._registry().active_id()
+
     def members_status(self):
-        """成员清单(给快照): 只回答「是谁、有没有凭证」, 不解密任何内容。"""
+        """成员清单与有效学期上限。只检查凭证是否存在，不解密。"""
         try:
             registry = self._registry()
             registry.ensure()
         except MemberError as exc:
             return {'error': str(exc), 'max': MAX_MEMBERS, 'active': '', 'items': []}
+        payload, limits = self._read_settings_document()
+        legacy_limit = payload.get('term_run_limit')
         active = registry.active_id()
         items = []
         for member in registry.members():
@@ -892,6 +956,7 @@ class Store:
                           'student_num': str(identity.get('student_num') or ''),
                           'uid': str(identity.get('uid') or ''),
                           'active': member.id == active,
+                          'term_run_limit': limits.get(member.id, legacy_limit),
                           # 给界面看「这个人今天跑没跑过」: 多成员自动跑步时一眼
                           # 分辨谁还轮着、谁已经完成。
                           'signed_today': (isinstance(signed, dict)
@@ -904,14 +969,24 @@ class Store:
         return {'error': '', 'max': MAX_MEMBERS, 'active': active, 'items': items}
 
     def switch_member(self, member_id):
-        return self._registry().activate(member_id)
+        with _SETTINGS_LOCK:
+            return self._registry().activate(member_id)
 
     def rename_member(self, member_id, name):
         return self._registry().rename(member_id, name)
 
     def remove_member(self, member_id):
         """摘掉成员并删除其全部本机数据(退出账号的语义)。返回 (member, leftover)。"""
-        member = self._registry().remove(member_id)
+        with _SETTINGS_LOCK:
+            member = self._registry().remove(member_id)
+            try:
+                payload, limits = self._read_settings_document()
+                if member.id in limits:
+                    del limits[member.id]
+                    self._write_settings_document(payload, limits)
+            except (OSError, ValueError):
+                # 登记表已移除该成员；设置问题不应拦住删除凭证。
+                pass
         directory = self._registry().member_dir(member.id)
         try:
             shutil.rmtree(directory)

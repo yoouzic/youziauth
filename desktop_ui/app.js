@@ -10,6 +10,7 @@ let api;
 let mapState = null;
 let mapDrag = null, mapSuppressPick = false, mapNameFor = null, accountNameFor = null, memberNameFor = null;
 let lpMemberShown = null, lpMemberFlip = false;   // 主卡成员标记: 换人时闪一下
+let termLimitDraft = null;
 const MAP_TILE = 256, MAP_MIN_ZOOM = 13, MAP_MAX_ZOOM = 19;
 const MAP_TILE_TRIES = 3, MAP_TILE_BACKOFF = [1200, 4000];  // ms before each retry of one tile
 const MAP_TILE_STALL = 8000;   // ms with nothing drawn before the next provider takes the frame
@@ -343,12 +344,27 @@ $('date-label').textContent = new Intl.DateTimeFormat('zh-CN',{month:'long',day:
 
 function badge(id, text, tone='') {$(id).textContent=text;$(id).className='badge'+(tone ? ' '+tone : '');}
 function sourceSummary(simulation) {return simulation?'模拟定位':'真实定位（Windows / Wi-Fi）';}
-function markDirty(kind, value) {
-  dirty[kind] = value;
+function renderSaveState(kind) {
+  const value=dirty[kind]||(kind==='lptiyu'&&termLimitDraft!==null);
   $(kind+'-save-state').textContent = value ? '有未保存的修改' : '设置已同步';
   $(kind+'-save-state').classList.toggle('dirty',value);
 }
-['network','dorm','lptiyu'].forEach(kind=>$(kind+'-form').addEventListener('input',()=>{revisions[kind]++;markDirty(kind,true);}));
+function markDirty(kind, value) {
+  dirty[kind] = value;
+  renderSaveState(kind);
+}
+['network','dorm','lptiyu'].forEach(kind=>$(kind+'-form').addEventListener('input',event=>{
+  if(event?.target?.id==='lp-term-run-limit'){
+    const member=activeMember();
+    if(member&&!event.target.disabled){
+      termLimitDraft={memberId:member.id};
+      renderSaveState(kind);
+    }
+    return;
+  }
+  revisions[kind]++;
+  markDirty(kind,true);
+}));
 
 function savedLocationSource(){return state?.dorm.settings.location_source||'windows';}
 function requireSavedLocationSource(){
@@ -653,6 +669,7 @@ if(zoneSelect)zoneSelect.addEventListener('change',async ()=>{
 });
 $('lptiyu-form').addEventListener('submit',async event=>{
   event.preventDefault();
+  if(state.lptiyu?.busy){notify('请等待当前跑步操作完成后再保存设置。',true);return;}
   const paceLo=parsePace($('lp-pace-lo').value),paceHi=parsePace($('lp-pace-hi').value);
   if(Number.isNaN(paceLo)||Number.isNaN(paceHi)){
     notify('配速请写成 4\'05" 这样（分钟\'秒"），留空为自动。',true);return;}
@@ -665,9 +682,21 @@ $('lptiyu-form').addEventListener('submit',async event=>{
     zone_id:$('lp-zone-select').value,
     zone_name:(state.lptiyu?.zones||[]).find(z=>z.id===$('lp-zone-select').value)?.name||''};
   if(payload.dist_lo>=payload.dist_hi){notify('距离下限要小于上限，暂不支持倒序范围。',true);return;}
+  const member=activeMember(),draft=termLimitDraft;
+  if(member){
+    if(!requireLptiyuSync())return;
+    const limitText=$('lp-term-run-limit').value.trim();
+    const termLimit=limitText?Number(limitText):null;
+    if(termLimit!==null&&(!Number.isSafeInteger(termLimit)||termLimit<1)){
+      notify('学期跑步上限须为正整数，留空表示不限。',true);return;}
+    payload.member_id=member.id;
+    payload.term_run_limit=termLimit;
+  }
   const revision=revisions.lptiyu;
   if(await act('lptiyu_save',payload)){
+    if(draft===termLimitDraft)termLimitDraft=null;
     if(revision===revisions.lptiyu)markDirty('lptiyu',false);
+    else renderSaveState('lptiyu');
     render();
   }
 });
@@ -800,6 +829,7 @@ function requireAccountSync(){
    老快照可能没有 lptiyu 区块，整页按「尚未开始」呈现，其余功能照常。 */
 const LP_NAMES={signed:'今日已完成',running:'正在跑步',checked:'验证通过',idle:'看看今天的安排',
   synced:'凭证已同步',need_token:'等待凭证',quota:'今日已完成',uncertain:'结果待确认',
+  term_quota:'已达学期上限',term_count_unavailable:'次数读取失败',
   waiting:'等待时段',error:'需要检查',cancelled:'操作已取消',
   renewed:'凭证已续期',token_ok:'凭证可用',cooldown:'稍后再试',zones:'跑区已同步'};
 /* 续期台账只回答「何时试过、下次何时、结果如何」：续期是后台维护动作，
@@ -829,7 +859,7 @@ function renewalText(lp,rn){
 }
 function renderRunStatus(lp,s){
   const label=lp.busy?'正在处理…':(LP_NAMES[lp.state]||'请查看任务状态');
-  const tone=lp.state==='signed'?'success':['need_token','error','uncertain','quota'].includes(lp.state)?'warning':'';
+  const tone=lp.state==='signed'?'success':['need_token','error','uncertain','quota','term_count_unavailable'].includes(lp.state)?'warning':'';
   const member=activeMember();
   const who=(member&&member.name)||(lp.identity&&lp.identity.name)||'';
   badge('lp-badge',label,tone);badge('lp-task-badge',label,tone);
@@ -856,7 +886,22 @@ function renderRunStatus(lp,s){
   $('lp-cancel').disabled=cancelPending.has('lptiyu_cancel')||!lp.busy;
   $('lp-dry').disabled=pending||lp.busy;
 }
+function renderTermLimit(lp,s){
+  const member=activeMember(),input=$('lp-term-run-limit');
+  input.disabled=!member||pending||syncedEpoch!==epoch||lp.busy||lp.available===false;
+  if(termLimitDraft&&termLimitDraft.memberId!==member?.id){
+    // 轮跑会暂时切换活动成员，等本轮结束后再决定是否清除草稿。
+    if(lp.busy)return;
+    termLimitDraft=null;
+    renderSaveState('lptiyu');
+  }
+  if(!termLimitDraft)input.value=member?String(s.term_run_limit??''):'';
+  $('lp-term-run-limit-hint').textContent=member
+    ?`「${member.name}」的有效次数达到上限后，跳过本次跑步。`
+    :'添加或导入成员后可设置。';
+}
 function renderRunSettings(lp,s){
+  renderTermLimit(lp,s);
   if(dirty.lptiyu)return;
   $('lp-enabled').checked=!!s.enabled;
   $('lp-run-all').checked=s.run_all_members!==false;
@@ -1183,7 +1228,7 @@ $('lp-member-rename').onclick=async()=>{
 $('lp-member-delete').onclick=()=>{
   const active=activeMember();
   if(!active||!requireLptiyuSync())return;
-  confirmAction(`删除成员「${active.name}」？`,'会同时删除这个成员在本机的身份与跑步凭证（等于退出账号）；无法撤销。',async()=>{
+  confirmAction(`删除成员「${active.name}」？`,'会同时删除这个成员在本机的身份、跑步凭证和个人跑步上限，无法撤销。',async()=>{
     await act('lptiyu_member_delete',{id:active.id,confirmed:true});
     render();
   });

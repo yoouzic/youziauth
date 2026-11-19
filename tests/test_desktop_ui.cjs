@@ -45,7 +45,7 @@ function harness(source='windows',extras={}){
       set innerHTML(value){assert.fail('Backend text must never be rendered as HTML: '+value);},
       classList:{toggle(name,on){if(on)classes.add(name);else classes.delete(name);},contains(name){return classes.has(name);}},
       listeners:{},addEventListener(event,fn){this.listeners[event]=fn;},
-      fire(event){this.listeners[event]?.({preventDefault(){}});},
+       fire(event,target=this){this.listeners[event]?.({target,preventDefault(){}});},
       // 运行记录的提示胶囊按这个矩形贴到日志框下缘；桩里给个固定值就够断言位置被算过。
       getBoundingClientRect(){return {bottom:700,top:200,left:0,right:600,width:600,height:500};},
       setAttribute(name,value){this.attributes[name]=value;},removeAttribute(name){delete this.attributes[name];},
@@ -97,12 +97,18 @@ function harness(source='windows',extras={}){
   const api={snapshot:async()=>structuredClone(data),dispatch:async(action,payload)=>{
     calls.push({action,payload});
     if(action==='dorm_save')Object.assign(data.dorm.settings,payload);
-    if(action==='lptiyu_save')Object.assign(data.lptiyu.settings,payload);
+    if(action==='lptiyu_save'){
+      const {member_id,...settings}=payload;
+      Object.assign(data.lptiyu.settings,settings);
+      const member=data.lptiyu.members?.items.find(item=>item.id===member_id);
+      if(member)member.term_run_limit=settings.term_run_limit;
+    }
     if(action==='lptiyu_member_switch'){
       const items=(data.lptiyu.members?.items||[]).map(item=>({...item,active:item.id===payload.id}));
       const picked=items.find(item=>item.active);
       data.lptiyu.members={...(data.lptiyu.members||{max:10,items:[]}),active:payload.id,items};
       data.lptiyu.identity={name:picked?.name||'',student_num:picked?.student_num||''};
+      data.lptiyu.settings.term_run_limit=picked?.term_run_limit??null;
       return {ok:true,message:`已切换到「${picked?.name||payload.id}」`};
     }
     if(action==='location_source_save')data.dorm.settings.location_source=payload.location_source;
@@ -2128,6 +2134,12 @@ async function lptiyuPage(lptiyu){
   return h;
 }
 
+function lptiyuTermMembers(){
+  return {max:10,active:'m1',error:'',items:[
+    {id:'m1',name:'张三',active:true,has_token:true,term_run_limit:28},
+    {id:'m2',name:'李四',active:false,has_token:true,term_run_limit:12}]};
+}
+
 test('a snapshot without the lptiyu layer still renders every page',async()=>{
   const h=harness('windows',{lptiyu:false});
   h.navigate('lptiyu');
@@ -2224,7 +2236,8 @@ test('lptiyu without a credential shows the official first-use guide',async()=>{
 });
 
 test('lptiyu settings sync from the snapshot and save through the bridge',async()=>{
-  const h=await lptiyuPage({settings:{enabled:true,run_time:'06:30',dist_lo:2.9,dist_hi:3.1,
+  const h=await lptiyuPage({members:lptiyuTermMembers(),settings:{enabled:true,run_time:'06:30',dist_lo:2.9,dist_hi:3.1,
+    term_run_limit:28,
     pace_lo:245,pace_hi:280,anchor_max_m:20,max_per_day:1,time_lo:'06:00',time_hi:'23:00',
     auto_renew:true,renew_lead_min:45,renew_interval_min:180},pace_range:{lo:245,hi:280}});
   assert.equal(h.el('lp-enabled').checked,true);
@@ -2236,13 +2249,117 @@ test('lptiyu settings sync from the snapshot and save through the bridge',async(
   assert.equal(h.el('lp-pace-detail').textContent,"4'05\"–4'40\"",'任务卡里的目标配速也跟着走');
   assert.equal(h.el('lp-auto-summary').textContent,'06:30 自动');
   h.el('lp-dist-hi').value='3.2';
+  assert.equal(String(h.el('lp-term-run-limit').value),'28');
+  h.el('lp-term-run-limit').value='30';
   await h.el('lptiyu-form').fire('submit');
   await new Promise(resolve=>setTimeout(resolve,0));
   assert.equal(h.el('lp-run-all').checked,true,'老快照没有该字段时默认开启跑完全部成员');
   assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1))),{action:'lptiyu_save',payload:{enabled:true,run_all_members:true,run_time:'06:30',
-    dist_lo:2.9,dist_hi:3.2,pace_lo:245,pace_hi:280,anchor_max_m:20,auto_renew:true,
+    member_id:'m1',term_run_limit:30,dist_lo:2.9,dist_hi:3.2,pace_lo:245,pace_hi:280,anchor_max_m:20,auto_renew:true,
     lab_dir:'',zone_id:'',zone_name:''}},
     '合法修改按表单内容发往后台');
+});
+
+test('lptiyu blank term limit clears the cap and invalid values never save',async()=>{
+  const h=await lptiyuPage({members:lptiyuTermMembers()});
+  const input=h.el('lp-term-run-limit');
+  assert.equal(input.value,'');
+  input.value='2.5';
+  await h.el('lptiyu-form').fire('submit');
+  assert.equal(h.calls.some(call=>call.action==='lptiyu_save'),false);
+  input.value='';
+  await h.el('lptiyu-form').fire('submit');
+  assert.equal(h.calls.at(-1).payload.term_run_limit,null);
+  assert.equal(h.calls.at(-1).payload.member_id,'m1');
+});
+
+test('lptiyu switches only the term limit draft and saves each member independently',async()=>{
+  const h=await lptiyuPage({members:lptiyuTermMembers(),settings:{term_run_limit:28}});
+  const form=h.el('lptiyu-form'),limit=h.el('lp-term-run-limit'),select=h.el('lp-member');
+  const runTime=h.el('lp-run-time');
+  runTime.value='07:00';form.fire('input',runTime);
+  limit.value='30';form.fire('input',limit);
+
+  select.value='m2';select.fire('change');
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(limit.value,'12');
+  assert.match(h.el('lp-term-run-limit-hint').textContent,/李四/);
+  assert.equal(runTime.value,'07:00');
+  assert.equal(h.el('lptiyu-save-state').textContent,'有未保存的修改');
+
+  limit.value='14';form.fire('input',limit);
+  form.fire('submit');
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(h.calls.at(-1).payload.member_id,'m2');
+  assert.equal(h.calls.at(-1).payload.term_run_limit,14);
+  assert.equal(h.el('lptiyu-save-state').textContent,'设置已同步');
+
+  select.value='m1';select.fire('change');
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(limit.value,'28');
+});
+
+test('lptiyu shared settings can still save without a member',async()=>{
+  const h=await lptiyuPage({settings:{term_run_limit:28}});
+  const limit=h.el('lp-term-run-limit');
+  assert.equal(limit.disabled,true);
+  assert.equal(limit.value,'');
+  h.el('lptiyu-form').fire('submit');
+  assert.equal(h.calls.at(-1).action,'lptiyu_save');
+  assert.equal(h.calls.at(-1).payload.member_id,undefined);
+  assert.equal(h.calls.at(-1).payload.term_run_limit,undefined);
+});
+
+test('lptiyu protects the member draft during a temporary background member swap',async()=>{
+  const h=await lptiyuPage({members:lptiyuTermMembers(),settings:{term_run_limit:28}});
+  const form=h.el('lptiyu-form'),limit=h.el('lp-term-run-limit');
+  limit.value='30';form.fire('input',limit);
+
+  const {lptiyu:lp}=h.data;
+  lp.busy=true;
+  lp.members.active='m2';lp.members.items[0].active=false;lp.members.items[1].active=true;
+  lp.settings.term_run_limit=12;
+  await h.refresh();
+  assert.equal(limit.disabled,true);
+  form.fire('submit');
+  assert.equal(h.calls.some(call=>call.action==='lptiyu_save'),false);
+
+  lp.busy=false;
+  lp.members.active='m1';lp.members.items[0].active=true;lp.members.items[1].active=false;
+  lp.settings.term_run_limit=28;
+  await h.refresh();
+  assert.equal(limit.disabled,false);
+  assert.equal(limit.value,'30');
+});
+
+test('lptiyu delayed save keeps the original member id when the active member changes',async()=>{
+  const h=await lptiyuPage({members:lptiyuTermMembers(),settings:{term_run_limit:28}});
+  const form=h.el('lptiyu-form'),limit=h.el('lp-term-run-limit');
+  const dispatch=h.api.dispatch;
+  let finishSave;
+  h.api.dispatch=async(action,payload)=>{
+    const result=await dispatch(action,payload);
+    await new Promise(resolve=>{finishSave=resolve;});
+    return result;
+  };
+  limit.value='30';form.fire('input',limit);
+  form.fire('submit');
+  await new Promise(resolve=>setTimeout(resolve,0));
+  const saved=h.calls.at(-1).payload;
+
+  await dispatch('lptiyu_member_switch',{id:'m2'});
+  await h.refresh();
+  finishSave();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(saved.member_id,'m1');
+  assert.equal(h.data.lptiyu.members.items[0].term_run_limit,30);
+  assert.equal(limit.value,'12');
+});
+
+test('lptiyu shows a distinct status when the semester run limit is reached',async()=>{
+  const h=await lptiyuPage({state:'term_quota',message:'本学期已有效完成 28 次，本次跳过'});
+  assert.equal(h.el('lp-task-badge').textContent,'已达学期上限');
+  assert.match(h.el('lp-message').textContent,/28 次/);
 });
 
 test('lptiyu displays the saved zone as a read-only summary',async()=>{

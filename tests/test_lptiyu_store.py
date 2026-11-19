@@ -1,4 +1,5 @@
 """乐跑存储层: 设置、凭证加密、状态历史、每日计数、研究库同步。"""
+import dataclasses
 import datetime as dt
 import json
 import tempfile
@@ -6,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from lptiyu_members import MemberRegistry
 from lptiyu_store import Settings, Store
 
 
@@ -75,6 +77,127 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(loaded.dist_hi, 3.0)
 
 
+class MemberTermLimitTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        self.settings_path = self.root / 'settings.json'
+        self.registry = MemberRegistry(self.root / 'members')
+        self.store = Store(self.root)
+
+    def test_keeping_distinct_limits_does_not_split_shared_settings(self):
+        first = self.registry.add('成员甲')
+        second = self.registry.add('成员乙')
+        self.store.save_settings(Settings(term_run_limit=28))
+
+        self.store.switch_member(second.id)
+        self.assertIsNone(self.store.settings().term_run_limit)
+        self.store.save_settings(Settings(term_run_limit=21, run_time='07:00'))
+
+        reopened = Store(self.root)
+        self.assertEqual(reopened.settings().term_run_limit, 21)
+        reopened.switch_member(first.id)
+        self.assertEqual(reopened.settings().term_run_limit, 28)
+        self.assertEqual(reopened.settings().run_time, '07:00')
+        self.assertEqual({item['id']: item['term_run_limit']
+                          for item in reopened.members_status()['items']},
+                         {first.id: 28, second.id: 21})
+
+    def test_explicit_blank_overrides_the_legacy_limit_for_one_member(self):
+        self.settings_path.write_text(json.dumps({'term_run_limit': 28}), encoding='utf-8')
+        first = self.registry.add('成员甲')
+        second = self.registry.add('成员乙')
+        self.assertEqual(self.store.settings().term_run_limit, 28)
+        self.store.save_settings(dataclasses.replace(self.store.settings(), term_run_limit=None))
+
+        self.assertIsNone(self.store.settings().term_run_limit)
+        self.store.switch_member(second.id)
+        self.assertEqual(self.store.settings().term_run_limit, 28)
+        self.assertEqual({item['id']: item['term_run_limit']
+                          for item in self.store.members_status()['items']},
+                         {first.id: None, second.id: 28})
+
+    def test_saving_shared_settings_without_members_preserves_legacy_limit(self):
+        self.settings_path.write_text(json.dumps({'term_run_limit': 28}), encoding='utf-8')
+        self.assertIsNone(self.store.settings().term_run_limit)
+        self.store.save_settings(Settings(run_time='07:00'))
+
+        self.registry.add('成员甲')
+        self.assertEqual(self.store.settings().term_run_limit, 28)
+        self.assertEqual(self.store.settings().run_time, '07:00')
+
+    def test_saving_valid_settings_recovers_an_unreadable_config_document(self):
+        self.registry.add('成员甲')
+        for damaged in (b'{bad', b'null', b'[]', b'\xff'):
+            with self.subTest(damaged=damaged):
+                self.settings_path.write_bytes(damaged)
+                self.store.save_settings(Settings(run_time='07:00', term_run_limit=28))
+
+                self.assertEqual(self.store.settings().run_time, '07:00')
+                self.assertEqual(self.store.settings().term_run_limit, 28)
+
+    def test_a_malformed_limit_cannot_cause_save_to_erase_valid_sibling_limits(self):
+        first = self.registry.add('成员甲')
+        second = self.registry.add('成员乙')
+        original = {'member_term_run_limits': {first.id: 28, second.id: 'invalid'}}
+        self.settings_path.write_text(json.dumps(original), encoding='utf-8')
+
+        with self.assertRaisesRegex(ValueError, '学期跑步上限'):
+            self.store.save_settings(Settings(run_time='07:00'), save_term_run_limit=False)
+
+        self.assertEqual(json.loads(self.settings_path.read_text(encoding='utf-8')), original)
+
+    def test_cannot_assign_a_limit_without_a_member(self):
+        with self.assertRaisesRegex(ValueError, '乐跑成员'):
+            self.store.save_settings(Settings(term_run_limit=28))
+        self.assertFalse(self.settings_path.exists())
+
+    def test_shared_only_save_cannot_write_another_members_limit(self):
+        first = self.registry.add('成员甲')
+        self.store.save_settings(Settings(term_run_limit=28))
+        old_settings = self.store.settings()
+        second = self.registry.add('成员乙')
+        self.store.switch_member(second.id)
+        self.store.save_settings(dataclasses.replace(old_settings, run_time='07:00'),
+                                 save_term_run_limit=False)
+
+        self.assertIsNone(self.store.settings().term_run_limit)
+        self.assertEqual(self.store.settings().run_time, '07:00')
+        self.assertEqual(self.store.members_status()['items'][0]['id'], first.id)
+        self.assertEqual(self.store.members_status()['items'][0]['term_run_limit'], 28)
+
+    def test_saved_limit_cannot_land_on_a_different_active_member(self):
+        first = self.registry.add('成员甲')
+        second = self.registry.add('成员乙')
+        self.store.save_settings(Settings(term_run_limit=28), expected_member_id=first.id)
+        self.store.switch_member(second.id)
+
+        with self.assertRaisesRegex(ValueError, '成员已切换'):
+            self.store.save_settings(Settings(term_run_limit=21, run_time='07:00'),
+                                     expected_member_id=first.id)
+
+        self.assertIsNone(self.store.settings().term_run_limit)
+        self.assertEqual(self.store.settings().run_time, '06:30')
+        self.store.switch_member(first.id)
+        self.assertEqual(self.store.settings().term_run_limit, 28)
+
+    def test_removing_a_member_prunes_only_their_override(self):
+        first = self.registry.add('成员甲')
+        second = self.registry.add('成员乙')
+        self.store.save_settings(Settings(term_run_limit=28))
+        self.store.switch_member(second.id)
+        self.store.save_settings(Settings(term_run_limit=21, run_time='07:00'))
+
+        member, leftover = self.store.remove_member(second.id)
+
+        self.assertEqual(member.id, second.id)
+        self.assertFalse(leftover)
+        saved = json.loads(self.settings_path.read_text(encoding='utf-8'))
+        self.assertEqual(saved['member_term_run_limits'], {first.id: 28})
+        self.assertEqual(self.store.settings().run_time, '07:00')
+
+
 class TokenTests(unittest.TestCase):
     def test_token_roundtrip_is_encrypted_at_rest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -119,6 +242,18 @@ class StatusTests(unittest.TestCase):
             store.record('signed', '今日跑步已完成', '第二运动场')
             self.assertEqual(store.status()['state'], 'signed')
             self.assertIn('[signed] 今日跑步已完成 · 第二运动场', store.history())
+
+    def test_record_can_bind_a_term_outcome_to_the_limit_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            at = dt.datetime(2026, 11, 19, 7)
+            store.record('term_quota', '达到学期上限', at=at, term_run_limit=28)
+
+            self.assertEqual(store.status()['term_run_limit'], 28)
+            self.assertEqual(store.history(), '2026-11-19T07:00:00 [term_quota] 达到学期上限\n')
+
+            store.record('checked', '验证成功', at=at)
+            self.assertNotIn('term_run_limit', store.status())
 
     def test_history_is_capped(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -616,6 +751,7 @@ class MemberStoreTests(unittest.TestCase):
                             student_num='2025009', card_id='2025009')
             second = store.file_captured_credential(stranger)
             store.switch_member(second['id'])
+            self.assertEqual(store.active_member_id(), second['id'])
             self.assertEqual(store.token(), 'STRANGER')
             self.assertEqual(store.identity()['student_num'], '2025009')
             store.switch_member(first['id'])

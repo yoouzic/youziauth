@@ -2,7 +2,7 @@
 
 时序对齐真机:
   0 真门 getTermList(假阳性源 getSchoolInfo 弃用为门) + 学校信息
-  → 1 beforeRunV260(跑区/打卡点/时间规则) [可选 setRunZone]
+  → 1 beforeRunV260(跑区/打卡点/时间规则) [可选学期上限检查，再 setRunZone]
   → 2 当日额度(term_records 两页)
   → 3 服务器时间 → 4 轨迹生成(重试保证覆盖+窗口) → 5 时间轴/计步
   → 6 record_file 命名 → [dry-run 到此为止, 零写入]
@@ -29,6 +29,9 @@ from .client import ApiClient, ApiError
 from .spec import R_AUTOCORRECT, R_NEGATIVE_HINTS
 
 SUBMITTED_REVIEW_CANCELLED = 6
+TERM_QUOTA_REACHED = 7
+TERM_COUNT_UNAVAILABLE = 8
+_MAX_TERM_RECORD_PAGES = 100
 
 
 def _positive_reason(reason: str) -> bool:
@@ -160,10 +163,17 @@ class DailyFlow:
                      f"方向={self.zone_profile.get('direction')} "
                      f"跑道={self.zone_profile.get('lane_m')}m "
                      f"贴点={self.zone_profile.get('anchor_m')}m")
+        total_num = str(cfg.get("total_num", "")).strip()
+        try:
+            # 真机 beforeRun 的 total_num 是本学期有效次数；term_num 是目标次数。
+            term_count = int(total_num) if total_num.isdecimal() else None
+        except ValueError:
+            term_count = None
         rule = {
             "zone": str(cfg.get("run_zone_id") or ""),
             "zone_name": str(cfg.get("run_zone_name") or ""),
             "term_id": str(cfg.get("term_id") or "0"),
+            "term_count": term_count,
             "pts": pts,
             "min_d": float(rule0.get("min_distance") or 2.0),
             "max_d": float(rule0.get("max_distance") or 10.0),
@@ -207,6 +217,75 @@ class DailyFlow:
         if done >= self.policy["max_per_day"] and submit:
             raise ApiError(3, "当日额度已满, 不提交")
         return done
+
+    @staticmethod
+    def _term_record(record):
+        """学期列表以已确认状态为准，失效记录也可能有里程。"""
+        if not isinstance(record, dict):
+            raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录格式异常")
+        raw_id = record.get("id")
+        record_id = str(raw_id or "").strip()
+        status = str(record.get("record_status")).strip()
+        if type(raw_id) not in (int, str) or not record_id or not status.isdecimal():
+            raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录缺少编号或有效状态")
+        if status != "1":
+            return record_id, False
+
+        reason = record.get("record_failed_reason")
+        try:
+            distance = float(record.get("distance"))
+        except (TypeError, ValueError, OverflowError):
+            raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录里程异常") from None
+        if not math.isfinite(distance) or distance < 0:
+            raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录里程异常")
+        if reason is not None and not isinstance(reason, str):
+            raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录判定格式异常")
+        return record_id, distance > 0 and _positive_reason(reason)
+
+    def _count_term_records(self, client, term_id):
+        records = {}
+        for page in range(1, _MAX_TERM_RECORD_PAGES + 1):
+            self._check_cancelled()
+            try:
+                reply = client.term_records(term_id, page)
+            except (ApiError, OSError) as error:
+                if isinstance(error, ApiError) and error.code in (9, 101):
+                    raise
+                self._check_cancelled()
+                raise ApiError(TERM_COUNT_UNAVAILABLE, f"无法读取学期记录第 {page} 页") from error
+            self._check_cancelled()
+            if not isinstance(reply, dict):
+                raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录列表格式异常")
+            status = str(reply.get("status", ""))
+            if status == "101":
+                raise ApiError(101, "读取学期记录时凭证失效")
+            items = reply.get("list")
+            if status not in ("", "0", "1") or not isinstance(items, list):
+                raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录列表格式异常")
+            if not items:
+                return sum(records.values())
+            previous_size = len(records)
+            for item in items:
+                record_id, valid = self._term_record(item)
+                if records.setdefault(record_id, valid) != valid:
+                    raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录判定在查询中发生变化")
+            if len(records) == previous_size:
+                raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录分页没有返回新记录")
+        raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录分页超出查询范围")
+
+    def _term_quota(self, client, rule, limit):
+        self._check_cancelled()
+        term_id = rule["term_id"]
+        if not term_id.isdecimal() or not term_id.strip("0"):
+            raise ApiError(TERM_COUNT_UNAVAILABLE, "无法确认当前学期")
+        count = rule["term_count"]
+        if count is None:
+            self._report(2, "正在读取本学期有效跑步次数…")
+            count = self._count_term_records(client, term_id)
+        self.log(f"[1b] 本学期已完成 {count} 次 (上限 {limit})")
+        if count >= limit:
+            return {"term_id": term_id, "term_count": count, "term_run_limit": limit}
+        return None
 
     @staticmethod
     def _clamp_pace(dist_km, ideal, pace_lo, pace_hi):
@@ -297,7 +376,8 @@ class DailyFlow:
     # ------------------------------------------------------------ 主入口
     def run(self, submit=False, zone_override=None):  # noqa: C901 —— 线性流水线
         """返回 (summary|None, exit_code)。退出码: 0 成功/受理 | 2 token失效
-        | 3 额度满 | 4 其他失败 | 5 受理但判无效 | 6 已提交、停止等待判定 | 9 中断。"""
+        | 3 当日额度满 | 4 其他失败 | 5 受理但判无效 | 6 已提交、停止等待判定
+        | 7 达到学期上限 | 8 无法确认学期次数 | 9 中断。"""
         submitting = False
         try:
             self._check_cancelled()
@@ -307,15 +387,28 @@ class DailyFlow:
             self._report(2, '正在连接小程序并读取跑区…')
             self._gate(client)
             rule = self._zone_rule(client)
+            initial_term_id = rule["term_id"]
+            term_run_limit = self.policy.get("term_run_limit") if submit else None
+            if term_run_limit is not None:
+                quota = self._term_quota(client, rule, term_run_limit)
+                if quota is not None:
+                    return quota, TERM_QUOTA_REACHED
             if zone_override and zone_override != rule["zone"]:
                 self._check_cancelled()
                 client.set_zone(zone_override)
-                self.log(f"[1b] setRunZone → {zone_override}")
+                self.log(f"[1c] setRunZone → {zone_override}")
                 rule = self._zone_rule(client)
                 if rule["zone"] != zone_override:
                     # 切换被拒时 beforeRun 仍是旧跑区: 拿旧点位冒充新跑区提交必被判无效
                     raise ApiError(4, f"跑区切换未生效: 请求 {zone_override}, "
                                       f"服务器仍在 {rule['zone']}({rule['zone_name']})")
+                if term_run_limit is not None:
+                    if rule["term_id"] != initial_term_id:
+                        raise ApiError(TERM_COUNT_UNAVAILABLE, "切换跑区后学期已变化")
+                    if rule["term_count"] is not None:
+                        quota = self._term_quota(client, rule, term_run_limit)
+                        if quota is not None:
+                            return quota, TERM_QUOTA_REACHED
             self._quota(client, rule["term_id"], submit)
             self._sleep(self.rnd.uniform(0.6, 1.4))
             self._check_cancelled()
@@ -466,9 +559,10 @@ class DailyFlow:
             self.log(f"[FATAL] ApiError({e.code}) {str(e.msg)[:200]}")
             if e.code == 101:
                 self.slot.mark_dead()
-            return None, (9 if e.code == 9 else
-                          (2 if e.code == 101 else
-                           (3 if e.code == 3 else 4)))
+                return None, 2
+            if e.code in (3, TERM_COUNT_UNAVAILABLE, 9):
+                return None, e.code
+            return None, 4
         except OSError as e:
             self.log(f"[FATAL] 业务链不通 {e.__class__.__name__}: {e}")
             if not submitting and self.stop_event.is_set():

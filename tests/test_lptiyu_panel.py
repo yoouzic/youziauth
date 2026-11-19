@@ -15,6 +15,7 @@ from unittest.mock import patch
 import lptiyu_panel
 from lptiyu_panel import LptiyuController, LptiyuError, TokenSlot, MAX_DAILY_AUTO_ATTEMPTS
 from lptiyu.client import ApiError
+from lptiyu.flow import TERM_COUNT_UNAVAILABLE, TERM_QUOTA_REACHED
 from lptiyu_renew import CredentialRenewer, RenewOutcome
 from lptiyu_store import Settings, Store, now
 
@@ -36,6 +37,8 @@ class FakeFlow:
             if submit:
                 self.progress_fn(3, '正在提交跑步成绩…')
                 self.progress_fn(4, '成绩已提交，等待学校判定…')
+        if self.code == TERM_QUOTA_REACHED:
+            return {'term_id': '13103', 'term_count': 28, 'term_run_limit': 28}, self.code
         return (self.summary if self.code in (0, 5) else None), self.code
 
 
@@ -153,6 +156,23 @@ class ExecuteTests(PanelTestCase):
         self.assertIsNone(controller.store.daily().get('run'),
                           '额度满那一拍没有真实提交, 不计入 run')
 
+    def test_term_limit_skips_without_marking_today_completed(self):
+        controller = self.make_controller(code=TERM_QUOTA_REACHED,
+                                          settings=Settings(term_run_limit=28))
+        result = controller._execute(submit=True)
+        self.assertEqual(result['state'], 'term_quota')
+        self.assertIn('28/28', result['message'])
+        self.assertFalse(self.store.is_signed_today())
+        self.assertIsNone(self.store.daily().get('run'))
+
+    def test_unavailable_term_count_explains_why_submission_was_skipped(self):
+        controller = self.make_controller(code=TERM_COUNT_UNAVAILABLE,
+                                          settings=Settings(term_run_limit=28))
+        result = controller._execute(submit=True)
+        self.assertEqual(result['state'], 'term_count_unavailable')
+        self.assertIn('未能读取本学期有效跑步次数', result['message'])
+        self.assertFalse(self.store.is_signed_today())
+
     def test_dead_token_maps_to_need_token(self):
         controller = self.make_controller(code=2)
         with self.assertRaises(LptiyuError) as caught:
@@ -219,7 +239,7 @@ class PollTests(PanelTestCase):
 
         def spy(self, action):
             actions.append(action)
-            if action == 'run':
+            if action == 'auto_run':
                 started.set()
             return original(self, action)
 
@@ -229,7 +249,27 @@ class PollTests(PanelTestCase):
             controller.poll()
         self.assertTrue(started.wait(3.0), '到点且开启时必须自动起跑')
         controller._wait_for_work()
-        self.assertEqual(actions, ['run'])
+        self.assertEqual(actions, ['auto_run'])
+
+    def test_term_limit_skip_only_suppresses_the_current_limit_for_today(self):
+        controller = self.make_controller(code=TERM_QUOTA_REACHED, settings=Settings(
+            enabled=True, run_all_members=False, term_run_limit=28))
+        controller.poll()
+        controller._wait_for_work()
+        self.assertEqual(controller.latest['state'], 'term_quota')
+        self.assertIsNone(self.store.daily().get('auto'))
+
+        controller._poll_at = 0
+        controller.poll()
+        controller._wait_for_work()
+        self.assertEqual(len(self.flows), 1)
+
+        self.store.save_settings(Settings(enabled=True, run_all_members=False, term_run_limit=29))
+        controller._poll_at = 0
+        with patch.object(controller, '_flow_factory', return_value=FakeFlow(0)):
+            controller.poll()
+            controller._wait_for_work()
+        self.assertEqual(controller.latest['state'], 'signed')
 
     def test_poll_renews_before_the_run_when_due(self):
         started = threading.Event()
@@ -371,6 +411,30 @@ class RunAllMembersTests(PanelTestCase):
             controller._wait_for_work(30)
         self.assertEqual(len(self.flows), len(pending), '已打卡的成员不再跑')
         self.assertEqual(controller.store.member_signed_record(items[0]['id']).get('date'), day)
+
+    def test_sweep_keeps_running_for_other_members_when_one_reaches_the_term_limit(self):
+        first, second = self._add_members(1)
+        self.store.switch_member(second['id'])
+        self.store.save_settings(Settings(enabled=True, term_run_limit=32))
+        self.store.switch_member(first['id'])
+        controller = self.make_controller(settings=Settings(enabled=True, term_run_limit=28))
+        checked_limits = []
+
+        def flow_for_member(_slot, settings):
+            checked_limits.append(settings.term_run_limit)
+            return FakeFlow(TERM_QUOTA_REACHED if settings.term_run_limit == 28 else 0)
+
+        with patch('lptiyu_panel.random.uniform', return_value=0.0), \
+                patch.object(controller, '_flow_factory', side_effect=flow_for_member):
+            controller.poll()
+            controller._wait_for_work()
+        self.assertEqual(checked_limits, [28, 32])
+        self.assertFalse(self.store.member_signed_record(first['id']))
+        self.assertFalse(self.store.member_daily(first['id']))
+        self.assertEqual(self.store.member_signed_record(second['id'])['date'], now().date().isoformat())
+        self.assertEqual(controller._pending_members(), [])
+        self.store.save_settings(Settings(enabled=True, term_run_limit=29))
+        self.assertEqual([item['id'] for item in controller._pending_members()], [first['id']])
 
     def test_sweep_records_dead_token_member_and_continues(self):
         items = self._add_members(2)
@@ -1091,6 +1155,9 @@ class FlowPolicyTests(PanelTestCase):
     def test_flow_policy_carries_the_pace_window(self):
         flow = self.flow_for(Settings(enabled=True, pace_lo=245, pace_hi=280))
         self.assertEqual((flow.policy['pace_lo'], flow.policy['pace_hi']), (245, 280))
+
+    def test_flow_policy_carries_the_term_limit(self):
+        self.assertEqual(self.flow_for(Settings(term_run_limit=28)).policy.get('term_run_limit'), 28)
 
     def test_legacy_single_pace_reads_as_a_point_window(self):
         flow = self.flow_for(Settings(enabled=True, pace_target=240))

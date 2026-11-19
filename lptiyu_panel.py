@@ -250,19 +250,21 @@ class LptiyuController:
         self._run_member_prefix = ''
         self._sweeping_run = False   # 轮跑中不给单个成员走续期/采集阶梯
         self._next_run_all = 0.0     # 两轮轮跑之间的间隔, 失败重试不轰炸
+        self._term_quota = {}        # 成员 ID → 当天已确认达到的学期上限
         # 初始状态不是「发生过的事」: 每造一个控制器就往历史里写一行, 记录页会被
         # 「尚未开始今天的跑步」刷满(测试和预览尤其明显)。
         self._set_latest('idle', '尚未开始今天的跑步', record=False)
 
     # ------------------------------------------------------------- 状态
-    def _set_latest(self, state, message, detail='', record=True, progress=None):
+    def _set_latest(self, state, message, detail='', record=True, progress=None, *,
+                    term_run_limit=None):
         result = {'state': state, 'message': message, 'detail': detail,
                   'at': self._clock().isoformat(timespec='seconds'),
                   'progress': progress if isinstance(progress, dict) else None}
         self.latest = result
         if record:
             try:
-                self.store.record(state, message, detail)
+                self.store.record(state, message, detail, term_run_limit=term_run_limit)
             except Exception:  # noqa: BLE001 —— 状态记录失败不影响主流程
                 pass
         return result
@@ -293,7 +295,7 @@ class LptiyuController:
 
     # ------------------------------------------------------------- 入口
     def start(self, action):
-        if action not in ('run', 'dry', 'sync', 'renew', 'renew_auto', 'zones',
+        if action not in ('run', 'auto_run', 'dry', 'sync', 'renew', 'renew_auto', 'zones',
                           'capture', 'capture_add', 'zone_apply'):
             return False
         with self._gate:
@@ -321,6 +323,8 @@ class LptiyuController:
                     result = self._renew_auto()
                 elif action == 'dry':
                     result = self._execute(submit=False)
+                elif action == 'auto_run':
+                    result = self._execute_automatic()
                 else:
                     result = self._execute(submit=True)
                 if result is not None:
@@ -373,7 +377,7 @@ class LptiyuController:
         if self._renewal_due(settings):
             self.start('renew_auto')
             return
-        if not in_window:
+        if not in_window or not run_ready:
             return
         if not settings.run_all_members:
             # 单成员(旧行为): 只跑活动成员这一个账号。
@@ -381,18 +385,15 @@ class LptiyuController:
                 return
             if self.store.daily().get('auto', 0) >= MAX_DAILY_AUTO_ATTEMPTS:
                 return
-            if not run_ready:
+            if (settings.term_run_limit and self._term_quota.get(self.store.active_member_id())
+                    == (current.date(), settings.term_run_limit)):
                 return
             if not self.store.has_token() and self.auto_capture():
                 return
-            self.start('run')
-            try:
-                self.store.bump_daily(kind='auto')
-            except Exception:  # noqa: BLE001
-                pass
+            self.start('auto_run')
             return
         # 多成员轮跑: 任何一个已添加、有凭证、今天还没跑完的账号都轮到。
-        if not run_ready or time.monotonic() < self._next_run_all:
+        if time.monotonic() < self._next_run_all:
             return
         pending = self._pending_members()
         if not pending:
@@ -509,9 +510,13 @@ class LptiyuController:
         except Exception:               # noqa: BLE001 —— 读不动就不轮跑这拍
             return []
         day = now().date().isoformat()
+        run_date = self._clock().date()
         pending = []
         for item in members.get('items') or []:
             if not item.get('has_token'):
+                continue
+            limit = item.get('term_run_limit')
+            if limit is not None and self._term_quota.get(item['id']) == (run_date, limit):
                 continue
             signed = self.store.member_signed_record(item['id'])
             if signed.get('date') == day:
@@ -576,15 +581,11 @@ class LptiyuController:
                                  f'自动跑步：正在为「{name}」打卡（{index + 1}/{len(pending)}）…',
                                  record=False)
                 try:
-                    self._execute(submit=True)
+                    self._execute_automatic()
                 except LptiyuError as exc:
                     self._set_latest(exc.state, f'「{name}」{exc.message}')
                 except Exception:  # noqa: BLE001
                     self._set_latest('error', f'「{name}」跑步操作未完成，请稍后重试')
-                try:
-                    store.bump_daily(kind='auto')
-                except Exception:       # noqa: BLE001
-                    pass
                 if index + 1 < len(pending):
                     # 成员之间歇一歇: 几个账号背靠背连着提交不像人
                     self.cancel.wait(random.uniform(20.0, 60.0))
@@ -1166,6 +1167,7 @@ class LptiyuController:
         pace_lo, pace_hi = settings.pace_range()
         policy = {
             'max_per_day': settings.max_per_day,
+            'term_run_limit': settings.term_run_limit,
             'style': 'template',
             'dist_lo': settings.dist_lo,
             'dist_hi': settings.dist_hi,
@@ -1187,6 +1189,18 @@ class LptiyuController:
                                      zone_tuning=self.store.zone_tuning(settings.zone_id),
                                      zone_sink=self._zone_sink,
                                      progress_fn=progress_fn)
+
+    def _execute_automatic(self):
+        result = None
+        try:
+            result = self._execute(submit=True)
+            return result
+        finally:
+            if result is None or result['state'] != 'term_quota':
+                try:
+                    self.store.bump_daily(kind='auto')
+                except Exception:  # noqa: BLE001 —— 台账写入失败不覆盖跑步结果
+                    pass
 
     def _execute(self, submit):
         # 界面的分段进度条: 提交跑 4 段, 本地验证不提交只有 3 段。
@@ -1243,6 +1257,19 @@ class LptiyuController:
         summary, code = flow.run(submit=submit, zone_override=settings.zone_id or None)
         if code == 9:
             return self._set_latest('cancelled', '已取消当前操作')
+        if submit and settings.term_run_limit is not None:
+            member_id = self.store.active_member_id()
+            if code == lptiyu_flow.TERM_QUOTA_REACHED:
+                self._term_quota[member_id] = self._clock().date(), settings.term_run_limit
+                count, limit = summary['term_count'], summary['term_run_limit']
+                return self._set_latest('term_quota', self._run_member_prefix +
+                                        f'本学期有效跑步已达上限（{count}/{limit} 次），本次跳过',
+                                        term_run_limit=limit)
+            self._term_quota.pop(member_id, None)
+            if code == lptiyu_flow.TERM_COUNT_UNAVAILABLE:
+                return self._set_latest('term_count_unavailable', self._run_member_prefix +
+                                        '未能读取本学期有效跑步次数，本次跳过',
+                                        term_run_limit=settings.term_run_limit)
         if submit and isinstance(summary, dict):
             self._record_sample(summary, settings)
         if not submit:
