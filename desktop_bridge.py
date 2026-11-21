@@ -320,20 +320,14 @@ class LocationProbe:
 
 
 def recover_leftover_capture_proxy():
-    """启动时收拾上次采集崩溃留下的系统代理。
-
-    采集会把当前用户的代理临时指到 127.0.0.1:<端口>。正常收尾会还原, 但进程被
-    强杀(卡死对话框「关闭程序」、任务管理器结束任务)时没有 finally 可走 —— 浏览器
-    就会一直连那个死端口, 看起来像整台机器断网。看门狗进程是第一道兜底, 这里在
-    界面启动时再清一次场。
-    """
+    """按明确请求恢复旧版留下的系统代理备份。"""
     try:
         import proxy_guard
 
         root = (Path(os.environ.get('LOCALAPPDATA', str(Path.home() / 'AppData' / 'Local')))
                 / 'youziauth' / 'lptiyu' / 'capture')
         return proxy_guard.recover_stale_backup(root / proxy_guard.BACKUP_NAME)
-    except Exception:                  # noqa: BLE001 —— 清场失败不能拦住界面启动
+    except Exception:                  # noqa: BLE001 —— 恢复失败由调用方处理
         return False
 
 
@@ -341,7 +335,6 @@ class DesktopBridge(LocationProbe):
     def __init__(self, config_path=None, dorm=None, startup_mode=False, accounts=None,
                  lptiyu=None):
         self._init_location()
-        recover_leftover_capture_proxy()
         self._config = gui.ensure_user_config(config_path or gui.DEFAULT_CONFIG_PATH)
         # 多账号：正式运行时由账号层提供「当前活动账号」的控制器（同一时刻只有一个活着，
         # 只有它在自动打卡）。注入 dorm（测试与旧调用点）时不叠账号层，直接用注入的控制器。
@@ -429,7 +422,7 @@ class DesktopBridge(LocationProbe):
                  'pace_range': {'lo': 0, 'hi': 0},
                  'capture': {'state': 'idle', 'message': '', 'remaining_s': 0,
                              'cert_installed': False, 'fingerprint': '',
-                             'available': False},
+                              'available': False},
                  'renewal': {'auto': False, 'state': '', 'message': '',
                              'next_due': '', 'last_success': '',
                              'failures': 0, 'interval_min': 0, 'lead_min': 0}}
@@ -520,9 +513,8 @@ class DesktopBridge(LocationProbe):
                 'last': last,
                 # 配速区间是后端算好的(含旧版单点配速的迁移), 界面不再自己拼。
                 'pace_range': dict(zip(('lo', 'hi'), settings.pace_range())),
-                # 采集组件(研究库): 没有它, 凭证只能靠已有的一份, 界面要把这件事说清楚。
+                # 研究库只供同步已有凭证与模板。
                 'lab': lab,
-                # 本机采集: 没有研究库的机器靠它自己拿 token。
                 'capture': controller.capture_status(),
                 # 跑区: 目录给下拉框, 选中跑区的几何摘要给「特调」这行字。
                 'zones': zones,
@@ -791,8 +783,9 @@ class DesktopBridge(LocationProbe):
             return {'ok': False, 'message': '设置格式无效'}
         if self._closed.is_set():
             return {'ok': False, 'message': '程序正在退出'}
-        # 取消只向已存在的控制器发送信号，不能等其他操作（例如 UAC）释放锁。
-        guard = nullcontext() if action in ('dorm_cancel', 'lptiyu_cancel') else self._mutation
+        # 取消和网络恢复都需要能在其他操作（例如 UAC）占用锁时执行。
+        interrupt = action in ('dorm_cancel', 'lptiyu_cancel', 'lptiyu_recover_network')
+        guard = nullcontext() if interrupt else self._mutation
         with guard:
             try:
                 message = self._dispatch(action, payload or {})
@@ -972,13 +965,14 @@ class DesktopBridge(LocationProbe):
             if not controller.start(action.removeprefix('lptiyu_')):
                 raise RuntimeError('乐跑操作正在进行，请等待完成或取消当前操作。')
             if action == 'lptiyu_capture_add':
-                return '开始采集新成员凭证：让对方打开小程序，抓到后自动归档并切换过去…'
-            return '正在打开小程序并等待凭证…'
-        if action == 'lptiyu_capture_stop':
+                return '正在准备采集新成员凭证…'
+            return '正在准备采集乐跑凭证…'
+        if action in ('lptiyu_capture_stop', 'lptiyu_recover_network'):
             controller = self._lptiyu
             if controller is None:
                 raise RuntimeError('乐跑功能在本机暂不可用')
-            result = controller.capture_stop()
+            result = (controller.recover_network() if action == 'lptiyu_recover_network'
+                      else controller.capture_stop())
             if result['state'] == 'error':
                 raise RuntimeError(result['message'])
             return result['message']
@@ -1497,8 +1491,7 @@ class PreviewBridge(LocationProbe):
                                'pace':"4'05\"", 'zone':'第一运动场'},
                        'pace_range':{'lo':0, 'hi':0},
                        'capture':{'state':'idle', 'message':'', 'remaining_s':0,
-                                  'cert_installed':False, 'fingerprint':'',
-                                  'available':True},
+                                   'cert_installed':False, 'fingerprint':'', 'available':True},
                        'zones':[{'id':'1873', 'name':'演示·第二运动场', 'default':False, 'points':4},
                                 {'id':'1874', 'name':'演示·第一运动场', 'default':True, 'points':4},
                                 {'id':'1876', 'name':'演示·南区操场', 'default':False, 'points':0}],
@@ -1786,6 +1779,8 @@ class PreviewBridge(LocationProbe):
                 return {'ok': True, 'message': '演示：证书已卸载。'}
             elif action in ('lptiyu_capture', 'lptiyu_capture_add'):
                 lp = self._data['lptiyu']
+                if not lp['capture']['cert_installed']:
+                    return {'ok': False, 'message': '请先安装采集证书。'}
                 lp['capture'].update(state='waiting', remaining_s=300,
                                      message='等待小程序登录（演示）')
                 lp.update(state='capturing', message='等待小程序登录（演示）')
@@ -1797,6 +1792,12 @@ class PreviewBridge(LocationProbe):
                 lp['capture'].update(state='idle', remaining_s=0, message='已停止采集')
                 lp.update(state='idle', message='已停止采集（演示）')
                 return {'ok': True, 'message': '已停止采集（演示）'}
+            elif action == 'lptiyu_recover_network':
+                lp = self._data['lptiyu']
+                if lp['capture']['state'] == 'waiting':
+                    lp['capture'].update(state='idle', remaining_s=0, message='已停止采集（演示）')
+                    lp.update(state='idle', message='已停止采集（演示）', busy=False)
+                return {'ok': True, 'message': '演示：可恢复乐跑旧版留下的代理设置。'}
             elif action == 'lptiyu_member_import':
                 return {'ok': True, 'message': '演示：会解密凭证文件并自动入档为新成员。'}
             elif action in ('lptiyu_member_switch', 'lptiyu_member_rename',

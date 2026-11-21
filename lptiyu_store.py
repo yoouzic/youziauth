@@ -217,6 +217,7 @@ class Store:
             if repair_root:
                 return {}, {}
             raise ValueError('乐跑设置格式有误。')
+        payload.pop('capture_proxy_port', None)  # 兼容有专用端口的旧测试版
         limits = payload.pop(_MEMBER_TERM_LIMITS, {})
         if not isinstance(limits, dict):
             raise ValueError('成员学期跑步上限格式有误。')

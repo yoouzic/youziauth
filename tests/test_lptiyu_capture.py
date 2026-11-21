@@ -3,19 +3,22 @@
 真实 TLS 拦截需要连线到 lptiyu, 单测只覆盖纯逻辑与本地回环:
   * 用 lptiyu.cipher.seal 造出与小程序同构的请求/响应信封;
   * CA 在本机真的生成一次(只落临时目录, 不装库);
-  * 系统代理用 HKCU 下的临时键, 绝不碰用户的真实代理设置;
-  * CONNECT 隧道用本地 echo 服务验证。
+  * 旧版代理用 HKCU 下的临时键; 默认会话的注册表、看门狗调用全部拦截并断言未使用;
+  * CONNECT 和 HTTPS 采集用本地回环、合成报文验证。
 """
 import datetime as dt
+import http.client
 import json
 import os
 import socket
+import ssl
 import subprocess
 import tempfile
 import threading
 import time
 import unittest
 import urllib.parse
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -573,44 +576,334 @@ class SessionTests(unittest.TestCase):
         session.stop("idle", "")
 
 
-class TunnelTests(unittest.TestCase):
-    """非目标域名的 CONNECT 必须原样隧道, 不解密。"""
+class ScopedTransportTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        for action in ("read_proxy", "write_proxy", "recover_stale_backup", "spawn_guard"):
+            forbidden = patch.object(cap.proxy_guard, action, side_effect=AssertionError(action))
+            mocked = forbidden.start()
+            self.addCleanup(forbidden.stop)
+            self.addCleanup(mocked.assert_not_called)
 
-    def test_connect_tunnels_bytes_verbatim(self):
-        echo = socket.socket()
-        echo.bind(("127.0.0.1", 0))
-        echo.listen(1)
-        port = echo.getsockname()[1]
+    def open_session(self, ca=None, **options):
+        session = cap.CaptureSession(self.root, ca=ca or FakeCA(), timeout_s=5)
+        self.addCleanup(session.stop)
+        session.start(**options)
+        return session
 
-        def serve():
-            conn, _addr = echo.accept()
-            data = conn.recv(1024)
-            conn.sendall(b"echo:" + data)
-            conn.close()
+    def test_scoped_session_binds_the_client_port_without_touching_system_proxy(self):
+        with socket.socket() as reserve:
+            reserve.bind(("127.0.0.1", 0))
+            port = reserve.getsockname()[1]
+        session = self.open_session(port=port)
+        self.assertEqual(session.status()["port"], port)
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            self.assertFalse(session.ensure_proxy())
+        session.stop()
+        self.assertEqual(session.status()["port"], 0)
+        self.assertFalse((self.root / cap.BACKUP_NAME).exists())
 
-        threading.Thread(target=serve, daemon=True).start()
-        server = cap._ProxyServer(FakeCA(), _NullSink())
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
-        proxy_port = server.server_address[1]
+    @unittest.skipUnless(hasattr(socket, "SO_EXCLUSIVEADDRUSE"), "Winsock option")
+    def test_windows_listener_reserves_its_address_exclusively(self):
+        session = self.open_session()
+        active_socket = session._server.socket
+        self.assertNotEqual(active_socket.getsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE), 0)
+        self.assertEqual(active_socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR), 0)
 
-        client = socket.create_connection(("127.0.0.1", proxy_port), timeout=5)
-        client.sendall(f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
-        head = client.recv(1024)
-        self.assertIn(b"200", head)
-        client.sendall(b"ping")
-        self.assertEqual(client.recv(1024), b"echo:ping")
-        client.close()
-        echo.close()
+    def test_non_target_and_non_https_connects_are_rejected_before_outbound_connection(self):
+        session = self.open_session()
+        cases = ["example.test:443", "api2.lptiyu.com.example.test:443",
+                 "api2.lptiyu.com:80", "user@fake.lptiyu.com:443"]
+        with patch.object(cap.socket, "create_connection", side_effect=AssertionError("upstream")) as dial:
+            for authority in cases:
+                with self.subTest(authority=authority), socket.socket() as client:
+                    client.settimeout(1)
+                    client.connect(("127.0.0.1", session.status()["port"]))
+                    client.sendall(f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode())
+                    response, _rest = cap._read_head(client)
+                    self.assertTrue(response and response.startswith(b"HTTP/1.1 403"))
+            dial.assert_not_called()
+        self.assertEqual(session.connects, 0)
+
+    def test_scoped_https_transports_matching_request_and_delivers_data(self):
+        ca = cap.CertificateAuthority(self.root)
+        ca.ensure()
+        payload = {"uid": "synthetic-uid", "token": "synthetic-token", "school_id": "100"}
+        with patch.object(ca, "installed", return_value=True):
+            session = self.open_session(ca=ca)
+        upstream_reply = (200, {"reason": "OK", "items": []}, b"synthetic upstream reply")
+        with patch.object(cap._ProxyHandler, "_forward", return_value=upstream_reply) as forward:
+            context = ssl.create_default_context(cafile=str(ca.cert_path))
+            conn = http.client.HTTPSConnection("127.0.0.1", session.status()["port"], timeout=2,
+                                               context=context)
+            with closing(conn):
+                conn.set_tunnel("api2.lptiyu.com", 443)
+                conn.request("POST", "/v3/api.php/WpLogin/getSchoolInfo", body=sealed_body(payload))
+                with conn.getresponse() as response:
+                    self.assertEqual((response.status, response.read()), (200, upstream_reply[2]))
+            self.assertEqual(forward.call_args.args[:2], ("api2.lptiyu.com", 443))
+        token = session.wait(timeout=1)
+        self.assertEqual({key: token[key] for key in payload}, payload)
+        self.assertEqual(session.status()["state"], "captured")
+
+    def test_tls_request_cannot_send_another_origin_or_host_through_proxy(self):
+        ca = cap.CertificateAuthority(self.root)
+        ca.ensure()
+        with patch.object(ca, "installed", return_value=True):
+            session = self.open_session(ca=ca)
+        context = ssl.create_default_context(cafile=str(ca.cert_path))
+        with patch.object(cap._ProxyHandler, "_forward", side_effect=AssertionError("upstream")) as forward:
+            for path, host in (("/path", "example.test"), ("https://example.test/", "api2.lptiyu.com")):
+                with self.subTest(path=path, host=host):
+                    conn = http.client.HTTPSConnection("127.0.0.1", session.status()["port"],
+                                                       timeout=2, context=context)
+                    with closing(conn):
+                        conn.set_tunnel("api2.lptiyu.com", 443)
+                        conn.request("GET", path, headers={"Host": host})
+                        with conn.getresponse() as response:
+                            self.assertEqual(response.status, 403)
+            forward.assert_not_called()
+        self.assertEqual(session.requests, 0)
+
+    def test_stopping_closes_open_plain_and_tls_clients_and_allows_same_port_restart(self):
+        ca = cap.CertificateAuthority(self.root)
+        ca.ensure()
+        with patch.object(ca, "installed", return_value=True):
+            session = self.open_session(ca=ca)
+            port = session.status()["port"]
+            with socket.create_connection(("127.0.0.1", port), timeout=2) as plain:
+                plain.sendall(b"CONNECT ")
+                context = ssl.create_default_context(cafile=str(ca.cert_path))
+                conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=2, context=context)
+                with closing(conn):
+                    conn.set_tunnel("api2.lptiyu.com", 443)
+                    conn.connect()
+                    session.stop()
+                    for client in (plain, conn.sock):
+                        with self.subTest(client=type(client).__name__):
+                            client.settimeout(0.5)
+                            try:
+                                self.assertEqual(client.recv(1), b"")
+                            except (ConnectionResetError, ssl.SSLEOFError):
+                                pass
+                    self.assertEqual(session.start(port=port)["port"], port)
+
+    def test_closed_listener_callbacks_cannot_contaminate_a_new_capture(self):
+        session = self.open_session()
+        old_listener = session._server
+        old_listener.record_request("api2.lptiyu.com", "/path",
+                                    sealed_body({"uid": "first-session", "student_num": "100"}))
+        session.stop()
+        session.start()
+        old_listener.record_connect()
+        old_listener.record_request("api2.lptiyu.com", "/path",
+                                    sealed_body({"uid": "late-session", "token": "late-token"}))
+        old_listener.record_login(sealed_reply({"token_data": {"access_token": "late-reply"}}))
+        self.assertEqual((session.connects, session.requests, session.identity), (0, 0, {}))
+        self.assertIsNone(session.poll())
+
+    def test_capture_does_not_end_while_its_response_is_still_being_forwarded(self):
+        ca = cap.CertificateAuthority(self.root)
+        ca.ensure()
+        with patch.object(ca, "installed", return_value=True):
+            session = self.open_session(ca=ca)
+        forwarding = threading.Event()
+        finish = threading.Event()
+
+        def held_upstream(*_args):
+            forwarding.set()
+            if not finish.wait(2):
+                raise RuntimeError("isolated upstream was not released")
+            return 200, {"reason": "OK", "items": []}, b"response"
+
+        context = ssl.create_default_context(cafile=str(ca.cert_path))
+        conn = http.client.HTTPSConnection("127.0.0.1", session.status()["port"], timeout=2,
+                                           context=context)
+        with closing(conn), patch.object(cap._ProxyHandler, "_forward", side_effect=held_upstream):
+            conn.set_tunnel("api2.lptiyu.com", 443)
+            conn.request("POST", "/v3/api.php/WpLogin/getSchoolInfo",
+                         body=sealed_body({"uid": "test-uid", "token": "test-token"}))
+            try:
+                self.assertTrue(forwarding.wait(1))
+                self.assertIsNone(session.poll())
+            finally:
+                finish.set()
+            with conn.getresponse() as response:
+                self.assertEqual(response.read(), b"response")
+            self.assertEqual(session.wait(timeout=1)["token"], "test-token")
 
 
-class _NullSink:
-    def on_request(self, *_args):
-        pass
+class TemporaryGlobalTransportTests(unittest.TestCase):
+    REG = r"Software\youziauth-manual-global-fixture"
 
-    def on_login(self, *_args):
-        pass
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.original = (0, "", "<local>")
+        self.current = self.original
+        self.writes = []
+
+        def read(reg_path):
+            self.assertEqual(reg_path, self.REG)
+            return self.current
+
+        def write(enable, server, override, reg_path):
+            self.assertEqual(reg_path, self.REG)
+            self.current = (enable, server, override)
+            self.writes.append(self.current)
+
+        for name, function in (("read_proxy", read), ("write_proxy", write)):
+            dependency = patch.object(cap.proxy_guard, name, side_effect=function)
+            dependency.start()
+            self.addCleanup(dependency.stop)
+
+    def make_session(self, guard=lambda *_: SimpleNamespace(pid=4321), ca=None):
+        session = cap.CaptureSession(self.root, ca=ca or FakeCA(), system_proxy=True,
+                                     proxy_factory=lambda: cap.SystemProxy(self.root / cap.BACKUP_NAME, self.REG),
+                                     guard_factory=guard)
+        self.addCleanup(session.stop)
+        return session
+
+    def make_listener(self):
+        listener = socket.socket()
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(2)
+        return listener
+
+    def test_watches_a_tagged_lease_before_switching_and_restores_on_cancel(self):
+        original = self.current = (1, "old-proxy.example:8090", "<local>;example.test")
+
+        def guard(path, pid, reg):
+            backup = cap.proxy_guard.read_backup(path)
+            self.assertEqual(self.current, original)
+            self.assertEqual(reg, self.REG)
+            self.assertEqual(backup["pid"], pid)
+            self.assertTrue(backup["monitor_listener"])
+            self.assertGreater(backup["expires_at"], time.time())
+            return SimpleNamespace(pid=4321)
+
+        session = self.make_session(guard)
+        status = session.start()
+        self.assertEqual(self.current, (1, f"127.0.0.1:{status['port']}", original[2]))
+        cancel = threading.Event()
+        cancel.set()
+        self.assertIsNone(session.wait(stop_event=cancel))
+        self.assertEqual(self.current, original)
+        self.assertFalse((self.root / cap.BACKUP_NAME).is_file())
+
+    def test_a_missing_watchdog_does_not_change_the_original_settings(self):
+        session = self.make_session(lambda *_: None)
+        with self.assertRaisesRegex(cap.CaptureError, "看门狗"):
+            session.start()
+        self.assertEqual(self.writes, [])
+
+    def test_an_untagged_backup_is_never_restored_when_a_manual_session_starts(self):
+        backup = self.root / cap.BACKUP_NAME
+        backup.write_text(json.dumps({"enable": 1, "server": "other.example:9000"}), encoding="utf-8")
+        session = self.make_session()
+        with self.assertRaisesRegex(cap.CaptureError, "备份"):
+            session.start()
+        self.assertEqual(self.writes, [])
+        self.assertTrue(backup.is_file())
+
+    def test_a_new_uncommitted_record_with_a_dead_owner_does_not_block_capture(self):
+        backup = self.root / cap.BACKUP_NAME
+        prior = {"enable": 0, "server": "", "override": "", "port": 18888,
+                 "pid": 1234, "capture_id": "abcd" * 8, "monitor_listener": True,
+                 "expires_at": time.time() + 15}
+        backup.write_text(json.dumps(prior), encoding="utf-8")
+        with patch.object(cap.proxy_guard, "pid_alive", return_value=False):
+            session = self.make_session()
+            self.assertEqual(session.start()["state"], "waiting")
+        self.assertNotEqual(json.loads(backup.read_text())["capture_id"], prior["capture_id"])
+
+    def test_an_active_legacy_extractor_keeps_its_proxy_and_backup(self):
+        legacy = self.root / "old-exporter.json"
+        legacy.write_text(json.dumps({"enable": 0, "server": "", "override": "", "pid": 1234,
+                                       "port": 18888}), encoding="utf-8")
+        self.current = (1, "127.0.0.1:18888", "<local>")
+        session = self.make_session()
+        with patch.object(cap.proxy_guard, "shared_backup_path", return_value=self.root / cap.BACKUP_NAME), \
+                patch.object(cap.proxy_guard, "legacy_extractor_backup_path", return_value=legacy), \
+                patch.object(cap.proxy_guard, "pid_alive", return_value=True):
+            with self.assertRaisesRegex(cap.CaptureError, "旧版提取器"):
+                session.start()
+        self.assertEqual(self.writes, [])
+        self.assertTrue(legacy.is_file())
+
+    def test_global_connect_passes_other_tls_bytes_without_a_capture_certificate(self):
+        listener = self.make_listener()
+        port = listener.getsockname()[1]
+
+        def peer():
+            with listener.accept()[0] as conn:
+                conn.settimeout(2)
+                conn.sendall(conn.recv(64).upper())
+
+        worker = threading.Thread(target=peer, daemon=True)
+        worker.start()
+        session = self.make_session()
+        status = session.start()
+        with socket.create_connection(("127.0.0.1", status["port"]), timeout=2) as client:
+            client.sendall(f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\n\r\n".encode())
+            head, _ = cap._read_head(client)
+            self.assertTrue(head and head.startswith(b"HTTP/1.1 200"))
+            client.sendall(b"opaque traffic")
+            self.assertEqual(client.recv(64), b"OPAQUE TRAFFIC")
+        worker.join(2)
+        self.assertEqual(session.connects, 0)
+        self.assertEqual(session.requests, 0)
+
+    def test_global_http_preserves_an_existing_http_upstream(self):
+        listener = self.make_listener()
+        port = listener.getsockname()[1]
+        self.current = (1, f"http=127.0.0.1:{port};https=127.0.0.1:{port}", "<local>")
+        received = []
+
+        def peer():
+            with listener.accept()[0] as conn:
+                conn.settimeout(2)
+                head, _ = cap._read_head(conn)
+                received.append(head.split(b"\r\n", 1)[0])
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nweb")
+
+        worker = threading.Thread(target=peer, daemon=True)
+        worker.start()
+        session = self.make_session()
+        status = session.start()
+        with closing(http.client.HTTPConnection("127.0.0.1", status["port"], timeout=2)) as client:
+            client.request("GET", "http://fixture.example/path")
+            with client.getresponse() as response:
+                self.assertEqual((response.status, response.read()), (200, b"web"))
+        worker.join(2)
+        self.assertEqual(received, [b"GET http://fixture.example/path HTTP/1.1"])
+        self.assertEqual(session.requests, 0)
+
+    def test_global_tls_capture_restores_settings_after_delivery(self):
+        self.current = (1, "127.0.0.1:1234", "<local>")
+        original = self.current
+        ca = cap.CertificateAuthority(self.root)
+        ca.ensure()
+        session = self.make_session(ca=ca)
+        with patch.object(ca, "installed", return_value=True):
+            status = session.start()
+        context = ssl.create_default_context(cafile=str(ca.cert_path))
+        payload = {"uid": "synthetic-user", "token": "synthetic-credential"}
+        conn = http.client.HTTPSConnection("127.0.0.1", status["port"], timeout=2, context=context)
+        with closing(conn), patch.object(cap._ProxyHandler, "_forward", return_value=(
+                200, {"reason": "OK", "items": []}, b"fixture")) as forward:
+            conn.set_tunnel("api2.lptiyu.com", 443)
+            conn.request("POST", "/v3/api.php/WpLogin/getSchoolInfo", body=sealed_body(payload))
+            with conn.getresponse() as response:
+                self.assertEqual(response.read(), b"fixture")
+        self.assertEqual(forward.call_args.kwargs["upstream"], ("127.0.0.1", 1234))
+        self.assertEqual(session.wait(timeout=2)["token"], payload["token"])
+        self.assertEqual(self.current, original)
 
 
 if __name__ == "__main__":

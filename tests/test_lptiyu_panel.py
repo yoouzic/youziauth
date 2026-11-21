@@ -5,14 +5,21 @@
 续期本身的阶梯/配额/冷却在 test_lptiyu_renew.py 里测。
 """
 import datetime as dt
+import http.client
+import json
+import ssl
 import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
 import lptiyu_panel
+import lptiyu_capture
+from lptiyu.cipher import seal
 from lptiyu_panel import LptiyuController, LptiyuError, TokenSlot, MAX_DAILY_AUTO_ATTEMPTS
 from lptiyu.client import ApiError
 from lptiyu.flow import TERM_COUNT_UNAVAILABLE, TERM_QUOTA_REACHED
@@ -200,32 +207,19 @@ class ExecuteTests(PanelTestCase):
 
     def test_expired_credential_finishes_verification_without_waiting_for_capture(self):
         controller = self.make_controller()
-        grab_started = threading.Event()
-        release_grab = threading.Event()
-
-        def grab():
-            grab_started.set()
-            release_grab.wait(3)
-            return False, '采集未完成'
-
-        controller.renewer = CredentialRenewer(
-            self.store, clock=CLOCK, probe=controller._probe_record, grab=grab)
+        controller.renewer = CredentialRenewer(self.store, clock=CLOCK, probe=controller._probe_record)
         with patch.object(controller, '_probe_alive', return_value=False), \
-                patch.object(self.store, 'lab_dir', return_value='test-lab'), \
-                patch.object(self.store, 'sync_from_lab', return_value=([], '')):
-            try:
-                self.assertTrue(controller.start('dry'))
-                controller._wait_for_work(0.8)
-                self.assertFalse(controller.busy)
-                self.assertFalse(grab_started.is_set())
-                self.assertEqual(controller.latest['state'], 'need_token')
-                self.assertIn('凭证已失效', controller.latest['message'])
-                self.assertFalse(self.store.has_token())
-                self.assertFalse(controller._capture_requested)
-                self.assertEqual(self.flows, [])
-            finally:
-                release_grab.set()
-                controller._wait_for_work()
+                patch.object(controller.capture, 'start') as capture, \
+                patch.object(self.store, 'sync_from_lab') as sync:
+            self.assertTrue(controller.start('dry'))
+            controller._wait_for_work(0.8)
+            self.assertFalse(controller.busy)
+            capture.assert_not_called()
+            sync.assert_not_called()
+            self.assertEqual(controller.latest['state'], 'need_token')
+            self.assertIn('凭证已失效', controller.latest['message'])
+            self.assertFalse(self.store.has_token())
+            self.assertEqual(self.flows, [])
 
     def test_cancel_releases_a_blocked_verification_probe_without_clearing_token(self):
         controller = self.make_controller()
@@ -580,14 +574,18 @@ class RenewActionTests(PanelTestCase):
         self.assertIn(('renew', False), renewer.calls,
                       '卡打完了凭证照样会过期，后台要按节奏继续保活')
 
-    def test_auto_renew_stays_quiet_when_the_day_is_done(self):
+    def test_auto_renew_notifies_without_replacing_today_completed_state(self):
         renewer = FakeRenewer(outcome=RenewOutcome('need_user', '请在小程序里开一次'))
         controller = self.make_controller(renewer=renewer)
         controller.store.mark_signed(controller._clock().date().isoformat())
+        controller._set_latest('signed', '今天已打卡', record=False)
         before = controller.store.status()
-        self.assertIsNone(controller._renew_auto(), '今日已完成不该被顶成「需要凭证」')
+        self.assertTrue(controller.start('renew_auto'))
+        controller._wait_for_work()
+        events = controller.drain()
+        self.assertEqual([event['state'] for event in events], ['need_token'])
+        self.assertEqual(controller.latest['state'], 'signed')
         self.assertEqual(controller.store.status(), before)
-        self.assertIn(('renew', False), renewer.calls, '安静不等于不续')
 
 
 class ProbePolicyTests(PanelTestCase):
@@ -838,11 +836,12 @@ class FakeCapture:
         self.state = "idle"
         self.message = ""
 
-    def start(self, stop_event=None):
+    def start(self, stop_event=None, *, port=0):
         from lptiyu_capture import CaptureError
         if not self.ca.installed():
             raise CaptureError("还没有安装采集证书：先点「安装采集证书」，再开始采集")
         self.started += 1
+        self.port = port
         self.state, self.message = "waiting", "等待小程序登录"
 
     def wait(self, timeout=None, on_tick=None, stop_event=None):
@@ -867,14 +866,12 @@ class FakeCapture:
 
 
 class DiagnoseTests(PanelTestCase):
-    def diagnose(self, installed=True, running=True, proxy_ok=True, connects=0):
-        controller = self.make_controller(capture=FakeCapture(installed=installed))
+    def diagnose(self, installed=True, running=True, cert=True, connects=0):
+        controller = self.make_controller(capture=FakeCapture(installed=cert))
         controller.capture.connects = connects
         with patch.object(lptiyu_panel, 'wechat_protocol_registered', lambda: installed), \
                 patch.object(lptiyu_panel, 'wechat_installed', lambda: installed), \
-                patch.object(lptiyu_panel, '_wechat_running', lambda: running), \
-                patch('lptiyu_capture.proxy_self_test',
-                      lambda ca, **_kw: (proxy_ok, '代理链可用（200）')):
+                patch.object(lptiyu_panel, '_wechat_running', lambda: running):
             return controller.capture_diagnose()
 
     def test_a_missing_wechat_is_the_verdict(self):
@@ -886,90 +883,17 @@ class DiagnoseTests(PanelTestCase):
         report = self.diagnose(running=False)
         self.assertIn('没在运行', report['verdict'])
 
-    def test_a_broken_proxy_chain_is_the_verdict(self):
-        report = self.diagnose(proxy_ok=False)
-        self.assertIn('代理链不通', report['verdict'])
+    def test_missing_certificate_is_the_verdict(self):
+        report = self.diagnose(cert=False)
+        self.assertIn('证书尚未安装', report['verdict'])
 
     def test_zero_connections_with_a_healthy_chain_points_at_wechat(self):
         report = self.diagnose(connects=0)
-        self.assertIn('没把流量交出来', report['verdict'])
+        self.assertIn('尚未收到乐跑请求', report['verdict'])
 
     def test_a_healthy_chain_with_traffic_says_capture_is_fine(self):
         report = self.diagnose(connects=3)
-        self.assertIn('采集链正常', report['verdict'])
-
-
-class AutoCaptureTests(PanelTestCase):
-    CRED = {"token": "SELF-HEALED", "uid": 17980002, "student_num": "2025003",
-            "school_id": "837", "card_id": "2025003",
-            "issued_at": "2026-11-11T19:00:00", "source": "capture"}
-
-    def setUp(self):
-        super().setUp()
-        # 自愈采集的语义是「活动成员自己重开小程序换新号」: 种子身份与抓到的
-        # 身份对齐, 归档才会落回活动成员头上。
-        self._align_identity_with(self.CRED)
-
-    def _align_identity_with(self, cred):
-        self.store.save_identity({'name': '测试成员', 'student_num': str(cred['student_num']),
-                                  'uid': str(cred['uid']), 'school_id': str(cred['school_id']),
-                                  'card_id': str(cred['card_id'])})
-
-    def test_auto_capture_needs_the_certificate(self):
-        controller = self.make_controller(capture=FakeCapture(installed=False))
-        self.assertFalse(controller.capture_ready())
-        self.assertFalse(controller.auto_capture())
-
-    def test_auto_capture_runs_without_being_asked(self):
-        capture = FakeCapture(cred=self.CRED, installed=True)
-        controller = self.make_controller(capture=capture, open_applet=lambda: True)
-        self.assertTrue(controller.auto_capture())
-        controller._wait_for_work()
-        self.assertEqual(capture.started, 1)
-        self.assertEqual(controller.store.token(), "SELF-HEALED")
-        today = CLOCK().date().isoformat()
-        self.assertEqual(controller.store.capture_state()['attempts'][today], 1)
-
-    def test_auto_capture_respects_its_cooldown(self):
-        capture = FakeCapture(cred=self.CRED, installed=True)
-        controller = self.make_controller(capture=capture, open_applet=lambda: True)
-        self.assertTrue(controller.auto_capture())
-        controller._wait_for_work()
-        self.assertFalse(controller.auto_capture(), '20 分钟内不该反复弹小程序')
-
-    def test_auto_capture_stops_at_the_daily_cap(self):
-        controller = self.make_controller(capture=FakeCapture(installed=True))
-        today = CLOCK().date().isoformat()
-        for _ in range(3):
-            controller.store.record_capture_attempt(CLOCK())
-        self.assertEqual(controller.store.capture_state()['attempts'][today], 3)
-        self.assertFalse(controller._auto_capture_due())
-
-    def test_a_missing_token_asks_for_a_silent_capture(self):
-        controller = self.make_controller(capture=FakeCapture(installed=True))
-        controller.store.clear_token()
-        with self.assertRaises(LptiyuError) as caught:
-            controller._execute(submit=True)
-        self.assertEqual(caught.exception.state, 'need_token')
-        self.assertIn('自动采集', caught.exception.message)
-        self.assertTrue(controller._capture_requested)
-
-    def test_verification_does_not_schedule_capture_without_a_credential(self):
-        controller = self.make_controller(capture=FakeCapture(installed=True))
-        controller.store.clear_token()
-        with self.assertRaises(LptiyuError) as caught:
-            controller._execute(submit=False)
-        self.assertEqual(caught.exception.state, 'need_token')
-        self.assertFalse(controller._capture_requested)
-        self.assertEqual(self.renewer.calls, [])
-
-    def test_poll_picks_the_request_up_by_itself(self):
-        capture = FakeCapture(cred=self.CRED, installed=True)
-        controller = self.make_controller(capture=capture, open_applet=lambda: True)
-        controller._capture_requested = True
-        controller.poll()
-        controller._wait_for_work()
-        self.assertEqual(capture.started, 1, '下一拍就该把采集接过来')
+        self.assertIn('已收到 3 次乐跑连接', report['verdict'])
 
 
 class MiniProgramTests(unittest.TestCase):
@@ -1000,6 +924,129 @@ class CaptureFlowTests(PanelTestCase):
         # 采集场景的语义是「活动成员自己重开小程序换新号」: 种子身份与抓到的
         # 身份对齐, 归档才会落回活动成员头上。
         self._align_identity_with(self.CRED)
+
+    def test_manual_capture_opens_wechat_and_saves_without_a_port_setting(self):
+        capture = FakeCapture(cred=self.CRED)
+        launches = []
+        controller = self.make_controller(capture=capture, settings=Settings(),
+                                          open_applet=lambda: launches.append(True))
+        self.assertEqual(controller._capture_flow()['state'], 'synced')
+        self.assertEqual(capture.started, 1)
+        self.assertEqual(capture.port, 0)
+        self.assertEqual(launches, [True])
+
+    def test_automatic_renewal_reminds_without_starting_capture_or_wechat(self):
+        self.store.clear_token()
+        capture = FakeCapture(cred=self.CRED)
+        launches = []
+        controller = LptiyuController(store=self.store, clock=CLOCK, capture=capture,
+                                      open_applet=lambda: launches.append(True))
+        self.addCleanup(controller.close)
+        self.assertTrue(controller.start('renew_auto'))
+        controller._wait_for_work()
+        self.assertEqual(self.store.renewal()['state'], 'need_user')
+        self.assertIn('开始采集', self.store.renewal()['message'])
+        self.assertEqual(capture.started, 0)
+        self.assertEqual(launches, [])
+        self.assertFalse(self.store.has_token())
+
+    def test_manual_capture_delivers_tls_data_and_releases_the_claimed_proxy(self):
+        capture_root = self.store.root / 'capture'
+        ca = lptiyu_capture.CertificateAuthority(capture_root)
+        ca.ensure()
+        context = ssl.create_default_context(cafile=str(ca.cert_path))
+        registry = [(0, '127.0.0.1:7897', '<local>')]
+        original = registry[0]
+        registry_path = r'Software\youziauth-test-only'
+        changes = []
+        responses = []
+
+        def write_proxy(enable, server, override, reg_path):
+            self.assertEqual(reg_path, registry_path)
+            registry[0] = (enable, server, override)
+            changes.append(registry[0])
+
+        adapter = lptiyu_capture.SystemProxy(capture_root / 'proxy_backup.json', registry_path)
+        session = lptiyu_capture.CaptureSession(capture_root, ca=ca, timeout_s=6,
+                                                proxy_factory=lambda: adapter, system_proxy=True)
+
+        def isolated_client():
+            port = session.status()['port']
+            self.assertEqual(registry[0], (1, f'127.0.0.1:{port}', '<local>'))
+            body = urllib.parse.urlencode({'data': seal(json.dumps(self.CRED))}).encode()
+            with closing(http.client.HTTPSConnection('127.0.0.1', port, timeout=2,
+                                                     context=context)) as conn:
+                conn.set_tunnel('api2.lptiyu.com', 443)
+                conn.request('POST', '/v3/api.php/WpLogin/getSchoolInfo', body=body)
+                with conn.getresponse() as response:
+                    responses.append((response.status, response.read()))
+            return True
+
+        with patch.object(ca, 'installed', return_value=True), \
+                patch.object(lptiyu_capture._ProxyHandler, '_forward',
+                             return_value=(200, {'reason': 'OK', 'items': []}, b'fixture')) as forward, \
+                patch('lptiyu_capture.proxy_guard.read_proxy', side_effect=lambda path: registry[0]), \
+                patch('lptiyu_capture.proxy_guard.write_proxy', side_effect=write_proxy), \
+                patch('lptiyu_capture.proxy_guard.guard_ready', return_value=True), \
+                patch('lptiyu_capture.proxy_guard.spawn_guard') as watchdog:
+            controller = LptiyuController(store=self.store, clock=CLOCK, capture=session,
+                                          open_applet=isolated_client)
+            self.addCleanup(controller.close)
+            self.assertTrue(controller.start('capture'))
+            controller._wait_for_work()
+            self.assertEqual(controller.latest['state'], 'synced')
+            self.assertEqual(self.store.token(), self.CRED['token'])
+        self.assertEqual(responses, [(200, b'fixture')])
+        self.assertEqual(forward.call_count, 1)
+        self.assertEqual(session.status()['port'], 0)
+        self.assertEqual(len(changes), 2)
+        self.assertEqual(changes[-1], original)
+        self.assertFalse(adapter.backup_path.exists())
+        watchdog.assert_called_once()
+
+    def test_scheduled_run_does_not_bypass_renewal_with_a_second_capture_path(self):
+        self.store.clear_token()
+        capture = FakeCapture(cred=self.CRED)
+        renewer = FakeRenewer(outcome=RenewOutcome('need_user', '请导入凭证'))
+        controller = self.make_controller(capture=capture, renewer=renewer,
+                                          settings=Settings(enabled=True, run_all_members=False))
+        controller.poll()
+        controller._wait_for_work()
+        self.assertIn(('renew', True), renewer.calls)
+        self.assertEqual(capture.started, 0)
+        self.assertFalse(self.store.has_token())
+
+    def test_network_recovery_releases_a_capture_even_while_controller_is_busy(self):
+        capture = FakeCapture()
+        controller = self.make_controller(capture=capture)
+        capture.state = 'waiting'
+        controller.busy = True
+        with patch('proxy_guard.restore_owned_capture_proxy', create=True,
+                   return_value='restored') as restore:
+            result = controller.recover_network()
+        self.assertEqual(result['state'], 'restored')
+        self.assertEqual(capture.state, 'idle')
+        self.assertFalse(controller.cancel.is_set(), '恢复网络不应取消其他操作')
+        restore.assert_called_once_with(self.store.root / 'capture' / 'proxy_backup.json')
+
+    def test_network_recovery_opens_windows_settings_for_an_unverified_dead_proxy(self):
+        controller = self.make_controller(capture=FakeCapture())
+        with patch('proxy_guard.restore_owned_capture_proxy', create=True, return_value='unverified'), \
+                patch.object(lptiyu_panel.os, 'startfile') as opened:
+            result = controller.recover_network()
+        self.assertEqual(result['state'], 'manual')
+        self.assertIn('核对', result['message'])
+        opened.assert_called_once_with('ms-settings:network-proxy')
+
+    def test_network_recovery_reports_a_failed_active_restore(self):
+        class RestoreFailure(FakeCapture):
+            def stop(self, *_args):
+                self.state, self.message = 'error', '系统代理恢复失败'
+
+        controller = self.make_controller(capture=RestoreFailure())
+        controller.capture.state = 'waiting'
+        with patch('proxy_guard.restore_owned_capture_proxy', return_value='unchanged'):
+            self.assertEqual(controller.recover_network(), {'state': 'error', 'message': '系统代理恢复失败'})
 
     def _align_identity_with(self, cred):
         self.store.save_identity({'name': '测试成员', 'student_num': str(cred['student_num']),

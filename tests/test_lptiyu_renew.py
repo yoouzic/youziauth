@@ -10,8 +10,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lptiyu_renew import (BACKOFF_BASE_MINUTES, COOLDOWN_MINUTES, MAX_DAILY_GRABS,
-                          MAX_DAILY_PROBES, CredentialRenewer)
+from lptiyu_renew import (BACKOFF_BASE_MINUTES, COOLDOWN_MINUTES, MAX_DAILY_PROBES,
+                          CredentialRenewer)
 from lptiyu_store import Settings, Store
 
 START = dt.datetime(2026, 11, 11, 5, 50)   # 默认 06:30 起跑, 提前 40 分钟: 落在 45 分钟保活窗
@@ -46,15 +46,6 @@ class Probe:
         return item, ''
 
 
-class Grab:
-    def __init__(self):
-        self.calls = 0
-
-    def __call__(self):
-        self.calls += 1
-        return True, ''
-
-
 class RenewTestCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -63,7 +54,6 @@ class RenewTestCase(unittest.TestCase):
         self.store = Store(self.root / 'lptiyu')
         self.clock = Clock(START)
         self.probe = Probe()
-        self.grab = Grab()
         self.lab_path = None
         # 这台机器上真有研究库: 自动发现必须钉死, 否则「没有研究库」的路径永远测不到。
         lab = patch.object(Store, 'lab_dir',
@@ -72,10 +62,8 @@ class RenewTestCase(unittest.TestCase):
         self.addCleanup(lab.stop)
 
     # ---------------------------------------------------------------- 工具
-    def renewer(self, can_capture=None):
-        return CredentialRenewer(self.store, clock=self.clock,
-                                 probe=self.probe, grab=self.grab,
-                                 can_capture=can_capture)
+    def renewer(self):
+        return CredentialRenewer(self.store, clock=self.clock, probe=self.probe)
 
     def token(self, value='TOK', issued='2026-11-11T01:00:00'):
         self.store.save_token_record(value, issued_at=issued, source='test')
@@ -114,7 +102,6 @@ class RenewLadderTests(RenewTestCase):
         outcome = self.renewer().renew()
         self.assertEqual(outcome.state, 'ok')
         self.assertEqual(self.store.token(), 'TOK')
-        self.assertEqual(self.grab.calls, 0, '活着就不该惊动采集链')
         record = self.store.renewal()
         self.assertEqual(record['state'], 'ok')
         self.assertEqual(record['failures'], 0)
@@ -130,7 +117,7 @@ class RenewLadderTests(RenewTestCase):
         outcome = self.renewer().renew()
         self.assertEqual(outcome.state, 'renewed')
         self.assertEqual(self.store.token(), 'NEW')
-        self.assertEqual(self.grab.calls, 0, '研究库有现成新号就不该让用户再开小程序')
+        self.assertEqual(self.probe.calls, 2)
 
     def test_consumed_lab_token_is_adopted_and_probed(self):
         # 研究库把提交后的号记成 consumed, 但实测只由 loginByCode 轮换才死。
@@ -140,27 +127,31 @@ class RenewLadderTests(RenewTestCase):
         self.assertEqual(self.store.token(), 'CONSUMED-BUT-ALIVE')
         self.assertEqual(self.probe.calls, 1)
 
-    def test_with_the_builtin_capture_it_does_not_send_people_to_the_lab(self):
-        # 装好采集证书的机器上, 续期应该指「开始采集」, 而不是「去填研究库」
-        outcome = self.renewer(can_capture=lambda: True).renew()
-        self.assertEqual(outcome.state, 'need_user')
-        self.assertIn('开始采集', outcome.message)
-        self.assertNotIn('研究库', outcome.message)
-        self.assertEqual(self.grab.calls, 0, '有内置采集就不该再起研究库那条路')
+    def test_missing_credentials_require_manual_capture_for_background_and_forced_renewal(self):
+        for force in (False, True):
+            with self.subTest(force=force):
+                outcome = self.renewer().renew(force=force)
+                self.assertEqual(outcome.state, 'need_user')
+                self.assertIn('开始采集', outcome.message)
+                self.assertIn('导入凭证', outcome.message)
+        self.assertEqual(self.store.renewal()['state'], 'need_user')
+        self.assertFalse(self.store.token())
+        self.assertEqual(self.probe.calls, 0)
+        self.assertEqual(int(self.store.daily().get('grab') or 0), 0)
 
-    def test_without_a_lab_it_names_the_missing_capture_component(self):
+    def test_a_lab_directory_without_credentials_requires_manual_capture(self):
+        self.save_lab(token='')
         outcome = self.renewer().renew()
         self.assertEqual(outcome.state, 'need_user')
-        self.assertIn('研究库', outcome.message,
-                      '没有采集组件时要说清缺的是什么, 而不是让人去开小程序')
-        self.assertEqual(self.grab.calls, 0)
+        self.assertIn('开始采集', outcome.message)
+        self.assertEqual(self.probe.calls, 0)
 
-    def test_capture_runs_at_most_twice_a_day(self):
-        self.save_lab(token='')           # 研究库在, 但还没有号
-        outcomes = [self.renewer().renew(force=True) for _ in range(MAX_DAILY_GRABS + 1)]
-        self.assertEqual(self.grab.calls, MAX_DAILY_GRABS)
-        self.assertEqual(outcomes[-1].state, 'need_user')
-        self.assertIn('次数已用完', outcomes[-1].message)
+    def test_synced_credential_is_retained_during_a_network_error(self):
+        self.save_lab(token='SYNCED')
+        self.probe = Probe((None, '链路故障'))
+        outcome = self.renewer().renew()
+        self.assertEqual(outcome.state, 'error')
+        self.assertEqual(self.store.token(), 'SYNCED')
 
     def test_network_error_keeps_the_token_and_backs_off(self):
         self.token('TOK')
@@ -191,12 +182,43 @@ class RenewLadderTests(RenewTestCase):
         self.assertEqual(outcome.state, 'capped')
         self.assertEqual(self.probe.calls, MAX_DAILY_PROBES, '探活也有每日硬上限')
 
-    def test_unknown_lab_token_falls_back_to_capture(self):
-        self.save_lab(token='DEAD', issued='2026-11-11T05:40:00')
-        self.probe = Probe((False, '101'), (False, '101'), (False, '101'))
+    def test_last_probe_on_a_dead_lab_credential_still_requests_manual_capture(self):
+        for _ in range(MAX_DAILY_PROBES - 1):
+            self.store.bump_daily(kind='probe')
+        self.save_lab(token='DEAD')
+        self.probe = Probe((False, '101'))
         outcome = self.renewer().renew()
-        self.assertEqual(self.grab.calls, 1, '研究库那枚也死了就该去采集一次')
         self.assertEqual(outcome.state, 'need_user')
+        self.assertIn('开始采集', outcome.message)
+        self.assertEqual(self.probe.calls, 1)
+
+    def test_last_probe_used_on_current_credential_prevents_a_second_probe(self):
+        for _ in range(MAX_DAILY_PROBES - 1):
+            self.store.bump_daily(kind='probe')
+        self.token('DEAD')
+        self.save_lab(token='LAB')
+        self.probe = Probe((False, '101'))
+        outcome = self.renewer().renew()
+        self.assertEqual(outcome.state, 'capped')
+        self.assertEqual(self.probe.calls, 1)
+
+    def test_no_probe_quota_leaves_lab_credential_unchanged(self):
+        for _ in range(MAX_DAILY_PROBES):
+            self.store.bump_daily(kind='probe')
+        self.save_lab(token='LAB')
+        outcome = self.renewer().renew()
+        self.assertEqual(outcome.state, 'capped')
+        self.assertEqual(self.probe.calls, 0)
+        self.assertFalse(self.store.token())
+
+    def test_invalid_lab_token_is_cleared_and_requests_manual_capture(self):
+        self.save_lab(token='DEAD', issued='2026-11-11T05:40:00')
+        self.probe = Probe((False, '101'))
+        outcome = self.renewer().renew()
+        self.assertEqual(outcome.state, 'need_user')
+        self.assertIn('开始采集', outcome.message)
+        self.assertFalse(self.store.token())
+        self.assertEqual(self.probe.calls, 1)
 
     def test_auto_renew_off_is_reported_not_executed(self):
         self.token('TOK')
@@ -239,6 +261,14 @@ class DueTests(RenewTestCase):
         self.store.save_settings(Settings(enabled=True, run_time='06:30', renew_lead_min=45))
         self.seed_ledger(next_due=(START + dt.timedelta(hours=3)).isoformat(timespec='seconds'),
                          last_success='2026-11-10T05:46:00')
+        self.assertTrue(self.renewer().due())
+
+    def test_lead_window_respects_the_retry_time_when_manual_capture_is_needed(self):
+        self.store.save_settings(Settings(enabled=True))
+        self.seed_ledger(state='need_user', next_due=(START + dt.timedelta(minutes=20))
+                         .isoformat(timespec='seconds'))
+        self.assertFalse(self.renewer().due())
+        self.clock.tick(20)
         self.assertTrue(self.renewer().due())
 
     def test_lead_window_already_confirmed_today_is_not_due(self):

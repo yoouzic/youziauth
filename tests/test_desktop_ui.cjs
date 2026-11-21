@@ -2217,7 +2217,8 @@ test('the member limit disables adding at ten and re-enables it after removal',a
   const items=Array.from({length:10},(_,index)=>({
     id:`m${index+1}`,name:`成员 ${index+1}`,active:index===0
   }));
-  const h=await lptiyuPage({members:{max:10,active:'m1',error:'',items}});
+  const h=await lptiyuPage({members:{max:10,active:'m1',error:'',items},
+    capture:{cert_installed:true}});
   assert.equal(h.el('lp-member-add').disabled,true);
   assert.equal(h.el('lp-member-state').textContent,'最多 10 个成员。');
   h.data.lptiyu.members.items.pop();await h.refresh();
@@ -2256,7 +2257,7 @@ test('lptiyu settings sync from the snapshot and save through the bridge',async(
   assert.equal(h.el('lp-run-all').checked,true,'老快照没有该字段时默认开启跑完全部成员');
   assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1))),{action:'lptiyu_save',payload:{enabled:true,run_all_members:true,run_time:'06:30',
     member_id:'m1',term_run_limit:30,dist_lo:2.9,dist_hi:3.2,pace_lo:245,pace_hi:280,anchor_max_m:20,auto_renew:true,
-    lab_dir:'',zone_id:'',zone_name:''}},
+     lab_dir:'',zone_id:'',zone_name:''}},
     '合法修改按表单内容发往后台');
 });
 
@@ -2397,14 +2398,13 @@ test('lptiyu credential line reports the local sync age',async()=>{
   const unknown=await lptiyuPage({has_token:true,token_age_hours:null});
   assert.equal(unknown.el('lp-credential-line').textContent,'凭证已就绪');
   const none=await lptiyuPage({has_token:false});
-  assert.equal(none.el('lp-credential-line').textContent,'尚未同步凭证。');
+  assert.match(none.el('lp-credential-line').textContent,/首次采集.*安装证书/);
 });
 
-test('lptiyu says when the capture component is missing and saves its path',async()=>{
+test('lptiyu shows import before the first capture and saves the research store path',async()=>{
   const h=await lptiyuPage({has_token:false,
     lab:{configured:'',found:'',ok:false,reason:'not_configured'}});
-  assert.match(h.el('lp-credential-line').textContent,/没有采集组件/,
-    '没有研究库时不能让人去点必然失败的同步');
+  assert.match(h.el('lp-credential-line').textContent,/可导入凭证/);
   assert.match(h.el('lp-lab-hint').textContent,/未找到研究库/);
   h.el('lp-lab').value='D:\\lptiyu-lab';
   await h.el('lptiyu-form').fire('submit');
@@ -2431,10 +2431,69 @@ test('lptiyu capture walks from certificate to waiting',async()=>{
              fingerprint:'ABCDEF012345',available:true}});
   assert.match(waiting.el('lp-capture-line').textContent,/还剩 2 分钟/,'等待时要说还剩多久');
   assert.equal(waiting.el('lp-capture-stop').disabled,false);
-  assert.equal(waiting.el('lp-capture-start').disabled,false);
+  assert.equal(waiting.el('lp-capture-start').disabled,true);
   waiting.el('lp-capture-stop').listeners.click();
   await new Promise(resolve=>setTimeout(resolve,0));
   assert.equal(waiting.calls.at(-1).action,'lptiyu_capture_stop');
+});
+
+test('manual lptiyu capture and import work without a port or an existing member',async()=>{
+  const h=await lptiyuPage({has_token:false,members:{max:10,active:'',items:[]},
+    capture:{state:'idle',message:'',cert_installed:true}});
+  assert.equal(h.el('lp-capture-start').disabled,false);
+  assert.equal(h.el('lp-member-import').disabled,false);
+  const html=fs.readFileSync(path.join(__dirname,'../desktop_ui/index.html'),'utf8');
+  const memberBar=html.match(/<div[^>]*id="lp-member-bar"[^>]*>[\s\S]*?<\/div>/)[0];
+  assert.doesNotMatch(memberBar,/id="lp-member-import"/);
+  h.data.lptiyu.members=lptiyuTermMembers();
+  await h.refresh();
+  assert.equal(h.el('lp-member-add').disabled,false);
+});
+
+test('recover network remains reachable without a credential',async()=>{
+  const h=await lptiyuPage({has_token:false,capture:{state:'idle'}});
+  const recovery=h.el('lp-recover-network');
+  assert.equal(recovery.hidden,false);
+  assert.equal(recovery.disabled,false);
+  recovery.listeners.click();
+  await settle();
+  assert.equal(h.calls.at(-1).action,'lptiyu_recover_network');
+});
+
+test('recover network bypasses an ordinary pending action and prevents duplicate clicks',async()=>{
+  const h=await lptiyuPage({busy:true,capture:{state:'waiting'}});
+  const recovery=h.el('lp-recover-network');
+  const dispatch=h.api.dispatch;
+  let finishNetwork,finishRecovery;
+  h.api.dispatch=(action,payload)=>{
+    const result=dispatch(action,payload);
+    if(action==='network_stop')return new Promise(resolve=>{finishNetwork=()=>resolve(result);});
+    if(action==='lptiyu_recover_network')return new Promise(resolve=>{finishRecovery=()=>resolve(result);});
+    return result;
+  };
+  h.stop.listeners.click();
+  try{
+    assert.equal(recovery.disabled,false);
+    recovery.listeners.click();
+    assert.equal(recovery.disabled,true);
+    recovery.listeners.click();
+    assert.deepEqual(h.calls.map(call=>call.action),['network_stop','lptiyu_recover_network']);
+  }finally{
+    finishRecovery?.();
+    finishNetwork?.();
+    await settle();
+  }
+  assert.equal(recovery.disabled,false);
+});
+
+test('lptiyu settings neither show nor submit a capture proxy port',async()=>{
+  const h=await lptiyuPage({});
+  h.el('lptiyu-form').fire('submit');
+  await settle();
+  assert.equal(h.calls.at(-1).action,'lptiyu_save');
+  assert.equal(Object.hasOwn(h.calls.at(-1).payload,'capture_proxy_port'),false);
+  const html=fs.readFileSync(path.join(__dirname,'../desktop_ui/index.html'),'utf8');
+  assert.doesNotMatch(html,/id="lp-capture-proxy-port"/);
 });
 
 test('lptiyu lets me pick a zone and push it to the applet',async()=>{

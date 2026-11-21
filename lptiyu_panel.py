@@ -20,11 +20,11 @@ import datetime as dt
 import os
 import random
 import queue
-import shutil
 import subprocess
 import threading
 import time
 
+import proxy_guard
 from lptiyu import flow as lptiyu_flow
 from lptiyu.client import ApiClient, ApiError
 from lptiyu_capture import CaptureError, CaptureSession
@@ -114,10 +114,6 @@ def open_mini_program(uri=OFFICIAL_MINI_PROGRAM_URI, timeout=6.0):
 
 
 MAX_DAILY_AUTO_ATTEMPTS = 3
-# 没有可用凭证时的自愈节奏: 冷却 20 分钟, 一天最多自动开三次小程序。
-AUTO_CAPTURE_COOLDOWN_MIN = 20
-AUTO_CAPTURE_DAILY_CAP = 3
-GRAB_TIMEOUT_SECONDS = 540
 VERIFY_PROBE_TIMEOUT_SECONDS = 15
 MAX_ZONE_SYNC = 8                # 同步跑区时最多切几次场地(服务端一般就 4 个)
 
@@ -216,21 +212,11 @@ class LptiyuController:
         self.store = store or Store()
         self.slot = slot or TokenSlot(self.store)
         self._clock = clock or now
-        # 采集链: 没有研究库的机器靠它自己拿 token。证书检查很慢(certutil),
-        # 所以在 capture_status 里做 60 秒缓存。
+        # 只有「开始采集」和「添加成员」会启动临时 Windows 代理。
         self.capture = capture or CaptureSession(self.store.root / 'capture',
-                                                 clock=self._clock)
-        # 上次采集如果被强杀, 代理可能还指着那个已经不存在的端口: 先还原再谈别的。
-        recover = getattr(self.capture, 'recover_stale_proxy', None)
-        if callable(recover):
-            try:
-                recover()
-            except Exception:          # noqa: BLE001 —— 清场失败不该拦住控制器构造
-                pass
+                                                  clock=self._clock, system_proxy=True)
         # 采集时代为唤起小程序: 少一步「去微信里翻出它」。
         self._open_applet = open_applet or open_mini_program
-        self._capture_requested = False      # 某次跑批发现没凭证 → 下一拍自动采集
-        self._capture_auto = False           # 这次采集是不是自动发起的
         self._capture_switch_intent = False  # 「添加成员」发起: 抓到就切到新成员
         self._next_sweep = time.monotonic() + 300   # 全成员巡检: 启动 5 分钟后首巡(避开开机峰值)
         self._sweeping = False
@@ -238,14 +224,14 @@ class LptiyuController:
         self._flow_factory = flow_factory   # 测试注入; 正式路径现场构造 DailyFlow
         # 续期器也允许注入: 单测里给一个假的, 就不必碰网络和子进程。
         self.renewer = renewer or CredentialRenewer(
-            self.store, clock=self._clock, can_capture=self.capture_ready,
-            probe=self._probe_record, grab=self._grab_via_lab, check_cancelled=self._check_cancelled)
+            self.store, clock=self._clock, probe=self._probe_record, check_cancelled=self._check_cancelled)
         self.events = queue.Queue()
         self.busy = False
         self.closed = False
         self._gate = threading.Lock()
         self._poll_at = 0.0
         self.cancel = threading.Event()
+        self._capture_interrupted = threading.Event()
         self._verification_probe = None
         self.latest = None
         # 多成员轮跑: 前缀贴到每个进度文案上, 告诉界面现在跑的是谁。
@@ -305,6 +291,7 @@ class LptiyuController:
                 return False
             self.busy = True
             self.cancel.clear()
+            self._capture_interrupted.clear()
         # 「添加成员」是显式的人为意图: 抓到新成员就切过去, 不用再手动换档。
         self._capture_switch_intent = (action == 'capture_add')
 
@@ -339,7 +326,6 @@ class LptiyuController:
                 self._push(result)
             finally:
                 with self._gate:
-                    self._capture_auto = False
                     self._capture_switch_intent = False
                     self.busy = False
 
@@ -351,11 +337,6 @@ class LptiyuController:
         if self.closed or time.monotonic() < self._poll_at:
             return
         self._poll_at = time.monotonic() + 5
-        # 手动/定时跑步撞上「没有凭证」时, 这里把采集接过来, 不用人再点一次。
-        if self._capture_requested and not self.busy:
-            self._capture_requested = False
-            if self.auto_capture():
-                return
         try:
             settings = self.store.settings()
         except Exception:  # noqa: BLE001 —— 设置坏了不轰炸，由快照呈现
@@ -390,8 +371,6 @@ class LptiyuController:
             if (settings.term_run_limit and self._term_quota.get(self.store.active_member_id())
                     == (current.date(), settings.term_run_limit)):
                 return
-            if not self.store.has_token() and self.auto_capture():
-                return
             self.start('auto_run')
             return
         # 多成员轮跑: 任何一个已添加、有凭证、今天还没跑完的账号都轮到。
@@ -400,25 +379,23 @@ class LptiyuController:
         pending = self._pending_members()
         if not pending:
             return
-        if not any(item.get('has_token') for item in pending):
-            # 一个有凭证的都没有: 走原本的采集兜底, 不空跑一轮。
-            if not self.store.has_token() and self.auto_capture():
-                return
         self._start_run_all(pending)
 
     def drain(self):
         values = []
         while True:
             try:
-                self.latest = self.events.get_nowait()
-                values.append(self.latest)
+                result = self.events.get_nowait()
             except queue.Empty:
                 return values
+            if not result.get('notice_only'):
+                self.latest = result
+            values.append(result)
 
     def cancel_work(self):
         with self._gate:
             self.cancel.set()
-            self._capture_requested = False
+            self._capture_interrupted.set()
 
     def _check_cancelled(self):
         if self.cancel.is_set():
@@ -630,6 +607,7 @@ class LptiyuController:
                 'remaining_s': int(status.get('remaining_s') or 0),
                 'cert_installed': bool(cached.get('installed')),
                 'fingerprint': str(cached.get('fingerprint') or '')[:16],
+                'port': int(status.get('port') or 0),
                 'available': True}
 
     def capture_cert_install(self):
@@ -648,48 +626,8 @@ class LptiyuController:
         self._cert_cache = (0.0, None)
         return result
 
-    def capture_ready(self):
-        """采集能不能自己跑: 证书装好就行(证书安装是明确的用户动作, 代劳不了)。"""
-        try:
-            return bool(self.capture.cert_status().get('installed'))
-        except Exception:              # noqa: BLE001 —— certutil 不在也当没装
-            return False
-
-    def _auto_capture_due(self):
-        if not self.capture_ready():
-            return False
-        state = self.store.capture_state()
-        today = self._clock().date().isoformat()
-        if int(state['attempts'].get(today, 0)) >= AUTO_CAPTURE_DAILY_CAP:
-            return False
-        if state['last_attempt']:
-            try:
-                last = dt.datetime.fromisoformat(state['last_attempt'])
-            except ValueError:
-                last = None
-            if last and (self._clock() - last).total_seconds() < AUTO_CAPTURE_COOLDOWN_MIN * 60:
-                return False
-        return True
-
-    def auto_capture(self):
-        """静默自愈: 起代理、唤起小程序、拿凭证、还原代理, 全程不需要人参与。"""
-        if self.busy or self.closed or not self._auto_capture_due():
-            return False
-        try:
-            self.store.record_capture_attempt(self._clock())
-        except Exception:              # noqa: BLE001 —— 记账失败不该拦住采集
-            pass
-        self._capture_auto = True
-        return bool(self.start('capture'))
-
     def capture_diagnose(self):
-        """采集自检: 一条条量给你看, 外加一次真实的代理链测试。
-
-        这一套是为了回答「明明点了开始采集, 为什么一个请求都没有」——
-        微信在不在、跑的什么版本、代理链通不通、上次采集收没收到连接。
-        """
-        from lptiyu_capture import proxy_self_test
-
+        """从本机配置与上次采集的观测诊断，不主动访问服务。"""
         protocol = wechat_protocol_registered()
         installed = wechat_installed()
         running = _wechat_running()
@@ -697,12 +635,7 @@ class LptiyuController:
             cert = self.capture.cert_status()
         except Exception:              # noqa: BLE001
             cert = {'installed': False, 'fingerprint': ''}
-        try:
-            enable, server, _override = self.capture.proxy.read()
-            proxy = {'enable': int(enable), 'server': str(server)}
-        except Exception:              # noqa: BLE001
-            proxy = {'enable': None, 'server': ''}
-        proxy_ok, proxy_detail = proxy_self_test(self.capture.ca)
+        capture = self.capture.status()
         connects = int(getattr(self.capture, 'connects', 0))
         try:
             log_tail = (self.store.root / 'capture' / 'capture.log').read_text(
@@ -714,10 +647,8 @@ class LptiyuController:
             'wechat_installed': installed,
             'wechat_running': running,
             'cert': cert,
-            'proxy': proxy,
-            'proxy_ok': proxy_ok,
-            'proxy_detail': proxy_detail,
-            'capture_state': self.capture.status().get('state'),
+            'port': int(capture.get('port') or 0),
+            'capture_state': capture.get('state'),
             'connects': connects,
             'log_tail': log_tail,
         }
@@ -725,38 +656,81 @@ class LptiyuController:
             verdict = '本机没有找到微信（精简版/商店版也算没有）：装官方经典版微信后再试'
         elif not running:
             verdict = '微信没在运行：先打开微信、确认能进小程序，再点开始采集'
-        elif not proxy_ok:
-            verdict = f'代理链不通（{proxy_detail}）：先关掉 Clash 之类的代理软件再试'
+        elif not cert.get('installed'):
+            verdict = '采集证书尚未安装'
         elif connects == 0:
-            verdict = ('代理链没问题，但微信没把流量交出来：'
-                       '微信设置里不要单独设代理，或换经典版微信')
+            verdict = '尚未收到乐跑请求，请开始采集并在微信小程序进入跑步首页'
         else:
-            verdict = '采集链正常：微信已经连上，只是还没拿到凭证'
+            verdict = f'已收到 {connects} 次乐跑连接'
         report['verdict'] = verdict
         return report
 
     def capture_stop(self):
+        self._capture_interrupted.set()
         self.capture.stop('idle', '已停止采集')
         status = self.capture.status()
         return self._set_latest(status.get('state', 'idle'),
                                 status.get('message') or '已停止采集', record=False)
 
+    def recover_network(self):
+        """结束活动采集，并用可信的备份尝试恢复遗留代理。"""
+        release_error = ''
+        with self._gate:
+            self._capture_interrupted.set()
+            capture_state = self.capture.status().get('state')
+            released = capture_state in ('capturing', 'waiting')
+            if released or capture_state == 'error':
+                self.capture.stop('idle', '已释放采集连接')
+                status = self.capture.status()
+                if status.get('state') == 'error':
+                    release_error = status.get('message') or '采集代理尚未恢复，请稍后重试。'
+        try:
+            state = proxy_guard.restore_owned_capture_proxy(
+                self.store.root / 'capture' / proxy_guard.BACKUP_NAME)
+        except OSError:
+            return {'state': 'error', 'message': '无法检查 Windows 代理，请在系统设置中核对。'}
+        if state == 'restored':
+            return {'state': 'restored', 'message': '已恢复采集前的 Windows 代理。'}
+        if state == 'unverified':
+            message = '本机代理端口不可用，无法确认原设置，请在 Windows 代理设置中核对。'
+            try:
+                os.startfile('ms-settings:network-proxy')
+            except (AttributeError, OSError):
+                pass
+            return {'state': 'manual', 'message': message}
+        if release_error:
+            return {'state': 'error', 'message': release_error}
+        if released:
+            return {'state': 'released', 'message': '已释放采集连接。'}
+        return {'state': 'unchanged', 'message': '当前没有需要恢复的采集代理。'}
+
     def _capture_flow(self):
         """等一次小程序登录, 把 token 与身份一起落盘, 然后当真门探活。"""
-        auto = self._capture_auto
+        cred = self._receive_capture()
+        if not cred:
+            status = self.capture.status()
+            return self._set_latest('idle', status.get('message') or '已停止采集', record=False)
+        return self._file_manual_capture(cred)
+
+    def _receive_capture(self):
         self._check_cancelled()
+        if self._capture_interrupted.is_set():
+            return None
         try:
-            self.capture.start(stop_event=self.cancel)
+            self.capture.start(stop_event=self._capture_interrupted)
         except CaptureError as exc:
             if self.cancel.is_set():
                 self._check_capture_error()
                 self._check_cancelled()
+            if self._capture_interrupted.is_set():
+                return None
             raise LptiyuError('error', str(exc)) from exc
         try:
             self._check_cancelled()
-            return self._capture_until_done(auto)
+            if self._capture_interrupted.is_set():
+                return None
+            return self._wait_for_capture()
         finally:
-            # 任何提前返回/异常都不能把系统代理留在采集端口上: 那会让浏览器断网。
             self._stop_if_capturing()
             if self.cancel.is_set():
                 self._check_capture_error()
@@ -778,7 +752,7 @@ class LptiyuController:
             except Exception:          # noqa: BLE001 —— 收尾必须尽力
                 pass
 
-    def _capture_until_done(self, auto):
+    def _wait_for_capture(self):
         launched = False
         try:
             launched = bool(self._open_applet())
@@ -789,18 +763,17 @@ class LptiyuController:
         log = getattr(self.capture, 'log', None)
         if callable(log):
             log('已请求微信打开小程序' if launched else '没能唤起微信, 等用户手动打开')
-        prefix = '正在自动采集凭证：' if auto else ''
         self._set_latest(
             'capturing',
-            (prefix + '已打开小程序，等待它发出第一个请求…') if launched
-            else (prefix + (reason or '请在微信里打开「数体智慧体育」并进入跑步首页')),
+            '已打开小程序，等待它发出第一个请求…' if launched
+            else (reason or '请在微信里打开「数体智慧体育」并进入跑步首页'),
             record=False)
         started_at = time.monotonic()
         hint_at = started_at + 25
         last_check = started_at
 
         def tick():
-            """结束被其他代理打断的采集，并提示无流量的情况。"""
+            """检查本地监听存活，并在客户端未送来请求时提示。"""
             nonlocal hint_at, last_check
             stamp = time.monotonic()
             if stamp - last_check >= 10:
@@ -809,22 +782,25 @@ class LptiyuController:
                     return
             if hint_at and stamp >= hint_at and not getattr(self.capture, 'connects', 0):
                 hint_at = 0
-                self.capture.log('25 秒内没有任何连接: 微信可能没走系统代理, 或被别的代理软件接管')
-                self._set_latest(
-                    'capturing',
-                    '还没看到流量：确认微信用的是系统代理（微信设置里不要单独设代理），'
-                    '并真正打开小程序页', record=False)
+                if callable(log):
+                    log('25 秒内未收到乐跑连接')
+                self._set_latest('capturing', '还没收到乐跑请求，请在小程序进入跑步首页',
+                                 record=False)
 
         self._check_cancelled()
-        cred = self.capture.wait(on_tick=tick, stop_event=self.cancel)
+        cred = self.capture.wait(on_tick=tick, stop_event=self._capture_interrupted)
         self._check_capture_error()
         self._check_cancelled()
+        if self._capture_interrupted.is_set():
+            return None
         if not cred:
             status = self.capture.status()
             if status.get('state') == 'idle':
-                return self._set_latest('idle', status.get('message') or '已停止采集',
-                                        record=False)
+                return None
             raise LptiyuError('need_token', status.get('message') or '没有抓到凭证')
+        return cred
+
+    def _file_manual_capture(self, cred):
         # 归档认身份不认活动指针: 抓到谁就归给谁(对不上就建新成员)。
         filed = self.store.file_captured_credential(cred)
         label = str(filed.get('name') or '成员')
@@ -835,9 +811,8 @@ class LptiyuController:
         if not filed.get('is_active'):
             # 归档给了旁席成员: 探活属于活动成员的槽位, 不越权代查;
             # 换到那一档时真门探活自然会确认。
-            suffix = '（自动采集）' if auto else ''
             return self._set_latest('synced',
-                                    f'已为「{label}」归档凭证，活动成员未变{suffix}')
+                                    f'已为「{label}」归档凭证，活动成员未变')
         client = self.slot.make_client(pace=0.0)
         try:
             alive = self._probe_alive(client)
@@ -850,11 +825,8 @@ class LptiyuController:
             raise LptiyuError('need_token', '抓到的凭证当场失效了：在小程序里重新登录后再采集')
         self.store.record_probe(True)
         if self._capture_switch_intent and len(self.store.members_status()['items']) > 1:
-            return self._set_latest(
-                'synced', f'已添加「{label}」的凭证并切换过去，确认可用' if auto
-                else f'已采集「{label}」的凭证并切换过去，确认可用')
-        return self._set_latest('synced', f'已自动采集「{label}」的凭证，并确认可用' if auto
-                                else f'已采集「{label}」的凭证，并确认可用')
+            return self._set_latest('synced', f'已采集「{label}」的凭证并切换过去，确认可用')
+        return self._set_latest('synced', f'已采集「{label}」的凭证，并确认可用')
 
     # ------------------------------------------------------------- 样本
     def _record_sample(self, summary, settings):
@@ -1069,12 +1041,13 @@ class LptiyuController:
         台账(renewal.json)里有痕, 界面那行「上次 13:49」就是它。
         """
         outcome = self._renew_credentials(force=False)
-        if (outcome.state == 'need_user'
-                and not self.store.is_signed_today(self._clock().date())):
-            # 今天已经跑完了就别再喊「需要凭证」: 状态栏该留住「今日已完成」,
-            # 这次失败在续期台账里(界面那行会写出原因), 明天到点前还会再试。
-            return self._set_latest('need_token', outcome.message, record=False)
-        return None
+        if outcome.state != 'need_user':
+            return None
+        at = self._clock()
+        if self.store.is_signed_today(at.date()):
+            return {'state': 'need_token', 'message': outcome.message,
+                    'at': at.isoformat(timespec='seconds'), 'notice_only': True}
+        return self._set_latest('need_token', outcome.message, record=False)
 
     def _renew_credentials(self, force):
         self._check_cancelled()
@@ -1085,11 +1058,10 @@ class LptiyuController:
     def _ensure_credentials(self, renew=True):
         """返回可用凭证; 拿不到就抛 LptiyuError(need_token)。
 
-        阶梯统一交给 renewer: 探活 → 研究库 → 主动采集(借用研究库采集链),
+        阶梯统一交给 renewer: 探活 → 同步已有凭证文件,
         每一步都用真门探活收尾。到点自动跑或用户手动提交, 都按 force=True 走 ——
         用户/日程已经表达了「现在要用凭证」, 不该再被台账冷却挡回去。
-        多成员轮跑传 renew=False: 台账/采集阶梯是为「当前活动成员」设计的,
-        轮跑里给旁席成员跑一遍会把队列挂在没人打开的小程序上。手动验证也只检查
+        多成员轮跑传 renew=False: 续期设置针对当前活动成员。手动验证也只检查
         当前凭证, 由 _execute 决定如何处理探活结果。
         """
         self._check_cancelled()
@@ -1103,38 +1075,6 @@ class LptiyuController:
             return record
         raise LptiyuError('need_token',
                           outcome.message if outcome is not None else '没有可用凭证')
-
-    def _grab_via_lab(self):
-        """借用研究库的采集链抓一次凭证(需要小程序冷启动一次)。
-
-        返回 (ok, reason); ok 只表示采集链自己走完了, 拿到没拿到由随后的
-        探活/同步裁决 —— 采集退出码成功但用户没开小程序是常态。
-        """
-        lab = self.store.lab_dir()
-        script = os.path.join(lab, 'lpctl.py')
-        selector = self.store.identity().get('student_num') or ''
-        python = shutil.which('py')
-        if python:
-            command = [python, '-3', script]
-        else:
-            python = shutil.which('python')
-            if not python:
-                return False, '本机没有可用的 Python'
-            command = [python, script]
-        command += ['grab', '--timeout', '480']
-        if selector:
-            command += ['--member', selector]
-        self._check_cancelled()
-        try:
-            completed = subprocess.run(command, capture_output=True,
-                                       timeout=GRAB_TIMEOUT_SECONDS,
-                                       creationflags=CREATE_NO_WINDOW, cwd=lab)
-        except subprocess.TimeoutExpired:
-            return False, '采集等待超时'
-        except OSError:
-            return False, '采集链启动失败'
-        self._check_cancelled()
-        return completed.returncode == 0, '' if completed.returncode == 0 else '采集链退出异常'
 
     def _probe_record(self, record=None):
         """续期器的探活回调: (True=活, False=101 判死, None=链路故障不知道)。"""
@@ -1256,16 +1196,8 @@ class LptiyuController:
         try:
             record = self._ensure_credentials(renew=submit and not self._sweeping_run)
         except LptiyuError as exc:
-            # 没有凭证但有采集能力: 交给下一拍自己采, 不用人点「同步凭证」。
             if exc.state == 'need_token' and not submit:
                 raise LptiyuError('need_token', '当前成员没有可用凭证，请更新或导入凭证后再验证') from None
-            if exc.state == 'need_token' and self._auto_capture_due():
-                with self._gate:
-                    self._check_cancelled()
-                    self._capture_requested = True
-                raise LptiyuError(
-                    'need_token',
-                    '本机没有可用凭证：正在自动采集，微信打开小程序后就会继续') from None
             raise
         self._progress(1, total, labels, '凭证就绪，正在确认账号状态…')
         client = self.slot.make_client(pace=0.8)

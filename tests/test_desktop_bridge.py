@@ -40,10 +40,7 @@ def _at(value):
 
 
 class LeftoverCaptureProxyTests(unittest.TestCase):
-    """2026-11-18: 采集崩溃后系统代理指向死端口, 浏览器整台断网。
-
-    界面启动时必须先清一次场; 清场失败也只能安静放过, 不能拦住界面启动。
-    """
+    """旧版代理只在明确请求恢复时写回。"""
 
     def test_a_leftover_backup_in_the_capture_directory_is_recovered(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -55,9 +52,18 @@ class LeftoverCaptureProxyTests(unittest.TestCase):
                         / 'proxy_backup.json')
             self.assertEqual(Path(recover.call_args.args[0]), expected)
 
-    def test_a_failing_recovery_never_blocks_startup(self):
+    def test_an_explicit_recovery_failure_reports_false(self):
         with patch('proxy_guard.recover_stale_backup', side_effect=OSError('nope')):
             self.assertFalse(desktop_bridge.recover_leftover_capture_proxy())
+
+    def test_desktop_startup_does_not_start_legacy_proxy_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch('desktop_bridge.recover_leftover_capture_proxy') as recover, \
+                patch('desktop_bridge.gui.ensure_user_config', side_effect=lambda p: p), \
+                patch('desktop_bridge.gui.load_gui_settings', return_value=GuiSettings()), \
+                patch('desktop_bridge.gui.is_startup_enabled', return_value=False):
+            DesktopBridge(Path(tmp) / 'config.ini', dorm=MagicMock())
+            recover.assert_not_called()
 
 
 class FakeController:
@@ -1535,6 +1541,13 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertTrue(settings.enabled)
         self.assertEqual(settings.pace_range(), (245, 280))
 
+    def test_obsolete_capture_proxy_port_is_ignored_when_saving_other_settings(self):
+        result = self.bridge.dispatch('lptiyu_save', {'capture_proxy_port': 18781.5, 'run_time': '07:00'})
+        self.assertTrue(result['ok'])
+        settings = self.bridge.snapshot()['lptiyu']['settings']
+        self.assertNotIn('capture_proxy_port', settings)
+        self.assertEqual(settings['run_time'], '07:00')
+
     def test_lptiyu_term_limit_is_saved_preserved_on_partial_updates_and_removable(self):
         self.assertIsNone(self.bridge.snapshot()['lptiyu']['settings'].get('term_run_limit'))
         result = self._save_term_limit(28)
@@ -1832,6 +1845,13 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertTrue(self.bridge.dispatch('lptiyu_capture_stop')['ok'])
         self.assertEqual(self.controller.latest['state'], 'idle')
 
+    def test_manual_capture_and_member_capture_do_not_require_a_configured_port(self):
+        with patch.object(self.controller, 'start', return_value=True) as start:
+            for operation in ('capture', 'capture_add'):
+                with self.subTest(operation=operation):
+                    self.assertTrue(self.bridge.dispatch('lptiyu_' + operation)['ok'])
+                    start.assert_called_with(operation)
+
     def test_capture_stop_reports_proxy_recovery_failure(self):
         with patch.object(self.controller, 'capture_stop', return_value={
             'state': 'error', 'message': '已停止采集，系统代理恢复失败',
@@ -1839,6 +1859,29 @@ class LptiyuBridgeTests(unittest.TestCase):
             result = self.bridge.dispatch('lptiyu_capture_stop')
         self.assertFalse(result['ok'])
         self.assertIn('恢复失败', result['message'])
+
+    def test_network_recovery_can_dispatch_while_a_mutation_is_waiting(self):
+        self.controller.busy = True
+        result = []
+        worker = threading.Thread(target=lambda: result.append(
+            self.bridge.dispatch('lptiyu_recover_network')), daemon=True)
+        with patch.object(self.controller, 'recover_network', create=True,
+                          return_value={'state': 'idle', 'message': '已恢复旧版乐跑代理'}) as recover:
+            try:
+                with self.bridge._mutation:
+                    worker.start()
+                    worker.join(timeout=1)
+                    self.assertFalse(worker.is_alive(), '恢复网络须跳过其他操作的锁')
+            finally:
+                worker.join(timeout=2)
+            recover.assert_called_once_with()
+        self.assertEqual(result, [{'ok': True, 'message': '已恢复旧版乐跑代理'}])
+
+    def test_network_recovery_reports_a_controller_failure(self):
+        with patch.object(self.controller, 'recover_network', create=True,
+                          return_value={'state': 'error', 'message': '没有可安全恢复的原值'}):
+            result = self.bridge.dispatch('lptiyu_recover_network')
+        self.assertEqual(result, {'ok': False, 'message': '没有可安全恢复的原值'})
 
     def test_certificate_actions_report_their_detail(self):
         ca = self.controller.capture.ca

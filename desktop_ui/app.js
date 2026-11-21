@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 const titles = {overview:'今日概览',network:'校园网',dorm:'寝室打卡',lptiyu:'乐跑',records:'运行记录',updates:'软件更新'};
 let state = null, logType = 'network', pending = false, refreshTask = null, epoch = 0, syncedEpoch = -1, timer, proxyIgnored = false;
-const cancelPending = new Set();
+const interruptPending = new Set();
 const dirty = {network:false, dorm:false, lptiyu:false};
 const revisions = {network:0, dorm:0, lptiyu:0};
 let sourceDirty = false, sourceRevision = 0;
@@ -474,7 +474,7 @@ function render() {
   document.querySelectorAll('[data-action="dorm_login"],[data-action="dorm_query"]').forEach(b=>b.disabled=pending||d.busy);
   $('submit-dorm').disabled=pending||syncedEpoch!==epoch||d.busy||!['ready','uncertain'].includes(d.state);
   $('submit-dorm').firstChild.textContent=d.state==='uncertain'?'回查提交结果 ':'提交今日打卡 ';
-  $('cancel-dorm').disabled=cancelPending.has('dorm_cancel')||!(d.busy||state.accounts?.busy);
+  $('cancel-dorm').disabled=interruptPending.has('dorm_cancel')||!(d.busy||state.accounts?.busy);
   $('logout-dorm').disabled=pending||d.busy;
   renderLogin(d,pending);
   $('idm-clear').disabled=!d.has_idm_credentials||pending||d.busy;
@@ -607,17 +607,18 @@ function actBlocksOnUac(action,payload){
   // The bridge waits for the elevated helper, so the form is blocked until UAC is answered.
   return action==='network_save'&&!!state&&payload.startup!==state.network.startup;
 }
-async function cancelOperation(action){
-  if(cancelPending.has(action))return;
-  cancelPending.add(action);
+async function interruptOperation(action){
+  if(interruptPending.has(action))return;
+  interruptPending.add(action);
   render();
   try{
     const result=await api.dispatch(action,{});
     notify(result.message,!result.ok);
   }catch(error){
-    notify('未收到取消结果，请检查后台连接后重试。',true);
+    const operation=action==='lptiyu_recover_network'?'恢复':'取消';
+    notify(`未收到${operation}结果，请检查后台连接后重试。`,true);
   }finally{
-    cancelPending.delete(action);
+    interruptPending.delete(action);
     render();
     if(refreshTask)await refreshTask;
     await refresh();
@@ -625,7 +626,7 @@ async function cancelOperation(action){
 }
 async function act(action,payload={}){
   if(!api)return false;
-  if(action==='dorm_cancel'||action==='lptiyu_cancel')return cancelOperation(action);
+  if(['dorm_cancel','lptiyu_cancel','lptiyu_recover_network'].includes(action))return interruptOperation(action);
   if(pending)return false;
   const simulation=savedLocationSource()==='simulation'&&(action==='location_authorize'||(action==='dorm_submit'&&state.dorm.state!=='uncertain'));
   pending=true;epoch++;render();
@@ -883,7 +884,7 @@ function renderRunStatus(lp,s){
   }
   $('lp-auto-summary').textContent=s.enabled?`${s.run_time||'06:30'} 自动`:'未开启';
   $('lp-submit').disabled=pending||syncedEpoch!==epoch||lp.busy||['signed','quota'].includes(lp.state);
-  $('lp-cancel').disabled=cancelPending.has('lptiyu_cancel')||!lp.busy;
+  $('lp-cancel').disabled=interruptPending.has('lptiyu_cancel')||!lp.busy;
   $('lp-dry').disabled=pending||lp.busy;
 }
 function renderTermLimit(lp,s){
@@ -936,9 +937,9 @@ function renderRunSettings(lp,s){
   if($('lp-zone-apply'))$('lp-zone-apply').disabled=pending||lp.busy||!selected;
   const lab=lp.lab||{};
   $('lp-lab').value=lab.configured||'';
-  $('lp-lab-hint').textContent=lab.ok?'已找到研究库，可以自动采集凭证'
+  $('lp-lab-hint').textContent=lab.ok?'已找到研究库，可同步已有凭证和模板。'
     :(lab.reason==='missing_lpctl'?'这个目录里没有 lpctl.py，检查路径是否正确'
-      :'未找到研究库：没有它无法采集新凭证');
+      :'未找到研究库。');
   $('lp-schedule').textContent=lp.schedule||'自动跑步：关闭';
 }
 function captureText(cap){
@@ -966,21 +967,23 @@ function renderRunCredential(lp){
   // sync.json 只在真抓到新 token 时前移，探活续期不动它 —— 只看它会永远写着
   // 「3.5 小时前同步」，而后台其实每三小时都在确认这枚凭证还能用。
   const confirmed=clockText((lp.renewal||{}).last_success);
+  const cap=lp.capture||{};
+  const captureUnavailable=lp.available===false||cap.available===false;
   $('lp-credential-line').textContent=lp.has_token
     ?(confirmed?`凭证可用 · ${confirmed} 确认`:ageText)
-    :((lp.lab&&lp.lab.ok===false)
-      ?'本机没有采集组件（研究库），无法自动取凭证：先在「跑步设置」里填写研究库目录。'
-      :'尚未同步凭证。');
+    :(captureUnavailable?'尚未同步凭证。':cap.cert_installed
+      ?'尚未同步凭证，可以开始采集或导入。':'可导入凭证，首次采集请在「采集设置」中安装证书。');
   $('lp-identity-line').textContent=lp.identity?.name?`当前成员：${lp.identity.name}`:'';
   document.querySelectorAll('[data-action="lptiyu_sync"],[data-action="lptiyu_renew"]').forEach(b=>b.disabled=pending||lp.busy);
-  const cap=lp.capture||{};
+  $('lp-member-import').disabled=pending||lp.busy||lp.available===false||!!lp.members?.error;
+  $('lp-recover-network').disabled=interruptPending.has('lptiyu_recover_network');
   $('lp-cert-line').textContent=cap.cert_installed
     ?`采集证书：已安装（${cap.fingerprint||'—'}）`
     :'采集证书：未安装，先装一次才能采集';
   $('lp-capture-line').textContent=captureText(cap);
-  $('lp-cert-install').disabled=pending||cap.cert_installed;
-  $('lp-cert-remove').disabled=pending||!cap.cert_installed;
-  $('lp-capture-start').disabled=pending||lp.busy||!cap.cert_installed;
+  $('lp-cert-install').disabled=pending||lp.busy||captureUnavailable||cap.cert_installed;
+  $('lp-cert-remove').disabled=pending||lp.busy||!cap.cert_installed;
+  $('lp-capture-start').disabled=pending||lp.busy||captureUnavailable||cap.state==='waiting'||!cap.cert_installed;
   $('lp-capture-stop').disabled=pending||cap.state!=='waiting';
 }
 function renderLptiyu(){
@@ -1044,10 +1047,7 @@ function renderActiveMemberChip(lp){
   }
   lpMemberShown=text;
 }
-/* 乐跑成员 -----------------------------------------------------------------------------------
-   成员清单与打卡账号同一套交互: 下拉切换、添加(= 采集, 抓到谁归档给谁)、重命名、删除(= 退出账号)。
-   添加成员不新建空档案 —— 点「添加成员」就是起一次采集, 对方用微信多开(或临时登录)打开一次
-   小程序, 凭证按 uid 自动归档, 活动成员不被顶掉。老快照没有 members 区块时整条栏不出现。 */
+/* 乐跑成员支持切换、手动采集、导入、重命名与退出。 */
 function memberItems(){return state?.lptiyu?.members?.items||[];}
 function activeMember(){
   const members=state?.lptiyu?.members||{},items=members.items||[];
@@ -1081,17 +1081,18 @@ function renderMembers(lp){
   const active=activeMember(),activeId=active?active.id:'';
   if(syncedEpoch===epoch)select.value=activeId;   // 状态没同步时不覆盖用户正在做的选择
   const blocked=Boolean(pending||error||lp.busy),max=members.max||0,full=max>0&&items.length>=max;
+  const captureEnabled=lp.available!==false&&lp.capture?.available!==false
+    &&lp.capture?.state!=='waiting'&&lp.capture?.cert_installed;
   select.disabled=blocked||!items.length;
   $('lp-member-name').disabled=blocked;
-  $('lp-member-add').disabled=blocked||full;
+  $('lp-member-add').disabled=blocked||full||!captureEnabled;
   $('lp-member-rename').disabled=blocked||!items.length;
   $('lp-member-delete').disabled=blocked||!items.length;
   const dead = items.filter(member=>member.alive===false).map(member=>member.name);
   $('lp-member-state').textContent=error
     ||(full?`最多 ${max} 个成员。`
-      :'添加成员：让对方用微信多开（或临时登录）打开一次小程序，凭证会自动归档并切换过去。'
-      +' 自动跑步开启时，到点会按成员逐个打卡，谁今天没跑才跑谁。')
-    +(dead.length?` 「${dead.join('、')}」的凭证已失效：让 TA 重跑一次提取器，新文件发来后点「导入凭证」。`:'');
+      :captureEnabled?'「添加成员」会打开微信小程序采集凭证。':'可通过「导入凭证」添加成员。')
+    +(dead.length?` 「${dead.join('、')}」的凭证已失效，可导入新的凭证文件。`:'');
   // 名字框只在真的换了活动成员时回写：它同时是重命名的输入框, 不能被后台重绘冲掉。
   if(memberNameFor!==activeId){
     memberNameFor=activeId;

@@ -156,7 +156,8 @@ def build_diagnose(report, version="", now=None):
     now = now or dt.datetime.now()
     report = report or {}
     cert = report.get("cert") or {}
-    proxy = report.get("proxy") or {}
+    port = report.get("port")
+    listener = f"127.0.0.1:{port}" if port else "空闲"
     lines = [
         "# 乐跑采集自检（youziauth）",
         "",
@@ -175,8 +176,7 @@ def build_diagnose(report, version="", now=None):
         f"| 微信安装 | {'找到' if report.get('wechat_installed') else '没找到'} |",
         f"| 微信进程 | {'在运行' if report.get('wechat_running') else '没运行'} |",
         f"| 采集证书 | {'已安装 ' + str(cert.get('fingerprint') or '')[:16] if cert.get('installed') else '未安装'} |",
-        f"| 系统代理 | {proxy.get('server') or '—'}（{'开' if proxy.get('enable') else '关'}） |",
-        f"| 代理链自测 | {report.get('proxy_detail') or '—'} |",
+        f"| 临时采集监听 | {listener} |",
         f"| 上次采集 | {report.get('capture_state') or '—'}，收到 {report.get('connects', 0)} 个连接 |",
         "",
     ]

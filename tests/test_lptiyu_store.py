@@ -32,6 +32,18 @@ class SettingsTests(unittest.TestCase):
     def test_defaults_validate(self):
         self.assertEqual(Settings().validate().run_time, '06:30')
 
+    def test_settings_from_the_scoped_capture_build_keep_their_other_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / 'settings.json'
+            config.write_text('{"run_time":"07:00","capture_proxy_port":18781}', encoding='utf-8')
+            store = Store(root)
+            settings = store.settings()
+            self.assertFalse(hasattr(settings, 'capture_proxy_port'))
+            self.assertEqual(settings.run_time, '07:00')
+            store.save_settings(settings)
+            self.assertNotIn('capture_proxy_port', json.loads(config.read_text(encoding='utf-8')))
+
     def test_inverted_distance_rejected(self):
         with self.assertRaises(ValueError):
             Settings(dist_lo=3.0, dist_hi=2.0).validate()

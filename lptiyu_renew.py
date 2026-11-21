@@ -6,15 +6,15 @@ loginByCode 轮换产生, 旧号的死亡形态恒 status=101(实测结论见 lp
 
   1) 真门探活(getTermList, 无副作用)确认手上这枚还能用 —— 这是唯一的存活判据;
   2) 只有 101 才判死; 网络故障只算「不知道」, 绝不清掉手上这枚凭证;
-  3) 判死/无号时按 本机 → 研究库 → 主动采集 的阶梯补号, 每拿到一枚都探活收尾;
+  3) 判死或无号时尝试同步研究库已有文件，探活新凭证，缺少可用凭证时提示手动采集或导入;
   4) 跑步前 renew_lead_min 分钟再确认一次, 让「到点自动跑」不因凭证失效而空跑;
-  5) 后台动作全部有配额与冷却: 主动采集每天 ≤2 次、探活 ≤12 次、失败后冷却 20 分钟,
+  5) 探活每天至多 12 次，需要手动采集时冷却 20 分钟，网络故障时退避，
      绝不无限重试 —— 续期是维护, 不是刷接口。
 
 state 是受控词表(与界面文案一一对应):
   ok        手上这枚还活着, 不需要换
   renewed   已经换到并确认了一枚新凭证
-  need_user 需要用户在小程序里开一次跑步首页(研究库不在 / 采集次数用完)
+  need_user 需要用户手动采集或导入凭证
   cooldown  上一次没成功, 冷却中
   capped    今天的探活次数用完了
   error     链路故障, 稍后按退避重试
@@ -24,10 +24,10 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import math
 
 from lptiyu_store import now, parse_time
 
-MAX_DAILY_GRABS = 2          # 主动采集(要用户开一次小程序)的每日硬上限
 MAX_DAILY_PROBES = 12        # 真门探活的每日硬上限: 界面每 5 秒一拍也不能把接口打爆
 COOLDOWN_MINUTES = 20        # 一次没成功后不再纠缠的时间
 BACKOFF_BASE_MINUTES = 15    # 链路故障的退避起点
@@ -45,21 +45,17 @@ class RenewOutcome:
 
 
 class CredentialRenewer:
-    """凭证保活器。probe/grab 都由控制器注入, 单测里可不碰网络与子进程。
+    """探活并同步已有凭证，由控制器注入探活函数。
 
     probe(record) -> (True, '')      手上这枚可用
                    -> (False, '101') 真门 101, 判死
                    -> (None, '原因') 链路故障, 不知道死没死
-    grab() -> (ok, reason)           起一次主动采集(用户要在小程序点一次)
     """
 
-    def __init__(self, store, clock=None, probe=None, grab=None, can_capture=None, check_cancelled=None):
+    def __init__(self, store, clock=None, probe=None, check_cancelled=None):
         self.store = store
         self._clock = clock or now
         self._probe = probe or (lambda record: (None, '未配置探活'))
-        self._grab = grab or (lambda: (False, '未配置采集'))
-        # 内置采集(不用研究库)能不能用: 由控制器按证书是否安装给出
-        self._can_capture = can_capture or (lambda: False)
         self._check_cancelled = check_cancelled or (lambda: None)
 
     # ------------------------------------------------------------- 何时该续
@@ -69,7 +65,7 @@ class CredentialRenewer:
         两条独立理由, 任一成立即到期:
           * 台账上的 next_due 到了(低频探活);
           * 落在「跑步前 renew_lead_min 分钟」窗口里, 且今天这个窗口还没成功过。
-        自动跑步没开时后台不续期: 关掉自动跑步的机器不该在后台拉采集链。
+        自动跑步关闭时暂停后台续期，失败后遵循台账记录的重试时间。
         """
         try:
             settings = settings or self.store.settings()
@@ -78,11 +74,14 @@ class CredentialRenewer:
         if not (settings.enabled and settings.auto_renew):
             return False
         at = self._clock()
+        record = self.store.renewal()
+        next_due = self._parse(record.get('next_due'))
+        if next_due and at < next_due and record.get('state') not in ('ok', 'renewed', ''):
+            return False
         window = self._lead_window(settings, at)
         if window is not None:
-            last = self._parse(self.store.renewal().get('last_success'))
+            last = self._parse(record.get('last_success'))
             return last is None or last < window[0]
-        next_due = self._parse(self.store.renewal().get('next_due'))
         return next_due is None or at >= next_due
 
     def _lead_window(self, settings, at):
@@ -97,8 +96,7 @@ class CredentialRenewer:
     def renew(self, force=False):
         """跑一遍续期阶梯。
 
-        force=True 只越过「上次失败的冷却」(用户点了「立即续期」); 采集与探活的
-        每日配额始终生效 —— 那两条是保护用户与接口的硬上限。
+        手动点击「立即续期」可越过失败冷却，探活每日配额始终生效。
         """
         self._check_cancelled()
         try:
@@ -115,10 +113,10 @@ class CredentialRenewer:
                 return RenewOutcome('cooldown', f'上次续期没有成功，{wait} 分钟后再试',
                                     next_due=str(record.get('next_due') or ''))
 
+        if capped := self._probe_limit(settings):
+            return capped
         token = self._record()
         if token:
-            if self._budget_spent('probe', MAX_DAILY_PROBES):
-                return self._halt(settings, 'capped', '今天确认凭证的次数已用完，明天继续')
             alive, why = self._check(token)
             if alive:
                 return self._settle(settings, 'ok', '凭证可用', '真门探活')
@@ -128,6 +126,8 @@ class CredentialRenewer:
             self.store.clear_token()
             self.store.record_probe(False)
             reason = '凭证已失效'
+            if capped := self._probe_limit(settings):
+                return capped
         else:
             reason = '本机还没有凭证'
 
@@ -143,36 +143,7 @@ class CredentialRenewer:
                 return self._defer(f'已换上研究库的凭证，但暂时确认不了（{why}）')
             self.store.clear_token()
             self.store.record_probe(False)
-
-        if not self.store.lab_dir():
-            # 有内置采集就直接走它, 不要再往「研究库」那条路上撞 —— 那只会给用户
-            # 刷出一堆「未找到研究库目录」, 而真正该做的是点一下开始采集。
-            if self._can_capture():
-                return self._need_user(f'{reason}：点「开始采集」，'
-                                       f'微信打开小程序就能拿到凭证')
-            # 既没有研究库也不能自己采: 只能让用户想别的办法。
-            return self._need_user(f'{reason}：本机没有采集组件（研究库），'
-                                   f'请先在跑步设置里填写研究库目录')
-        # 配额是硬的: 手动点击只越过冷却, 不越过「今天最多采集两次」—— 采集链要用户
-        # 真去开一次小程序, 点了没反应再点十次也只会更乱。
-        if self._budget_spent('grab', MAX_DAILY_GRABS):
-            return self._need_user(f'{reason}，今天的自动采集次数已用完：'
-                                   f'在小程序里打开一次跑步首页后点「同步凭证」')
-        ok, why = self._capture()
-        if not ok:
-            return self._need_user(f'{reason}：自动采集没有完成'
-                                   + (f'（{why}）' if why else '，请打开一次小程序跑步首页'))
-        adopted = self._sync_lab()
-        if adopted:
-            alive, why = self._check(adopted)
-            if alive:
-                return self._settle(settings, 'renewed', f'{reason}，已自动续期并确认可用',
-                                    '自动采集')
-            if alive is None:
-                return self._settle(settings, 'renewed',
-                                    f'{reason}，已换上新凭证（网络不通，稍后再确认）',
-                                    '自动采集')
-        return self._need_user(f'{reason}：请在小程序里打开一次跑步首页，然后点「同步凭证」')
+        return self._need_user(f'{reason}，请点击「开始采集」或「导入凭证」。')
 
     # ------------------------------------------------------------- 内部动作
     def _record(self):
@@ -212,22 +183,6 @@ class CredentialRenewer:
         if 'token' not in (changes or []):
             return None
         return self._record()
-
-    def _capture(self):
-        self._check_cancelled()
-        try:
-            self.store.bump_daily(kind='grab')
-        except Exception:                       # noqa: BLE001
-            pass
-        try:
-            result = self._grab()
-        except Exception as exc:                # noqa: BLE001
-            self._check_cancelled()
-            return False, str(exc) or exc.__class__.__name__
-        self._check_cancelled()
-        if isinstance(result, tuple):
-            return bool(result[0]), str(result[1] or '')
-        return bool(result), ''
 
     # ------------------------------------------------------------- 记账
     # record_renewal 自己会追加一行历史, 这里不再重复 note()。
@@ -270,13 +225,16 @@ class CredentialRenewer:
         if next_due is None:
             return 0
         left = (next_due - self._clock()).total_seconds() / 60.0
-        return max(0, int(round(left)))
+        return max(0, math.ceil(left))
 
-    def _budget_spent(self, kind, limit):
+    def _probe_limit(self, settings):
         try:
-            return int(self.store.daily().get(kind, 0)) >= limit
+            spent = int(self.store.daily().get('probe', 0))
         except (TypeError, ValueError):
-            return False
+            return None
+        if spent >= MAX_DAILY_PROBES:
+            return self._halt(settings, 'capped', '今天确认凭证的次数已用完，明天继续')
+        return None
 
     @staticmethod
     def _parse(value):

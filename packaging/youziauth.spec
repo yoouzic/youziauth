@@ -39,8 +39,7 @@ gui_analysis = Analysis(
                    "lptiyu.client", "lptiyu.tracks", "lptiyu.zones", "lptiyu.upfile", "lptiyu.flow",
                    "lptiyu_store", "lptiyu_panel", "lptiyu_renew", "lptiyu_capture",
                    "lptiyu_members",
-                   # 采集代理看门狗: 由 --proxy-guard 以自身 exe 再起一个进程,
-                   # 冻结包必须把模块打进去。
+                   # 保留用于修复旧版本遗留代理的命令行入口。
                    "proxy_guard"],
     hookspath=[],
     hooksconfig={},

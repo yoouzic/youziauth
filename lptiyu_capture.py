@@ -7,23 +7,25 @@
   1. 本机生成一把专用 CA(`%LOCALAPPDATA%\\youziauth\\lptiyu\\capture\\ca.pem`),
      只用于签发 `*.lptiyu.com` 的站点证书;
   2. 用户显式点「安装证书」才写进 **当前用户** 的受信任根(免管理员), 随时可卸;
-  3. 「开始采集」把系统代理指到本机 127.0.0.1:<随机端口>, 只解密 lptiyu 域,
-     其它 TLS 一律原样隧道, 不经手;
-  4. 抓到 loginByCode 的 token 就落盘(DPAPI 由调用方负责), 并立刻还原系统代理;
-  5. 超时/停止/异常都走同一个收尾: 关服务、还原代理、清备份。
+  3. 会话默认只开放独立回环监听。桌面手动采集可显式启用临时系统代理，
+     只解析乐跑 HTTPS，其它请求按原代理转发;
+  4. 拿到凭证后恢复系统代理并关闭监听，DPAPI 归档由调用方负责。
 
 边界: 只处理 HTTP/1.1 与 CONNECT; 不碰 HTTP/2、WebSocket; 响应最多缓冲 8MB;
-采集结束立即还原代理, 不把用户留在代理里。
+超时、停止或异常时同样关闭监听。
 """
 from __future__ import annotations
 
 import atexit
 import base64
 import datetime as dt
+import fnmatch
 import http.client
 import json
+import math
 import os
 import queue
+import re
 import select
 import socket
 import socketserver
@@ -130,7 +132,16 @@ def credentials_from_login(body: bytes):
 
 def host_in_scope(host: str) -> bool:
     host = (host or "").strip().lower().rstrip(".")
-    return host == CAPTURE_HOST_SUFFIX or host.endswith("." + CAPTURE_HOST_SUFFIX)
+    suffix = re.escape(CAPTURE_HOST_SUFFIX)
+    return bool(len(host) <= 253 and re.fullmatch(
+        rf"(?:[a-z0-9](?:[a-z0-9-]{{0,61}}[a-z0-9])?\.)*{suffix}", host))
+
+
+def _capture_authority(authority):
+    """Return the canonical host for an allowed HTTPS authority, else empty."""
+    host, separator, port = authority.partition(":")
+    host = host.lower().removesuffix(".")
+    return host if (not separator or port == "443") and host_in_scope(host) else ""
 
 
 # ================================================================ 证书
@@ -151,8 +162,7 @@ def proxy_self_test(ca, host="api2.lptiyu.com", timeout=15):
     """临时起一个代理, 用它自己访问一次 lptiyu 接口。
 
     证明的是「代理链本身通」: 起服务 → CONNECT → 用我们签的证书做 MITM →
-    上游 TLS → 拿到响应。这一步过了, 采集却 0 连接, 那问题一定在微信那一侧
-    (没打开小程序 / 不走系统代理), 不用再猜。
+    上游 TLS → 拿到响应。这一步不验证微信或外部采集客户端的分流配置。
     """
     try:
         ca.ensure()
@@ -396,32 +406,77 @@ class SystemProxy:
     def write(self, enable, server, override=None):
         proxy_guard.write_proxy(enable, server, override, self.reg_path)
 
-    def prepare(self, port):
+    def prepare(self, port, *, expires_at=None):
         """Reserve the shared backup and record the current proxy before switching."""
         with proxy_guard.backup_lock(self.backup_path):
-            previous = proxy_guard.read_backup(self.backup_path)
+            current = self.read()
+            watched = expires_at is not None
+            if watched and self.backup_path == proxy_guard.shared_backup_path():
+                self._check_legacy_extractor(current)
+            previous = proxy_guard.read_backup(self.backup_path, owned_only=watched)
             if previous is not None:
                 if proxy_guard.backup_is_active(self.backup_path, previous):
                     raise CaptureError("另一个采集正在使用系统代理，请先结束该采集")
-                proxy_guard.restore_locked_backup(self.backup_path, previous, self.reg_path)
-            elif self.backup_path.exists():
+                if watched:
+                    if current[0] and current[1].strip() == f"127.0.0.1:{previous['port']}":
+                        raise CaptureError("上次采集的代理尚未恢复，请先点击「恢复网络」")
+                    self.backup_path.unlink()
+                else:
+                    proxy_guard.restore_locked_backup(self.backup_path, previous, self.reg_path)
+            elif self.backup_path.exists() and not (watched and self._retire_unstarted(current)):
                 raise CaptureError("无法读取上次的系统代理备份，请检查后再开始采集")
-            if self.backup_path == proxy_guard.shared_backup_path():
+            if not watched and self.backup_path == proxy_guard.shared_backup_path():
                 legacy = proxy_guard.legacy_extractor_backup_path()
                 proxy_guard.recover_stale_backup(legacy, self.reg_path)
                 if legacy.exists():
                     raise CaptureError("旧版提取器的代理备份仍在使用或无法读取，请先结束该采集")
-            enable, server, override = self.read()
+            enable, server, override = current if watched else self.read()
             capture_id = uuid.uuid4().hex
-            proxy_guard.write_backup(self.backup_path, {
+            record = {
                 "enable": enable,
                 "server": server,
                 "override": override,
                 "pid": os.getpid(),
                 "port": int(port),
                 "capture_id": capture_id,
-            })
+            }
+            if watched:
+                record.update(monitor_listener=True, expires_at=expires_at)
+            proxy_guard.write_backup(self.backup_path, record)
             self.capture_id = capture_id
+            return enable, server, override
+
+    def _retire_unstarted(self, current):
+        record = proxy_guard.read_backup(self.backup_path)
+        if not record or record.get("monitor_listener") is not True or "created" in record \
+                or record.get("guard_ready") is not None:
+            return False
+        capture_id = record.get("capture_id")
+        port, pid, expires = (record.get(key) for key in ("port", "pid", "expires_at"))
+        if not isinstance(capture_id, str) or not re.fullmatch("[0-9a-f]{32}", capture_id) \
+                or type(port) is not int or not 0 < port <= 65535 or type(pid) is not int or pid <= 0 \
+                or type(expires) is not float or not math.isfinite(expires):
+            return False
+        if proxy_guard.pid_alive(pid) or (current[0] and current[1].strip() == f"127.0.0.1:{port}"):
+            return False
+        # 备份创建后、看门狗就绪前被中止。这一阶段没有改过代理。
+        self.backup_path.unlink()
+        return True
+
+    @staticmethod
+    def _check_legacy_extractor(current):
+        path = proxy_guard.legacy_extractor_backup_path()
+        if not path.is_file():
+            return
+        with proxy_guard.backup_lock(path):
+            if not path.is_file():
+                return
+            record = proxy_guard.read_backup(path)
+            if record is None or proxy_guard.backup_is_active(path, record):
+                raise CaptureError("旧版提取器的代理可能仍在使用，请先结束旧版采集")
+            port = record.get("port")
+            if current[0] and (port is None or current[1].strip() == f"127.0.0.1:{port}"):
+                raise CaptureError("旧版提取器的代理尚未恢复，请先结束旧版采集")
 
     def point_at(self, port):
         if self.capture_id is None:
@@ -506,6 +561,49 @@ def _read_request(conn, rest):
                 "headers": headers, "body": body[:length]}
 
 
+def _connect_target(authority):
+    target = urllib.parse.urlsplit("//" + authority)
+    if not target.hostname or target.username is not None or target.path or target.query or target.fragment:
+        raise ValueError("代理目标地址无效")
+    return target.hostname, target.port if target.port is not None else 443
+
+
+class _OriginalProxy:
+    """在临时接管期间复用 Windows 原先的 HTTP 代理和域名绕过设置。"""
+
+    def __init__(self, original, listen_port):
+        enabled, server, override = original
+        self._bypass = tuple(rule.strip().lower() for rule in override.split(";") if rule.strip())
+        self._routes = {}
+        if not enabled:
+            return
+        for entry in server.split(";"):
+            scheme, assigned, value = entry.strip().partition("=")
+            scheme, value = (scheme.lower(), value) if assigned else ("*", scheme)
+            if not value:
+                continue
+            uri = value if "://" in value else "http://" + value
+            parsed = urllib.parse.urlsplit(uri)
+            if scheme not in ("http", "https", "*") or parsed.scheme != "http" or not parsed.hostname \
+                    or parsed.username is not None or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+                raise CaptureError("当前代理类型无法在采集期间转发，未切换系统代理")
+            port = parsed.port if parsed.port is not None else 80
+            if not port or (parsed.hostname in ("127.0.0.1", "localhost", "::1") and port == listen_port):
+                raise CaptureError("当前代理端口与采集端口冲突，未切换系统代理")
+            self._routes[scheme] = (parsed.hostname, port)
+
+    def endpoint(self, scheme, host):
+        host = host.lower()
+        if host in ("127.0.0.1", "localhost", "::1"):
+            return None
+        for rule in self._bypass:
+            if rule == "<local>" and "." not in host and ":" not in host:
+                return None
+            if fnmatch.fnmatchcase(host, rule):
+                return None
+        return self._routes.get(scheme, self._routes.get("*"))
+
+
 class _ProxyHandler(socketserver.BaseRequestHandler):
     server = None                       # 由 _ProxyServer 注入
 
@@ -513,102 +611,132 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
         client = self.request
         client.settimeout(CONNECT_TIMEOUT_S)
         try:
-            head, _rest = _read_head(client)
+            head, rest = _read_head(client)
             if head is None:
                 return
-            first, _headers, _order = _parse_head(head)
-            parts = first.split(" ")
+            first, headers, _order = _parse_head(head)
+            parts = first.split(" ", 2)
             if len(parts) < 2 or parts[0].upper() != "CONNECT":
-                client.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+                if self.server.original_proxy is not None and len(parts) == 3:
+                    self._pass_http(parts, headers, rest)
+                else:
+                    client.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
                 return
-            host, _, port = parts[1].partition(":")
-            host = host.strip().lower()
-            port = int(port or 443)
-            if not host_in_scope(host):
-                self._tunnel(host, port)
+            host = _capture_authority(parts[1])
+            if not host:
+                if self.server.original_proxy is not None:
+                    self._pass_connect(parts[1], head, rest)
+                else:
+                    client.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 return
             self.server.record_connect()
-            self.server.log(f"CONNECT {host}:{port}")
+            self.server.log(f"CONNECT {host}:443")
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             cert_path, key_path = self.server.ca.leaf(host)
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(str(cert_path), str(key_path))
-            tls = ctx.wrap_socket(client, server_side=True)
-            try:
-                self._serve_https(tls, host, port)
-            finally:
-                try:
-                    tls.close()
-                except OSError:
-                    pass
+            tls = self.server.wrap_client(client, ctx)
+            tls.do_handshake()
+            self._serve_https(tls, host, 443)
         except (OSError, ssl.SSLError, ValueError) as exc:
             self.server.log(f"ERR {type(exc).__name__}: {exc}")
-            return
-        finally:
-            try:
-                client.close()
-            except OSError:
-                pass
 
-    # ---------------------------------------------------------- 隧道(非目标)
-    def _tunnel(self, host, port):
+    def _pass_connect(self, authority, head, rest):
+        host, port = _connect_target(authority)
+        previous = self.server.original_proxy.endpoint("https", host)
         try:
-            upstream = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_S)
+            upstream = socket.create_connection(previous or (host, port), timeout=CONNECT_TIMEOUT_S)
         except OSError:
-            self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
             return
-        self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        sockets = [self.request, upstream]
+        with upstream:
+            if previous is not None:
+                upstream.sendall(head + b"\r\n\r\n" + rest)
+            else:
+                self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                if rest:
+                    upstream.sendall(rest)
+            self._relay(upstream)
+
+    def _pass_http(self, parts, headers, rest):
+        method, target, version = parts
+        url = urllib.parse.urlsplit(target)
+        if url.scheme != "http" or not url.hostname or url.username is not None or url.fragment:
+            self.request.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            return
+        previous = self.server.original_proxy.endpoint("http", url.hostname)
+        if previous is None:
+            target = urllib.parse.urlunsplit(("", "", url.path or "/", url.query, ""))
+            headers.pop("proxy-authorization", None)
+        headers.pop("proxy-connection", None)
+        headers.update(host=url.netloc, connection="close")
+        request = [f"{method} {target} {version}"]
+        request.extend(f"{key}: {value}" for key, value in headers.items())
         try:
-            while True:
-                readable, _, errored = select.select(sockets, [], sockets, 30)
-                if errored or not readable:
-                    return
-                for sock in readable:
-                    other = upstream if sock is self.request else self.request
-                    data = sock.recv(65536)
-                    if not data:
-                        return
-                    other.sendall(data)
+            upstream = socket.create_connection(previous or (url.hostname, url.port or 80),
+                                                timeout=CONNECT_TIMEOUT_S)
         except OSError:
+            self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
             return
-        finally:
-            try:
-                upstream.close()
-            except OSError:
-                pass
+        with upstream:
+            upstream.sendall(("\r\n".join(request) + "\r\n\r\n").encode("latin-1") + rest)
+            self._relay(upstream)
+
+    def _relay(self, upstream):
+        client = self.request
+        active = [client, upstream]
+        while active:
+            ready, _, errors = select.select(active, [], active, CONNECT_TIMEOUT_S)
+            if errors or not ready:
+                return
+            for source in ready:
+                destination = upstream if source is client else client
+                data = source.recv(65536)
+                if data:
+                    destination.sendall(data)
+                else:
+                    active.remove(source)
+                    destination.shutdown(socket.SHUT_WR)
 
     # ---------------------------------------------------------- 目标 HTTPS
     def _serve_https(self, tls, host, port):
-        rest = b""
-        while True:
-            request = _read_request(tls, rest)
-            if request is None:
-                return
-            rest = b""
-            self.server.log(f"REQ {request['method']} {request['path']}")
+        request = _read_request(tls, b"")
+        if request is None:
+            return
+        request_host = _capture_authority(request["headers"].get("host", host))
+        if request_host != host or not request["path"].startswith("/") or request["path"].startswith("//"):
+            tls.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n"
+                        b"Connection: close\r\n\r\n")
+            return
+        self.server.log(f"REQ {request['method']} {request['path']}")
+        route = self.server.original_proxy
+        previous = route.endpoint("https", host) if route is not None else None
+        status, headers, body = (self._forward(host, port, request, upstream=previous) if previous else
+                                 self._forward(host, port, request))
+        if status is None:
+            tls.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n"
+                        b"Connection: close\r\n\r\n")
             self._sniff_request(request, host)
-            status, headers, body = self._forward(host, port, request)
-            if status is None:
-                tls.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n"
-                            b"Connection: close\r\n\r\n")
-                return
-            self._sniff_response(request, body)
-            keep = [f"HTTP/1.1 {status} {headers.get('reason', '')}".strip()]
-            for key, value in headers.get("items", []):
-                if key.lower() in ("content-length", "transfer-encoding", "connection"):
-                    continue
-                keep.append(f"{key}: {value}")
-            keep.append(f"Content-Length: {len(body)}")
-            keep.append("Connection: close")
-            tls.sendall(("\r\n".join(keep) + "\r\n\r\n").encode("latin-1") + body)
-            return              # 每个连接只服务一个请求, 由客户端重连
+            return
+        keep = [f"HTTP/1.1 {status} {headers.get('reason', '')}".strip()]
+        for key, value in headers.get("items", []):
+            if key.lower() in ("content-length", "transfer-encoding", "connection"):
+                continue
+            keep.append(f"{key}: {value}")
+        keep.append(f"Content-Length: {len(body)}")
+        keep.append("Connection: close")
+        tls.sendall(("\r\n".join(keep) + "\r\n\r\n").encode("latin-1") + body)
+        # 凭证一入队，等待方就会关闭监听及连接，先把响应发完。
+        self._sniff_request(request, host)
+        self._sniff_response(request, body)
 
     @staticmethod
-    def _forward(host, port, request):
+    def _forward(host, port, request, *, upstream=None):
         conn = http.client.HTTPSConnection(
-            host, port, timeout=CONNECT_TIMEOUT_S,
+            *(upstream or (host, port)), timeout=CONNECT_TIMEOUT_S,
             context=ssl.create_default_context())
+        if upstream:
+            conn.set_tunnel(host, port)
         headers = {k: v for k, v in request["headers"].items()
                    if k not in ("proxy-connection", "connection", "content-length",
                                 "accept-encoding")}
@@ -643,13 +771,64 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
 
 
 class _ProxyServer(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
+    allow_reuse_address = not hasattr(socket, "SO_EXCLUSIVEADDRUSE")
     daemon_threads = True
 
     def __init__(self, ca, sink, port=0):
         self.ca = ca
         self.sink = sink
+        self.original_proxy = None
+        self._clients = {}
+        self._client_lock = threading.Lock()
+        self._closing = False
         super().__init__(("127.0.0.1", port), _ProxyHandler)
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+    def process_request(self, request, client_address):
+        with self._client_lock:
+            if self._closing:
+                self._close_client(request)
+                return
+            self._clients[request] = request
+        super().process_request(request, client_address)
+
+    def wrap_client(self, request, context):
+        with self._client_lock:
+            if self._closing:
+                raise OSError("采集监听已关闭")
+            # wrap_socket 把底层套接字转交给 TLS 包装器。在锁内更新所有权，
+            # 再在锁外完成可能阻塞的握手。
+            tls = context.wrap_socket(request, server_side=True, do_handshake_on_connect=False)
+            self._clients[request] = tls
+            return tls
+
+    @staticmethod
+    def _close_client(client):
+        try:
+            client.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            client.close()
+        except OSError:
+            pass
+
+    def shutdown_request(self, request):
+        with self._client_lock:
+            self._close_client(self._clients.pop(request, request))
+
+    def server_close(self):
+        with self._client_lock:
+            self._closing = True
+            clients = list(self._clients.values())
+            self._clients.clear()
+        for client in clients:
+            self._close_client(client)
+        super().server_close()
 
     def log(self, message):
         try:
@@ -658,23 +837,28 @@ class _ProxyServer(socketserver.ThreadingTCPServer):
             pass
 
     def record_connect(self):
-        try:
-            self.sink.connects += 1
-        except Exception:                  # noqa: BLE001
-            pass
+        with self._client_lock:
+            if not self._closing:
+                self.sink.connects += 1
 
     def record_request(self, host, path, body):
-        try:
+        with self._client_lock:
+            if self._closing:
+                return
             self.sink.requests += 1
-            self.sink.on_request(host, path, body)
-        except Exception:                  # noqa: BLE001 —— 解析失败不影响转发
-            pass
+            try:
+                self.sink.on_request(host, path, body)
+            except Exception:              # noqa: BLE001 —— 解析失败不影响转发
+                pass
 
     def record_login(self, body):
-        try:
-            self.sink.on_login(body)
-        except Exception:                  # noqa: BLE001
-            pass
+        with self._client_lock:
+            if self._closing:
+                return
+            try:
+                self.sink.on_login(body)
+            except Exception:              # noqa: BLE001 —— 解析失败不影响转发
+                pass
 
 
 # ================================================================ 会话
@@ -682,14 +866,15 @@ class CaptureSession:
     """一次采集: 起代理 → 等 token → 收尾。状态机对外只暴露 status()。"""
 
     def __init__(self, root: Path, clock=None, proxy_factory=None, ca=None,
-                 timeout_s=DEFAULT_TIMEOUT_S, server_factory=None, guard_factory=None,
-                 proxy_backup_path=None):
+                 timeout_s=DEFAULT_TIMEOUT_S, server_factory=None, guard_factory=None, *,
+                 system_proxy=False):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._clock = clock or _now
         self.ca = ca or CertificateAuthority(self.root)
-        self.proxy = (proxy_factory or
-                      (lambda: SystemProxy(proxy_backup_path or self.root / BACKUP_NAME)))()
+        self._system_proxy = system_proxy
+        self.proxy = proxy_factory() if proxy_factory is not None else (
+            SystemProxy(self.root / BACKUP_NAME) if system_proxy else None)
         self.timeout_s = int(timeout_s)
         self._server_factory = server_factory or _ProxyServer
         self._guard_factory = guard_factory
@@ -737,7 +922,9 @@ class CaptureSession:
         return {"installed": self.ca.installed(), "fingerprint": self.ca.fingerprint()}
 
     def recover_stale_proxy(self):
-        """启动时先收拾上次崩溃留下的代理(不会碰仍在运行的采集)。"""
+        """兼容显式注入的旧版代理适配器。"""
+        if self.proxy is None:
+            return False
         path = getattr(self.proxy, "backup_path", None) or (self.root / BACKUP_NAME)
         reg_path = getattr(self.proxy, "reg_path", proxy_guard.REG_PATH)
         try:
@@ -746,7 +933,7 @@ class CaptureSession:
             return False
 
     # ---------------------------------------------------------- 生命周期
-    def start(self, stop_event=None):
+    def start(self, stop_event=None, *, port=0):
         if stop_event is not None and stop_event.is_set():
             raise CaptureError("本次采集已取消")
         with self._lifecycle:
@@ -761,25 +948,38 @@ class CaptureSession:
             if generation != self._stop_generation or (stop_event is not None and stop_event.is_set()):
                 raise CaptureError("本次采集已取消")
             system_proxy = isinstance(self.proxy, SystemProxy)
-            if not system_proxy and self.proxy.stale_backup():
+            if self.proxy is not None and not system_proxy and self.proxy.stale_backup():
                 self.proxy.restore()
             self._tokens = queue.Queue()
+            self.identity = {}
+            self.connects = 0
+            self.requests = 0
+            expires_at = None
             try:
-                server = self._server_factory(self.ca, self)
+                server = (self._server_factory(self.ca, self, port)
+                          if port else self._server_factory(self.ca, self))
                 self._server = server
                 port = server.server_address[1]
+                if system_proxy:
+                    if self._system_proxy:
+                        expires_at = time.time() + self.timeout_s
+                        prior = self.proxy.prepare(port, expires_at=expires_at)
+                        self._arm_exit_restore()
+                        server.original_proxy = _OriginalProxy(prior, port)
+                    else:
+                        self.proxy.prepare(port)
                 self._thread = threading.Thread(target=server.serve_forever,
                                                 name="youziauth-lptiyu-capture", daemon=True)
                 self._thread.start()
-                self._arm_exit_restore()
-                if system_proxy:
-                    self.proxy.prepare(port)
-                self._start_proxy_guard(port)
+                if self.proxy is not None:
+                    self._arm_exit_restore()
+                    self._start_proxy_guard(port)
                 if not self._thread.is_alive():
                     raise CaptureError("本地采集监听未能启动")
                 if stop_event is not None and stop_event.is_set():
                     raise CaptureError("本次采集已取消")
-                self.proxy.point_at(port)
+                if self.proxy is not None:
+                    self.proxy.point_at(port)
             except Exception as exc:
                 self.stop()
                 if isinstance(exc, CaptureError):
@@ -787,9 +987,9 @@ class CaptureSession:
                 raise CaptureError(f"无法启动乐跑采集：{exc}") from exc
             with self._lock:
                 self._port = port
-                self._deadline = time.time() + self.timeout_s
+                self._deadline = expires_at if expires_at is not None else time.time() + self.timeout_s
                 self._state = "waiting"
-                self._message = "等待小程序请求：在微信里打开「数体智慧体育」并进入跑步首页"
+                self._message = "等待小程序请求：打开「数体智慧体育」并进入跑步首页"
             self.log(f"采集开始 127.0.0.1:{port}")
             return self.status()
 
@@ -896,17 +1096,22 @@ class CaptureSession:
                 self.stop("captured", "已抓到凭证")
                 return cred
             if not self._thread.is_alive():
-                self.stop("error", "本地采集监听已停止，已尝试恢复系统代理")
+                self.stop("error", "本地采集监听已停止")
                 return None
             if time.time() >= self._deadline:
                 self.stop("timeout", f"等待超时：没有看到小程序请求（微信连接 {self.connects} 次）")
         return None
 
     def ensure_proxy(self):
-        """Stop capture when another program changes the proxy."""
+        """Stop an unhealthy listener or an explicitly configured legacy proxy."""
         with self._lifecycle:
             if self._state != "waiting":
                 return False
+            if self.proxy is None:
+                if self._thread is not None and self._thread.is_alive():
+                    return False
+                self.stop("error", "本地采集监听已停止")
+                return True
             try:
                 enable, server, _override = self.proxy.read()
             except OSError:

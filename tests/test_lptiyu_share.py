@@ -93,17 +93,18 @@ class DiagnoseTests(unittest.TestCase):
     def test_the_report_states_the_verdict_and_the_facts(self):
         from lptiyu_share import build_diagnose
         text = build_diagnose({
-            'verdict': '代理链没问题，但微信没把流量交出来',
+            'verdict': '尚未收到乐跑请求',
             'wechat_protocol': True, 'wechat_installed': True, 'wechat_running': False,
             'cert': {'installed': True, 'fingerprint': '9B51D65FE21C8576'},
-            'proxy': {'enable': 1, 'server': '127.0.0.1:7897'},
-            'proxy_ok': True, 'proxy_detail': '代理链可用（api2.lptiyu.com 返回 200）',
+            'port': 18781,
             'capture_state': 'timeout', 'connects': 0,
             'log_tail': ['[23:52:00] 采集开始 127.0.0.1:5100'],
         }, version='1.9.10')
-        self.assertIn('代理链没问题', text)
+        self.assertIn('尚未收到乐跑请求', text)
         self.assertIn('没运行', text)
         self.assertIn('9B51D65FE21C8576', text)
+        self.assertIn('127.0.0.1:18781', text)
+        self.assertNotIn('系统代理', text)
         self.assertIn('CONNECT', text.replace('采集开始', 'CONNECT'))
 
 

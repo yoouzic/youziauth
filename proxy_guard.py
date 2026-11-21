@@ -7,22 +7,23 @@
 一个人已经不在的端口上 —— 浏览器的每个请求都连 127.0.0.1 被拒, 表现为整台
 机器断网。
 
-所以采集开始时额外起一个**独立进程**: 它只做一件事 —— 等父进程消失, 然后按
-备份文件把 HKCU 代理还原。这条路径只依赖标准库, 不碰 cryptography、不碰界面
-组件, 保证在最坏情况下也能跑起来。
+采集开始时额外起一个独立进程。父进程退出、监听失效或采集到期后，它按备份文件
+还原仍由采集占用的 HKCU 代理。这条路径只依赖标准库和本地文件。
 
 备份文件格式(与 `lptiyu_capture.SystemProxy` 共用):
     {"enable": 0|1, "server": "...", "override": "...",
-     "pid": <采集进程>, "port": <采集端口>, "created": <时间戳>}
+     "pid": <采集进程>, "port": <采集端口>, "capture_id": <采集标识>}
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from windows_credentials import atomic_write_bytes
@@ -37,6 +38,8 @@ MISSING_BACKUP_GRACE_SECONDS = 3.0
 # 备份里的 pid 还活着时, 最多容忍这么久; 超过就当成「pid 被复用」直接还原,
 # 避免一次崩溃因为巧合的进程号复用而把用户永远留在死代理上。
 MAX_LIVE_OWNER_SECONDS = 30 * 60
+# A refused loopback connection on Windows can take just over two seconds.
+LOOPBACK_CONNECT_TIMEOUT_SECONDS = 2.5
 
 
 def _winreg():
@@ -85,16 +88,19 @@ def write_proxy(enable, server, override=None, reg_path: str = REG_PATH) -> None
             winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, str(override))
         if enable:
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
-    notify_settings_changed()
+    if reg_path.casefold() == REG_PATH.casefold():
+        notify_settings_changed()
 
 
-def read_backup(path) -> dict | None:
+def read_backup(path, *, owned_only=False) -> dict | None:
     """读备份; 坏文件当作没有(绝不因为一个坏备份去改用户的代理)。"""
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict):
+        return None
+    if owned_only and not _has_capture_backup_fields(data):
         return None
     try:
         data["enable"] = int(data.get("enable") or 0)
@@ -105,6 +111,27 @@ def read_backup(path) -> dict | None:
     data["server"] = str(data.get("server") or "")
     data["override"] = str(data.get("override") or "")
     return data
+
+
+def _has_capture_backup_fields(data):
+    capture_id = data.get("capture_id")
+    port = data.get("port")
+    pid = data.get("pid")
+    enable = data.get("enable")
+    server = data.get("server")
+    # The external research runner added a timestamp to every mirror. Its
+    # detection could adopt an unrelated loopback proxy before capture began.
+    return (
+        "created" not in data
+        and isinstance(capture_id, str) and bool(capture_id.strip())
+        and data.get("guard_ready") is True
+        and type(port) is int and 0 < port <= 65535
+        and type(pid) is int and pid > 0
+        and type(enable) is int and enable in (0, 1)
+        and isinstance(server, str) and not any(char in server for char in "\r\n\0")
+        and (not enable or bool(server.strip()))
+        and isinstance(data.get("override"), str)
+    )
 
 
 def _local_data_root() -> Path:
@@ -236,6 +263,78 @@ def recover_stale_backup(path, reg_path: str = REG_PATH) -> bool:
         return restore_locked_backup(path, data, reg_path)
 
 
+def restore_owned_capture_proxy(backup_path, reg_path: str = REG_PATH) -> str:
+    """Restore an owned abandoned capture proxy on explicit user request."""
+    current = read_proxy(reg_path)
+    enabled, server, _ = current
+    endpoint = _loopback_endpoint(server) if enabled == 1 else None
+    if endpoint is None:
+        return "unchanged"
+
+    path = Path(backup_path)
+    has_backup = path.is_file()
+    with backup_lock(path) if has_backup else nullcontext():
+        if read_proxy(reg_path) != current:
+            return "unchanged"
+        data = read_backup(path, owned_only=True) if has_backup else None
+        owned = data is not None and server.strip() == f"127.0.0.1:{data['port']}"
+        if owned and pid_alive(data["pid"]):
+            return "unchanged"
+        listening = _loopback_reachable(*endpoint)
+        if listening is True or read_proxy(reg_path) != current:
+            return "unchanged"
+        if listening is None or not owned:
+            return "unverified"
+        for saved in _saved_loopback_endpoints(data["server"]):
+            if saved[1] == data["port"] or (data["enable"] and _loopback_reachable(*saved) is not True):
+                return "unverified"
+        if read_proxy(reg_path) != current:
+            return "unchanged"
+        write_proxy(data["enable"], data["server"], reg_path=reg_path)
+        path.unlink(missing_ok=True)
+        return "restored"
+
+
+def _loopback_endpoint(server):
+    host, separator, port = server.strip().rpartition(":")
+    if not separator or not 1 <= len(port) <= 5 or not port.isascii() or not port.isdecimal():
+        return None
+    number = int(port)
+    if not 0 < number <= 65535:
+        return None
+    host = host.lower()
+    if host == "localhost":
+        return host, number
+    try:
+        address = ipaddress.ip_address(host.removeprefix("[").removesuffix("]"))
+    except ValueError:
+        return None
+    return (str(address), number) if address.is_loopback else None
+
+
+def _loopback_reachable(host, port):
+    # Probe only literal loopback IPs, even when Windows lists "localhost".
+    hosts = ("127.0.0.1", "::1") if host == "localhost" else (host,)
+    uncertain = False
+    for address in hosts:
+        try:
+            with socket.create_connection((address, port), timeout=LOOPBACK_CONNECT_TIMEOUT_SECONDS):
+                return True
+        except ConnectionRefusedError:
+            continue
+        except OSError:
+            uncertain = True
+    return None if uncertain else False
+
+
+def _saved_loopback_endpoints(server):
+    for rule in server.split(";"):
+        target = rule.rpartition("=")[2].split("://", 1)[-1]
+        endpoint = _loopback_endpoint(target)
+        if endpoint is not None:
+            yield endpoint
+
+
 def _log(path, message: str) -> None:
     try:
         target = Path(path).with_name("proxy_guard.log")
@@ -321,6 +420,20 @@ def _finish_restore(path, parent_pid, capture_id, reg_path):
             return 0
 
 
+def _capture_listener_failed(data, reg_path):
+    """Probe only the listener that still owns the current Windows proxy."""
+    port = data.get("port")
+    if type(port) is not int or not 0 < port <= 65535:
+        return False
+    try:
+        enabled, server, _ = read_proxy(reg_path)
+    except OSError:
+        return False
+    if enabled != 1 or server.strip() != f"127.0.0.1:{port}":
+        return False
+    return _loopback_reachable("127.0.0.1", port) is not True
+
+
 def main(argv=None) -> int:
     """`--proxy-guard <备份路径> <父进程 pid> [注册表路径] [采集标识]`。"""
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -342,6 +455,7 @@ def main(argv=None) -> int:
             write_backup(backup_path, data)
     _log(backup_path, f"看门狗启动 pid={os.getpid()} 监视父进程 {parent_pid}")
     missing_since = None
+    unavailable_checks = 0
     while True:
         data = read_backup(backup_path)
         if data is not None and capture_id is not None and data.get("capture_id") != capture_id:
@@ -357,6 +471,16 @@ def main(argv=None) -> int:
         released = capture_id is not None and data is not None and data.get("release_requested") is True
         if released or not pid_alive(parent_pid):
             return _finish_restore(backup_path, parent_pid, capture_id, reg_path)
+        if capture_id is not None and data is not None and data.get("monitor_listener") is True:
+            deadline = data.get("expires_at")
+            expired = type(deadline) in (int, float) and time.time() >= deadline
+            if expired:
+                _log(backup_path, "采集到期，正在恢复代理")
+                return _finish_restore(backup_path, parent_pid, capture_id, reg_path)
+            unavailable_checks = unavailable_checks + 1 if _capture_listener_failed(data, reg_path) else 0
+            if unavailable_checks >= 2:
+                _log(backup_path, "采集端口不再可用，正在恢复代理")
+                return _finish_restore(backup_path, parent_pid, capture_id, reg_path)
         time.sleep(POLL_SECONDS)
 
 

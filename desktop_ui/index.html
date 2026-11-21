@@ -161,7 +161,6 @@
               <select id="lp-member"></select>
               <input type="text" id="lp-member-name" maxlength="24" placeholder="重命名用" aria-label="成员新名字">
               <button type="button" class="secondary" id="lp-member-add" data-action="lptiyu_capture_add">添加成员</button>
-              <button type="button" class="secondary" id="lp-member-import">导入凭证</button>
               <button type="button" class="secondary" id="lp-member-rename">重命名</button>
               <button type="button" class="secondary danger" id="lp-member-delete">退出账号</button>
             </div>
@@ -178,20 +177,23 @@
             <div class="lp-actions">
               <button class="secondary" data-action="lptiyu_renew">立即续期</button>
               <button class="primary" data-action="lptiyu_sync">同步凭证</button>
+              <button type="button" class="secondary" id="lp-capture-start" data-action="lptiyu_capture">开始采集</button>
+              <button type="button" class="secondary" id="lp-member-import">导入凭证</button>
+              <button type="button" class="text-button" id="lp-recover-network" data-action="lptiyu_recover_network"
+                title="停止乐跑采集并恢复可确认由乐跑改动的代理设置">恢复网络</button>
             </div>
             <details class="lp-help" id="lp-capture">
-              <summary>没有研究库？用本机采集</summary>
+              <summary>采集设置</summary>
               <p class="field-hint" id="lp-cert-line">正在读取采集证书…</p>
               <p class="field-hint" id="lp-capture-line"></p>
               <div class="lp-actions">
                 <button type="button" class="text-button" id="lp-cert-install" data-action="lptiyu_cert_install">安装采集证书</button>
                 <button type="button" class="text-button" id="lp-cert-remove" data-action="lptiyu_cert_remove">卸载证书</button>
-                <button type="button" class="secondary" id="lp-capture-start" data-action="lptiyu_capture">开始采集</button>
                 <button type="button" class="text-button" id="lp-capture-stop" data-action="lptiyu_capture_stop">停止采集</button>
                 <button type="button" class="text-button" id="lp-diagnose" data-action="lptiyu_diagnose">采集自检</button>
                 <button type="button" class="text-button" id="lp-export-samples" data-action="lptiyu_export_samples">导出轨迹样本</button>
               </div>
-              <p class="field-hint">开始采集后，在微信里打开「数体智慧体育」进一次跑步首页就会带上当前凭证；采集只解密 lptiyu 域，拿到凭证立刻还原系统代理。安装/卸载证书时 Windows 会弹一次确认，点「是」即可。</p>
+              <p class="field-hint">手动采集时会临时切换 Windows 系统代理，结束后自动恢复。</p>
             </details>
           </article>
         </div>
@@ -256,7 +258,7 @@
             <div class="lp-field lp-field-wide">
               <label for="lp-lab">研究库目录</label>
               <input id="lp-lab" type="text" spellcheck="false" placeholder="留空自动查找">
-              <p class="field-hint" id="lp-lab-hint">采集凭证用的研究库，留空自动查找</p>
+              <p class="field-hint" id="lp-lab-hint">同步已有凭证与模板，留空自动查找。</p>
             </div>
             <div class="lp-field lp-field-wide">
               <label for="lp-zone-select">跑区</label>

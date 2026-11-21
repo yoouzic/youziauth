@@ -1,23 +1,14 @@
 """乐跑凭证提取器 —— 在成员**自己的电脑**上运行, 生成可发给管理者的加密凭证文件。
 
-用法(两种):
-    命令行: py -3 tools/lptiyu_credential_export.py
-    打包后: 双击 lptiyu-credential-export.exe
-
-流程(全部复用 youziauth 已验证的采集机制):
-    1. 前置检查: 本机装了微信(需要在本机登录的微信里打开小程序)
-    2. 生成/安装本机专用采集 CA(只签 lptiyu 域; 装卸都要 Windows 弹窗确认)
-    3. 把系统代理临时指到本机(其他网站原样直通, 不解密)
-    4. 自动唤起微信里的「数体智慧体育」小程序
-    5. 等你进一次跑步首页 —— 小程序发出的第一个请求里就有当前凭证
-    6. 用与管理员约定好的 PIN 加密, 存到桌面 lptiyu-credential-*.json
-    7. 立刻还原系统代理, 结束
+命令行或打包后的 EXE 接收 --capture-proxy-port PORT。请事先在支持按域名
+分流的客户端中只将乐跑 HTTPS 发往 127.0.0.1:PORT。采集结束即关闭监听。
 
 纪律: 凭证文件 = 你的乐跑登录态, 只发给约定好 PIN 的那个人; PIN 用口头/
 电话告知, 不要跟文件走同一条聊天。
 """
 from __future__ import annotations
 
+import argparse
 import getpass
 import json
 import os
@@ -67,11 +58,17 @@ def main(argv=None) -> int:
         # 采集代理看门狗: 冻结包用自身 exe 再起一个独立进程。必须最先分派,
         # 否则看门狗会掉进下面的交互流程去问 PIN。
         return proxy_guard.main(argv[1:])
+    parser = argparse.ArgumentParser(description='通过本机的乐跑专用代理导出凭证')
+    parser.add_argument('--capture-proxy-port', type=int)
+    args = parser.parse_args(argv)
+    port = args.capture_proxy_port
+    if port is None or not 1024 <= port <= 65535:
+        print('请先配置支持按域名分流的客户端，并使用 --capture-proxy-port 指定端口（1024–65535）。')
+        return 2
     print('=' * 56, flush=True)
     print('乐跑凭证提取器(在自己的电脑上运行)', flush=True)
     print('=' * 56, flush=True)
-    print('这一步会: 临时改系统代理抓乐跑小程序的凭证(只解密 lptiyu 域,')
-    print('其他网站原样直通), 结束后立刻还原代理。凭证用 PIN 加密存到桌面。')
+    print(f'只接收专用客户端送到 127.0.0.1:{port} 的乐跑 HTTPS 请求。凭证用 PIN 加密存到桌面。')
     print()
 
     if not wechat_installed():
@@ -85,8 +82,7 @@ def main(argv=None) -> int:
         return 2
 
     capture_root = WORK_ROOT / 'capture'
-    session = CaptureSession(capture_root, timeout_s=TIMEOUT_SECONDS,
-                             proxy_backup_path=proxy_guard.shared_backup_path())
+    session = CaptureSession(capture_root, timeout_s=TIMEOUT_SECONDS)
     print()
     print('[1/3] 检查采集证书…')
     cert = session.cert_status()
@@ -101,7 +97,7 @@ def main(argv=None) -> int:
 
     print('[2/3] 开始采集: 稍后会自动打开微信小程序, 请在里面进入一次跑步首页。')
     try:
-        session.start()
+        session.start(port=port)
     except CaptureError as exc:
         print(f'启动失败: {exc}')
         return 2
@@ -123,13 +119,11 @@ def main(argv=None) -> int:
             if time.time() - last_hint > 30:
                 last_hint = time.time()
                 print(f'      还在等…(已连接 {getattr(session, "connects", 0)} 次) '
-                      '如果一直没流量: 确认微信用的是系统代理、小程序真的打开了。')
+                      '请核对专用客户端的乐跑分流配置及小程序是否已打开。')
             time.sleep(1.0)
 
         session.stop('captured', '已抓到凭证')
     finally:
-        # 中途任何退出(Ctrl+C、异常、提前 return)都不能把系统代理留在采集端口上,
-        # 否则用户一断网就再也上不了网。
         session.stop('idle', '')
 
     file_dict = seal_credential(cred, pin)

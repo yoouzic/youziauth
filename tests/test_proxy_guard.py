@@ -6,6 +6,7 @@
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -172,6 +173,30 @@ class ProxyGuardTests(unittest.TestCase):
         self.assertEqual(proxy_guard.read_proxy(REG)[1], "127.0.0.1:7890")
         self.assertFalse(self.backup.exists())
 
+    def test_guard_recovers_a_dead_listener_even_if_the_application_is_still_alive(self):
+        owner = os.getpid()
+        capture_id = "manual-capture"
+        self._write_backup(pid=owner, port=18888, capture_id=capture_id, monitor_listener=True,
+                           expires_at=proxy_guard.time.time() + 60)
+        self._point_at_dead_port()
+        with (
+            patch.object(proxy_guard, "_loopback_reachable", return_value=False) as probe,
+            patch.object(proxy_guard.time, "sleep", side_effect=[None, None, AssertionError("guard did not recover")]),
+        ):
+            self.assertEqual(proxy_guard.main([str(self.backup), str(owner), REG, capture_id]), 0)
+        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(proxy_guard.read_proxy(REG)[1], "127.0.0.1:7890")
+
+    def test_guard_recovers_when_the_session_deadline_passes_with_a_live_owner(self):
+        owner = os.getpid()
+        capture_id = "manual-capture"
+        self._write_backup(pid=owner, port=18888, capture_id=capture_id, monitor_listener=True,
+                           expires_at=proxy_guard.time.time() - 1)
+        self._point_at_dead_port()
+        with patch.object(proxy_guard.time, "sleep", side_effect=AssertionError("guard ignored deadline")):
+            self.assertEqual(proxy_guard.main([str(self.backup), str(owner), REG, capture_id]), 0)
+        self.assertEqual(proxy_guard.read_proxy(REG)[1], "127.0.0.1:7890")
+
     def test_proxy_server_write_failure_does_not_enable_a_disabled_proxy(self):
         calls = []
 
@@ -215,6 +240,109 @@ class ProxyGuardTests(unittest.TestCase):
             self.assertEqual(child_env.get("PYINSTALLER_RESET_ENVIRONMENT"), "1")
             self.assertEqual(child_env.get("YOUZIAUTH_TEST_ENV"), "preserved")
             self.assertEqual(os.environ["PYINSTALLER_RESET_ENVIRONMENT"], "0")
+
+
+class ManualRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        temporary = self.enterContext(tempfile.TemporaryDirectory())
+        self.backup = Path(temporary) / proxy_guard.BACKUP_NAME
+        self.local = self.enterContext(socket.socket())
+        self.local.bind(('127.0.0.1', 0))
+        self.port = self.local.getsockname()[1]
+        self.current = (1, f'127.0.0.1:{self.port}', '<local>;my.example')
+        self.read = self.enterContext(patch.object(proxy_guard, 'read_proxy', return_value=self.current))
+        self.write = self.enterContext(patch.object(proxy_guard, 'write_proxy'))
+        self.owner_alive = self.enterContext(patch.object(proxy_guard, 'pid_alive', return_value=False))
+        self.connect_real = socket.create_connection
+        self.connect = self.enterContext(patch.object(socket, 'create_connection',
+                                                       side_effect=ConnectionRefusedError))
+
+    def save_backup(self, **changes):
+        data = {'enable': 1, 'server': 'original.example:3128', 'override': '<local>',
+                'pid': 12345, 'port': self.port, 'capture_id': 'owned', 'guard_ready': True}
+        data.update(changes)
+        self.backup.write_text(json.dumps(data), encoding='utf-8')
+
+    def recover(self):
+        return proxy_guard.restore_owned_capture_proxy(self.backup, REG)
+
+    def test_matching_dead_capture_restores_only_the_owned_proxy_settings(self):
+        self.save_backup()
+        self.assertEqual(self.recover(), 'restored')
+        self.write.assert_called_once_with(1, 'original.example:3128', reg_path=REG)
+        self.assertFalse(self.backup.exists())
+
+    def test_plain_lab_backup_does_not_identify_a_capture(self):
+        self.backup.write_text('{"enable": 0, "server": "127.0.0.1:7897"}', encoding='utf-8')
+        self.assertEqual(self.recover(), 'unverified')
+        self.write.assert_not_called()
+        self.assertTrue(self.backup.exists())
+
+    def test_a_lab_mirror_does_not_prove_which_route_was_owned(self):
+        self.save_backup(created=1700000000)
+        self.assertEqual(self.recover(), 'unverified')
+        self.write.assert_not_called()
+
+    def test_unverified_backup_cannot_restore_a_dead_loopback_alias(self):
+        self.save_backup(server=f'https=localhost:{self.port}')
+        self.assertEqual(self.recover(), 'unverified')
+        self.write.assert_not_called()
+
+    def test_invalid_original_values_cannot_be_recovered(self):
+        for changes in ({'enable': None}, {'server': ''}, {'server': []}):
+            with self.subTest(changes=changes):
+                self.save_backup(**changes)
+                self.assertEqual(self.recover(), 'unverified')
+        self.write.assert_not_called()
+
+    def test_a_live_owner_is_left_alone(self):
+        self.save_backup()
+        self.owner_alive.return_value = True
+        self.assertEqual(self.recover(), 'unchanged')
+        self.write.assert_not_called()
+
+    def test_a_reachable_loopback_listener_is_left_alone(self):
+        self.save_backup()
+        self.local.listen(1)
+        self.connect.side_effect = self.connect_real
+        self.assertEqual(self.recover(), 'unchanged')
+        self.write.assert_not_called()
+
+    def test_a_loopback_timeout_is_unverified(self):
+        self.save_backup()
+        self.connect.side_effect = TimeoutError
+        self.assertEqual(self.recover(), 'unverified')
+        self.write.assert_not_called()
+
+    def test_a_saved_enabled_loopback_that_is_also_down_is_unverified(self):
+        with socket.socket() as previous:
+            previous.bind(('127.0.0.1', 0))
+            self.save_backup(server=f'127.0.0.1:{previous.getsockname()[1]}')
+            self.assertEqual(self.recover(), 'unverified')
+        self.write.assert_not_called()
+        self.assertTrue(self.backup.exists())
+
+    def test_inactive_or_remote_proxies_are_left_alone(self):
+        self.save_backup()
+        for proxy in ((0, self.current[1], ''), (1, 'work.example:8080', '')):
+            with self.subTest(proxy=proxy):
+                self.read.return_value = proxy
+                self.assertEqual(self.recover(), 'unchanged')
+        self.write.assert_not_called()
+
+    def test_a_proxy_that_changed_during_recovery_is_left_alone(self):
+        self.save_backup()
+        self.read.side_effect = [self.current, (1, 'work.example:8080', '')]
+        self.assertEqual(self.recover(), 'unchanged')
+        self.write.assert_not_called()
+        self.assertTrue(self.backup.exists())
+
+    def test_failed_write_keeps_the_backup(self):
+        self.save_backup()
+        self.write.side_effect = PermissionError('mock write error')
+        with self.assertRaises(PermissionError):
+            self.recover()
+        self.assertTrue(self.backup.exists())
 
 
 if __name__ == "__main__":
