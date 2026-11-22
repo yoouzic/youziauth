@@ -865,5 +865,48 @@ class PaceTextTests(unittest.TestCase):
         self.assertEqual(lptiyu_flow.pace_text(None), '')
 
 
+class LinkFailureFlagTests(unittest.TestCase):
+    """link_failure 只标「提交之前就断了」: 那时重跑是安全的。
+
+    提交(POST stopRun)发出去之后的断链不算 —— 记录可能已经落库, 再跑一次就是
+    重复提交。这个区别决定了面板敢不敢把这一拍当成「等网回来重试」。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.template = make_template(Path(self._tmp.name))
+        patcher = patch('lptiyu.flow.UP.upload_to_oss', return_value=(200, ''))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_oserror_before_submit_marks_the_link_failure(self):
+        slot = FakeSlot()
+        slot.client = FakeClient({'before_run': OSError(11001, 'getaddrinfo failed')})
+        flow = make_flow(slot, template_path=self.template)
+
+        self.assertEqual(flow.run(submit=True), (None, 4))
+        self.assertTrue(flow.link_failure)
+
+    def test_oserror_after_submit_is_not_an_outage(self):
+        slot = FakeSlot()
+        slot.client = FakeClient({'stop_run': OSError(10054, 'connection reset')})
+        flow = make_flow(slot, template_path=self.template)
+
+        self.assertEqual(flow.run(submit=True), (None, 4))
+        self.assertFalse(flow.link_failure, '提交已发出去, 不能当作「没网, 再跑一次」')
+
+    def test_flag_is_cleared_on_the_next_successful_run(self):
+        slot = FakeSlot()
+        slot.client = FakeClient({'before_run': OSError('offline')})
+        flow = make_flow(slot, template_path=self.template)
+        flow.run(submit=True)
+        self.assertTrue(flow.link_failure)
+
+        slot.client = FakeClient({})
+        self.assertEqual(flow.run(submit=True)[1], 0)
+        self.assertFalse(flow.link_failure, '下一拍正常了就不能还挂着上一拍的断网标记')
+
+
 if __name__ == '__main__':
     unittest.main()

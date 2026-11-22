@@ -4,6 +4,10 @@
   读取凭证 → 真门探测(101 才判死) → 死了先向研究库同步 → 仍无凭证且研究库
   可用则后台采集(等用户开一次小程序) → 拿到凭证跑完整流水线 → 结果落盘。
 所有自动行为都有硬上限: 每天最多自动尝试 3 次、自动采集 2 次, 绝不无限重试。
+**断网不算一次尝试**: 「根本连不上」是机器的状态, 不是学校给的判决 —— 拿它去
+烧当天 3 次额度, 只会让「早上六点半没网」变成「一整天都不再试」。断网改按
+5 → 10 → 20 → 40 → 60 分钟退避后继续试, 直到有效时段结束或断网重试到上限
+(MAX_DAILY_OFFLINE_ATTEMPTS); 真实的失败(判无效/额度/凭证死)仍然 3 次就停。
 
 凭证自动续期(lptiyu_renew.CredentialRenewer)在这里挂两条线:
   * 手动: 「立即续期」= start('renew'), 越过冷却(采集/探活的每日配额仍是硬的),
@@ -17,6 +21,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import http.client
 import os
 import random
 import queue
@@ -114,6 +119,12 @@ def open_mini_program(uri=OFFICIAL_MINI_PROGRAM_URI, timeout=6.0):
 
 
 MAX_DAILY_AUTO_ATTEMPTS = 3
+# 断网重试不占上面那 3 次: 它的上限是「退避间隔」+「今天最多重试几次」。
+# 5→10→20→40→60 分钟封顶, 从 06:30 起算一天也就十几次; 24 次是安全网, 正常
+# 有效时段(6:00–23:00)走不到。
+MAX_DAILY_OFFLINE_ATTEMPTS = 24
+OFFLINE_RETRY_BASE_SECONDS = 300
+OFFLINE_RETRY_MAX_SECONDS = 3600
 VERIFY_PROBE_TIMEOUT_SECONDS = 15
 TERM_COUNT_TIMEOUT_SECONDS = 25
 MAX_TERM_COUNT_WORKERS = 3
@@ -135,6 +146,50 @@ class LptiyuError(Exception):
         self.state = state
         self.message = message
         super().__init__(message)
+
+
+class OfflineError(LptiyuError):
+    """这一拍根本没连上(断网/DNS/连接被拒/读响应超时)。
+
+    它不是学校给的判决: 等网回来自动重跑就行, 不该拿当天那 3 次尝试额度去换。
+    只有「提交已经发出去之后」才发现断链的情形不算在内(记录可能已落库), 那条路
+    在 DailyFlow 里按普通失败收尾。
+    """
+
+    def __init__(self, message=''):
+        super().__init__('offline', message or '连不上学校服务器（网络不可用）')
+
+
+# 传输层才会出现的异常: 它们证明「请求没走到学校」, 而不是学校拒了这次跑步。
+LINK_FAILURE_ERRORS = (OSError, http.client.HTTPException)
+
+
+def link_failure(exc):
+    """这个异常是不是「断网」。
+
+    顺着 __cause__/__context__ 往里看: 面板这一层拿到的可能是 LptiyuError 包着
+    OSError。ApiError 是服务端真的回了话, 一律当判决 —— 那才该计入 3 次上限。
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, LptiyuError):
+            return exc.state == 'offline'
+        if isinstance(exc, ApiError):
+            return False
+        if isinstance(exc, LINK_FAILURE_ERRORS):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def offline_retry_delay(attempts):
+    """第 n 次断网重试之后等多久: 5 → 10 → 20 → 40 → 60 分钟(封顶)。"""
+    try:
+        step = max(1, min(int(attempts), 5))
+    except (TypeError, ValueError):
+        step = 1
+    return min(OFFLINE_RETRY_MAX_SECONDS, OFFLINE_RETRY_BASE_SECONDS * 2 ** (step - 1))
 
 
 class TokenSlot:
@@ -243,6 +298,9 @@ class LptiyuController:
         self._run_member_prefix = ''
         self._sweeping_run = False   # 轮跑中不给单个成员走续期/采集阶梯
         self._next_run_all = 0.0     # 两轮轮跑之间的间隔, 失败重试不轰炸
+        # 断网退避到期时刻(monotonic): 没网时不是「今天试完了」, 而是「过一会儿再试」。
+        # 0.0 = 没有在退避。
+        self._next_auto_at = 0.0
         self._term_quota = {}        # 成员 ID → 当天已确认达到的学期上限
         # 初始状态不是「发生过的事」: 每造一个控制器就往历史里写一行, 记录页会被
         # 「尚未开始今天的跑步」刷满(测试和预览尤其明显)。
@@ -439,6 +497,8 @@ class LptiyuController:
             return
         if not in_window or not run_ready:
             return
+        if not self._auto_attempt_allowed():
+            return
         if not settings.run_all_members:
             # 单成员(旧行为): 只跑活动成员这一个账号。
             if self.store.is_signed_today(current.date()):
@@ -457,6 +517,49 @@ class LptiyuController:
         if not pending:
             return
         self._start_run_all(pending)
+
+    def _auto_attempt_allowed(self):
+        """断网退避与断网重试上限: 这两道闸都不消耗「今天自动尝试 3 次」的额度。
+
+        没网时每一拍都重来一遍, 只会把 3 次额度烧在同一条死链路上, 之后一整天都
+        不再试(2026-11-21 现场: 06:31/06:35/06:39 三行 error, 之后只剩保活日志)。
+        这里改成等网: 退避到期再试, 一直试到有效时段结束或断网重试到上限。
+        """
+        if time.monotonic() < self._next_auto_at:
+            return False
+        return self._offline_attempts_today() < MAX_DAILY_OFFLINE_ATTEMPTS
+
+    def _offline_attempts_today(self):
+        try:
+            return int(self.store.daily().get('offline', 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _defer_offline(self, exc):
+        """把「这一拍没网」记成一次断网重试, 并给出下一拍的时间。
+
+        不碰 daily.json 的 auto 计数: 断网不是一次尝试, 只是网还没回来。
+        """
+        try:
+            attempts = int(self.store.bump_daily(kind='offline') or 1)
+        except Exception:            # noqa: BLE001 —— 台账写不动也要照常退避
+            attempts = max(1, self._offline_attempts_today() + 1)
+        head = str(getattr(exc, 'message', '') or '').strip() or '连不上学校服务器（网络不可用）'
+        if attempts >= MAX_DAILY_OFFLINE_ATTEMPTS:
+            self._next_auto_at = float('inf')
+            return LptiyuError(
+                'offline',
+                f'{head}；今天已自动重试 {attempts} 次，先停在这里'
+                '（网络恢复后可手动点「开始跑步」）')
+        delay = offline_retry_delay(attempts)
+        self._next_auto_at = time.monotonic() + delay
+        try:
+            retry_at = (self._clock() + dt.timedelta(seconds=delay)).strftime('%H:%M')
+        except Exception:            # noqa: BLE001 —— 时钟坏了也要能退避
+            retry_at = ''
+        plan = (f'{head}；{retry_at} 自动再试一次（今天会一直试到有效时段结束）'
+                if retry_at else f'{head}；稍后自动再试一次')
+        return LptiyuError('offline', plan)
 
     def drain(self):
         values = []
@@ -643,6 +746,10 @@ class LptiyuController:
                     self._execute_automatic()
                 except LptiyuError as exc:
                     self._set_latest(exc.state, f'「{name}」{exc.message}')
+                    if exc.state == 'offline':
+                        # 整机没网: 后面几个成员一样连不上, 这一轮到此为止,
+                        # 由 _defer_offline 排好的退避决定下一轮什么时候来。
+                        break
                 except Exception:  # noqa: BLE001
                     self._set_latest('error', f'「{name}」跑步操作未完成，请稍后重试')
                 if index + 1 < len(pending):
@@ -1153,6 +1260,10 @@ class LptiyuController:
             self.store.clear_token()
         if record and record.get('token'):
             return record
+        if outcome is not None and outcome.state == 'error':
+            # 「暂时确认不了」是链路问题, 不是「本机没有号」: 等网回来还能续上,
+            # 别让它烧掉当天的一次自动尝试。
+            raise OfflineError(outcome.message or '暂时连不上学校服务器')
         raise LptiyuError('need_token',
                           outcome.message if outcome is not None else '没有可用凭证')
 
@@ -1253,16 +1364,29 @@ class LptiyuController:
                                      progress_fn=progress_fn)
 
     def _execute_automatic(self):
-        result = None
+        """自动跑一拍。
+
+        断网不算一次尝试(不写 auto 计数): 记一次断网重试, 退避之后再来, 一直试到
+        有效时段结束。真正走到了学校的失败(判无效/额度/凭证死)仍然计入当天那 3 次。
+        """
         try:
             result = self._execute(submit=True)
-            return result
-        finally:
-            if result is None or result['state'] != 'term_quota':
-                try:
-                    self.store.bump_daily(kind='auto')
-                except Exception:  # noqa: BLE001 —— 台账写入失败不覆盖跑步结果
-                    pass
+        except Exception as exc:  # noqa: BLE001 —— 先分类, 再原样抛回去
+            if link_failure(exc):
+                raise self._defer_offline(exc) from exc
+            self._count_auto_attempt()
+            raise
+        # 这一拍确实走到了学校(不管结论如何): 断网退避作废。
+        self._next_auto_at = 0.0
+        if result is None or result.get('state') != 'term_quota':
+            self._count_auto_attempt()
+        return result
+
+    def _count_auto_attempt(self):
+        try:
+            self.store.bump_daily(kind='auto')
+        except Exception:  # noqa: BLE001 —— 台账写入失败不覆盖跑步结果
+            pass
 
     def _execute(self, submit):
         # 界面的分段进度条: 提交跑 4 段, 本地验证不提交只有 3 段。
@@ -1311,6 +1435,9 @@ class LptiyuController:
         flow = self._flow(settings, progress_fn=lambda stage, text:
                           self._progress(stage, total, labels, text))
         summary, code = flow.run(submit=submit, zone_override=settings.zone_id or None)
+        if code == 4 and getattr(flow, 'link_failure', False):
+            # 提交之前就断了: 这一拍什么都没写进去, 等网回来重跑是安全的。
+            raise OfflineError('网络中断，跑步数据没能提交上去')
         if code == 9:
             return self._set_latest('cancelled', '已取消当前操作')
         if submit and settings.term_run_limit is not None:

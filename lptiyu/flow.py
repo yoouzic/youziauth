@@ -15,6 +15,7 @@
     的核心: 凭证不再是一次性消耗品。
   * 模板缺失自动落到 ring 引擎, 不再是致命错误。
 """
+import http.client
 import json
 import math
 import random
@@ -177,6 +178,11 @@ class DailyFlow:
         self.rnd = random.Random()
         self.stop_event = stop_event or threading.Event()
         self.lines = []                              # 本次运行的过程日志(留档)
+        # 这一拍是不是「根本没连上」(DNS/连接/超时), 由 run() 结束时给出。
+        # 调用方据此区分「断网, 等网回来可以重跑」和「学校给出的判决, 重跑也白跑」。
+        # 提交(POST stopRun)已经发出去之后不再算断网: 记录可能已经落库, 再跑一次
+        # 就是重复提交 —— 那种情况按普通失败处理, 交给人和台账判断。
+        self.link_failure = False
 
     def _report(self, stage, text):
         try:
@@ -413,6 +419,7 @@ class DailyFlow:
         | 3 当日额度满 | 4 其他失败 | 5 受理但判无效 | 6 已提交、停止等待判定
         | 7 达到学期上限 | 8 无法确认学期次数 | 9 中断。"""
         submitting = False
+        self.link_failure = False
         try:
             self._check_cancelled()
             client = self.slot.make_client(pace=0.8)
@@ -599,6 +606,13 @@ class DailyFlow:
             return None, 4
         except OSError as e:
             self.log(f"[FATAL] 业务链不通 {e.__class__.__name__}: {e}")
+            # 提交已经发出去之后的断链不算「可以重跑」: 记录可能已经落库。
+            self.link_failure = not submitting
             if not submitting and self.stop_event.is_set():
                 return None, 9
+            return None, 4
+        except http.client.HTTPException as e:
+            # 响应读到一半被掐断(BadStatusLine/IncompleteRead 之类): 同样是链路问题。
+            self.log(f"[FATAL] 响应中断 {e.__class__.__name__}: {e}")
+            self.link_failure = not submitting
             return None, 4

@@ -20,7 +20,9 @@ from unittest.mock import patch
 import lptiyu_panel
 import lptiyu_capture
 from lptiyu.cipher import seal
-from lptiyu_panel import LptiyuController, LptiyuError, TokenSlot, MAX_DAILY_AUTO_ATTEMPTS
+from lptiyu_panel import (LptiyuController, LptiyuError, TokenSlot, MAX_DAILY_AUTO_ATTEMPTS,
+                          MAX_DAILY_OFFLINE_ATTEMPTS, OfflineError, link_failure,
+                          offline_retry_delay)
 from lptiyu.client import ApiError
 from lptiyu.flow import TERM_COUNT_UNAVAILABLE, TERM_QUOTA_REACHED
 from lptiyu_renew import CredentialRenewer, RenewOutcome
@@ -559,6 +561,161 @@ class PollTests(PanelTestCase):
         self.assertEqual(len(self.flows), flows_before)
 
 
+class LinkFailureClassifierTests(unittest.TestCase):
+    """断网判据: 传输层异常算断网, 服务端答复(ApiError)一律算判决。"""
+
+    def test_transport_errors_count_as_offline(self):
+        for exc in (OSError('no route to host'), TimeoutError('timed out'),
+                    ConnectionRefusedError(10061, 'refused'),
+                    ConnectionResetError(10054, 'reset'),
+                    http.client.RemoteDisconnected('closed'),
+                    http.client.IncompleteRead(b'x')):
+            with self.subTest(exc=exc):
+                self.assertTrue(link_failure(exc))
+
+    def test_our_own_offline_error_counts(self):
+        self.assertTrue(link_failure(OfflineError('没网')))
+
+    def test_server_answers_are_verdicts_not_outages(self):
+        for exc in (ApiError(4, '非JSON响应'), ApiError(101, 'token 失效'),
+                    LptiyuError('need_token', '没有可用凭证'),
+                    LptiyuError('cancelled', '已取消当前操作')):
+            with self.subTest(exc=exc):
+                self.assertFalse(link_failure(exc))
+
+    def test_wrapped_transport_errors_are_still_seen(self):
+        try:
+            try:
+                raise OSError('getaddrinfo failed')
+            except OSError as inner:
+                raise RuntimeError('probe failed') from inner
+        except RuntimeError as exc:
+            self.assertTrue(link_failure(exc))
+
+    def test_retry_delays_grow_then_stay_capped(self):
+        self.assertEqual([offline_retry_delay(n) for n in range(1, 8)],
+                         [300, 600, 1200, 2400, 3600, 3600, 3600])
+
+
+class OfflineRetryTests(PanelTestCase):
+    """断网不是判决: 不烧当天 3 次额度, 退避后继续试, 一直试到有效时段结束。"""
+
+    @staticmethod
+    def _raise_offline(controller, client):
+        raise OSError(11001, 'getaddrinfo failed')
+
+    def test_offline_failure_does_not_spend_a_daily_attempt(self):
+        controller = self.make_controller(settings=Settings(enabled=True, run_all_members=False))
+        with patch.object(LptiyuController, '_probe_alive', self._raise_offline):
+            with self.assertRaises(LptiyuError) as caught:
+                controller._execute_automatic()
+        self.assertEqual(caught.exception.state, 'offline')
+        self.assertIsNone(self.store.daily().get('auto'), '断网不该记成一次自动尝试')
+        self.assertEqual(self.store.daily().get('offline'), 1)
+        self.assertIn('自动再试', caught.exception.message)
+        self.assertIn('07:0', caught.exception.message, '要告诉用户几点会再试')
+
+    def test_poll_waits_for_the_backoff_then_tries_again(self):
+        controller = self.make_controller(settings=Settings(enabled=True, run_time='06:30',
+                                                            run_all_members=False))
+        with patch.object(LptiyuController, '_probe_alive', self._raise_offline):
+            controller.poll()
+            controller._wait_for_work(30)
+        self.assertEqual(controller.latest['state'], 'offline')
+        self.assertEqual(self.flows, [], '连不上的那一拍不该走到流水线')
+        # 退避期内: 再 poll 也不重来(这正是以前把 3 次额度烧光的地方)
+        controller._poll_at = 0
+        with patch.object(LptiyuController, '_probe_alive', self._raise_offline):
+            controller.poll()
+            controller._wait_for_work(30)
+        self.assertEqual(self.store.daily().get('offline'), 1, '退避期内不再尝试')
+        # 退避到期: 自动继续试, 仍然不计入当天那 3 次
+        controller._next_auto_at = 0.0
+        controller._poll_at = 0
+        with patch.object(LptiyuController, '_probe_alive', self._raise_offline):
+            controller.poll()
+            controller._wait_for_work(30)
+        self.assertEqual(self.store.daily().get('offline'), 2, '退避到期要自己再来一次')
+        self.assertIsNone(self.store.daily().get('auto'))
+
+    def test_backoff_widens_with_each_offline_retry(self):
+        controller = self.make_controller(settings=Settings(enabled=True, run_all_members=False))
+        delays = []
+        with patch.object(LptiyuController, '_probe_alive', self._raise_offline):
+            for _ in range(6):
+                with self.assertRaises(LptiyuError):
+                    controller._execute_automatic()
+                delays.append(controller._next_auto_at - time.monotonic())
+        for got, want in zip(delays, [300, 600, 1200, 2400, 3600, 3600]):
+            self.assertAlmostEqual(got, want, delta=5.0)
+
+    def test_network_coming_back_clears_the_backoff(self):
+        controller = self.make_controller(code=0, settings=Settings(enabled=True,
+                                                                    run_all_members=False))
+        with patch.object(LptiyuController, '_probe_alive', self._raise_offline):
+            with self.assertRaises(LptiyuError):
+                controller._execute_automatic()
+        self.assertGreater(controller._next_auto_at, 0.0)
+        result = controller._execute_automatic()      # setUp 里的探活是「通的」
+        self.assertEqual(result['state'], 'signed')
+        self.assertEqual(controller._next_auto_at, 0.0, '网回来了就不再退避')
+
+    def test_unconfirmed_credentials_are_an_outage_not_an_attempt(self):
+        self.store.clear_token()
+        controller = self.make_controller(
+            settings=Settings(enabled=True, run_all_members=False),
+            renewer=FakeRenewer(outcome=RenewOutcome('error', '暂时确认不了凭证（链路故障）')))
+        with self.assertRaises(LptiyuError) as caught:
+            controller._execute_automatic()
+        self.assertEqual(caught.exception.state, 'offline')
+        self.assertIn('链路故障', caught.exception.message)
+        self.assertIsNone(self.store.daily().get('auto'), '拿不到结论不等于试过一次')
+
+    def test_flow_level_link_failure_is_retried_instead_of_spent(self):
+        controller = self.make_controller(code=4, settings=Settings(enabled=True,
+                                                                    run_all_members=False))
+
+        def factory(slot, flow_settings):
+            flow = FakeFlow(4)
+            flow.link_failure = True          # DailyFlow 在提交前断链时给的就是这个
+            self.flows.append(flow)
+            return flow
+
+        with patch.object(controller, '_flow_factory', side_effect=factory):
+            with self.assertRaises(LptiyuError) as caught:
+                controller._execute_automatic()
+        self.assertEqual(caught.exception.state, 'offline')
+        self.assertIsNone(self.store.daily().get('auto'))
+        self.assertEqual(self.store.daily().get('offline'), 1)
+
+    def test_real_failures_still_stop_at_the_daily_cap(self):
+        controller = self.make_controller(code=4, settings=Settings(enabled=True,
+                                                                    run_all_members=False))
+        for _ in range(MAX_DAILY_AUTO_ATTEMPTS):
+            controller._execute_automatic()
+        self.assertEqual(self.store.daily().get('auto'), MAX_DAILY_AUTO_ATTEMPTS)
+        controller._poll_at = 0
+        controller.poll()
+        controller._wait_for_work(30)
+        self.assertEqual(len(self.flows), MAX_DAILY_AUTO_ATTEMPTS,
+                         '真实失败仍然 3 次就停, 断网的宽松不能漏到这里')
+
+    def test_offline_retries_stop_at_the_hard_cap(self):
+        controller = self.make_controller(settings=Settings(enabled=True, run_all_members=False))
+        for _ in range(MAX_DAILY_OFFLINE_ATTEMPTS - 1):
+            self.store.bump_daily(kind='offline')
+        with patch.object(LptiyuController, '_probe_alive', self._raise_offline):
+            with self.assertRaises(LptiyuError) as caught:
+                controller._execute_automatic()
+        self.assertIn('先停在这里', caught.exception.message)
+        controller._poll_at = 0
+        with patch.object(LptiyuController, '_probe_alive', self._raise_offline):
+            controller.poll()
+            controller._wait_for_work(30)
+        self.assertEqual(self.store.daily().get('offline'), MAX_DAILY_OFFLINE_ATTEMPTS,
+                         '到上限之后不再自己重试')
+
+
 class RunAllMembersTests(PanelTestCase):
     # 多成员自动跑步: 逐个激活→跑→记台账→还原活动指针。
 
@@ -650,6 +807,26 @@ class RunAllMembersTests(PanelTestCase):
         self.assertIn('凭证已失效', controller.latest['message'])
         self.assertEqual(controller.store.members_status()['active'], original,
                          '轮跑结束要回到原来的活动成员')
+
+    def test_offline_aborts_the_round_and_keeps_everyone_pending(self):
+        items = self._add_members(3)
+        controller = self.make_controller()
+
+        def offline(controller_self, client):
+            raise OSError(11001, 'getaddrinfo failed')
+
+        with patch('lptiyu_panel.random.uniform', return_value=0.0), \
+                patch.object(LptiyuController, '_probe_alive', offline):
+            controller._start_run_all(items)
+            controller._wait_for_work(30)
+        self.assertEqual(self.flows, [], '整机没网时不该逐个成员再撞一遍')
+        self.assertEqual(controller.latest['state'], 'offline')
+        self.assertEqual(len(controller._pending_members()), len(items),
+                         '三个人都还没跑, 下一轮(退避之后)还要继续试')
+        day = now().date().isoformat()
+        for item in items:
+            self.assertIsNone(controller.store.member_daily(item['id']).get(day, {}).get('auto'),
+                              '断网不占任何成员的自动尝试额度')
 
 
 class RenewActionTests(PanelTestCase):

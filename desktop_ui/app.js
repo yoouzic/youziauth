@@ -913,6 +913,8 @@ const LP_NAMES={signed:'今日已完成',running:'正在跑步',checked:'验证�
   synced:'凭证已同步',need_token:'等待凭证',quota:'今日已完成',uncertain:'结果待确认',
   term_quota:'已达学期上限',term_count_unavailable:'次数读取失败',
   waiting:'等待时段',error:'需要检查',cancelled:'操作已取消',
+  /* 断网不是判决: 后端会一直退避重试, 这行字要说清「还在等网」而不是「今天没戏了」。 */
+  offline:'网络不通 · 会自动重试',
   renewed:'凭证已续期',token_ok:'凭证可用',cooldown:'稍后再试',zones:'跑区已同步'};
 /* 续期台账只回答「何时试过、下次何时、结果如何」：续期是后台维护动作，
    文案要让人一眼看出「还活着 / 什么时候会再看一眼 / 要不要自己动一次」。 */
@@ -941,7 +943,7 @@ function renewalText(lp,rn){
 }
 function renderRunStatus(lp,s){
   const label=lp.busy?'正在处理…':(LP_NAMES[lp.state]||'请查看任务状态');
-  const tone=lp.state==='signed'?'success':['need_token','error','uncertain','quota','term_count_unavailable'].includes(lp.state)?'warning':'';
+  const tone=lp.state==='signed'?'success':['need_token','error','offline','uncertain','quota','term_count_unavailable'].includes(lp.state)?'warning':'';
   const member=activeMember();
   const who=(member&&member.name)||(lp.identity&&lp.identity.name)||'';
   badge('lp-badge',label,tone);badge('lp-task-badge',label,tone);
