@@ -8,6 +8,7 @@
 }
 
 #lptiyu {
+  --lp-control-height: 44px;
   container-type: inline-size;
 }
 
@@ -25,7 +26,7 @@
 .lp-overview {
   display: grid;
   grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
-  align-items: start;
+  align-items: stretch;
   gap: 16px;
   margin-bottom: 16px;
 }
@@ -177,6 +178,27 @@
   font-weight: 600;
 }
 
+.lp-saved-zone dd {
+  flex: 1 1 min(180px, 100%);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0 6px;
+  min-width: 0;
+}
+
+.lp-saved-zone strong {
+  flex: 1 1 0;
+  min-width: min(130px, 100%);
+  overflow-wrap: anywhere;
+}
+
+.lp-saved-zone button {
+  padding-inline: 6px;
+  margin-inline-start: auto;
+}
+
 .lp-actions {
   display: flex;
   flex-wrap: wrap;
@@ -278,7 +300,7 @@
 
 .lp-run-details,
 .lp-advanced-settings,
-.lp-pace-exact {
+.lp-range-exact {
   padding-inline: 0;
   border: 0;
   border-top: 1px solid var(--border);
@@ -292,7 +314,7 @@
 
 .lp-run-details[open],
 .lp-advanced-settings[open],
-.lp-pace-exact[open] {
+.lp-range-exact[open] {
   padding-bottom: 0;
 }
 
@@ -349,16 +371,23 @@
   border: 0;
 }
 
-.lp-field label,
-.lp-field legend {
+.lp-field label {
   margin: 0 0 6px;
   padding: 0;
   font-size: 12px;
   font-weight: 600;
 }
 
-.lp-field input {
+.lp-field input,
+.lp-range input {
   font-variant-numeric: tabular-nums;
+}
+
+.lp-settings-grid .lp-field input:not([type="checkbox"]),
+.lp-settings-grid .lp-field select,
+.lp-inline-field > button,
+.lp-range input {
+  height: var(--lp-control-height);
 }
 
 .lp-range {
@@ -377,33 +406,33 @@
   gap: 9px;
 }
 
-.lp-pace-panel {
+.lp-range-panel {
   align-self: start;
   margin: 0;
   background: rgba(255, 254, 250, .38);
 }
 
-.lp-pace-panel > summary {
-  min-height: 40px;
+.lp-range-panel > summary {
+  min-height: calc(var(--lp-control-height) - 2px);
 }
 
-.lp-pace-panel > summary::after {
+.lp-range-panel > summary::after {
   margin-left: 0;
 }
 
-#lp-pace-hint {
+.lp-range-hint {
   margin-inline-start: auto;
   color: var(--blue);
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-.lp-pace-controls {
+.lp-range-controls {
   padding-top: 6px;
   border-top: 1px solid var(--border);
 }
 
-.lp-pace-slider {
+.lp-range-slider {
   --lp-slider-thumb: #65765a;
   --lp-slider-track: linear-gradient(to right, #d2dbca, #e5ded1);
   display: grid;
@@ -412,29 +441,29 @@
   align-items: baseline;
 }
 
-.lp-pace-slider + .lp-pace-slider {
+.lp-range-slider + .lp-range-slider {
   --lp-slider-thumb: var(--blue);
   margin-top: 5px;
 }
 
-.lp-pace-slider label {
+.lp-range-slider label {
   margin: 0;
   color: var(--muted);
   font-size: 11px;
 }
 
-.lp-pace-slider output {
+.lp-range-slider output {
   color: var(--strong);
   font-weight: 650;
   font-variant-numeric: tabular-nums;
 }
 
-.lp-pace-panel[data-mode="auto"] .lp-pace-slider output {
+.lp-range-panel[data-mode="auto"] .lp-range-slider output {
   color: var(--muted);
   font-weight: 500;
 }
 
-.lp-pace-slider input[type="range"] {
+.lp-range-slider input[type="range"] {
   grid-column: 1 / -1;
   appearance: none;
   height: 28px;
@@ -447,13 +476,13 @@
   cursor: pointer;
 }
 
-.lp-pace-slider input::-webkit-slider-runnable-track {
+.lp-range-slider input::-webkit-slider-runnable-track {
   height: 4px;
   border-radius: 4px;
   background: var(--lp-slider-track);
 }
 
-.lp-pace-slider input::-webkit-slider-thumb {
+.lp-range-slider input::-webkit-slider-thumb {
   appearance: none;
   width: 16px;
   height: 16px;
@@ -463,13 +492,13 @@
   background: var(--surface);
 }
 
-.lp-pace-slider input::-moz-range-track {
+.lp-range-slider input::-moz-range-track {
   height: 4px;
   border-radius: 4px;
   background: var(--lp-slider-track);
 }
 
-.lp-pace-slider input::-moz-range-thumb {
+.lp-range-slider input::-moz-range-thumb {
   box-sizing: border-box;
   width: 16px;
   height: 16px;
@@ -478,7 +507,7 @@
   background: var(--surface);
 }
 
-.lp-pace-scale {
+.lp-range-scale {
   display: flex;
   justify-content: space-between;
   gap: 8px;
@@ -492,8 +521,8 @@
   margin-top: 3px;
 }
 
-.lp-pace-exact {
-  margin-top: 2px;
+.lp-range-exact {
+  margin-top: 8px;
 }
 
 .lp-advanced-settings {
@@ -672,7 +701,7 @@
 
 @media (forced-colors: active) {
   .lp-term-progress,
-  .lp-pace-slider input[type="range"] {
+  .lp-range-slider input[type="range"] {
     appearance: auto;
   }
 }

@@ -395,6 +395,22 @@ function renderProxyHint(p){
   const apply=$('proxy-apply');
   if(apply)apply.hidden=!p.can_apply;
 }
+const distanceEnds=['lo','hi'];
+function renderDistanceEditor(){
+  const inputs=distanceEnds.map(end=>$('lp-dist-'+end));
+  const distances=inputs.map(input=>Number(input.value));
+  const valid=distances[0]<distances[1]&&inputs.every(input=>input.value&&input.validity?.valid!==false);
+  $('lp-dist-hint').textContent=valid
+    ?distances.map(distance=>distance.toFixed(2)).join('–')+' 公里'
+    :'距离待修正';
+  distanceEnds.forEach((end,index)=>{
+    const slider=$('lp-dist-'+end+'-slider');
+    if(valid)slider.value=String(distances[index]);
+    const label=Number(slider.value).toFixed(2)+' 公里';
+    slider.setAttribute('aria-valuetext',label);
+    $('lp-dist-'+end+'-value').textContent=label;
+  });
+}
 function paceLabel(seconds){
   const s=Math.round(Number(seconds)||0);
   if(!s)return '自动';
@@ -679,6 +695,21 @@ $('network-form').addEventListener('submit',async event=>{
   if(await act('network_save',payload)){if(revision===revisions.network){markDirty('network',false);$('password').value='';}render();}
 });
 $('location-source').addEventListener('change',()=>{sourceRevision++;sourceDirty=true;markDirty('dorm',true);});
+distanceEnds.forEach((end,index)=>{
+  const input=$('lp-dist-'+end);
+  input.addEventListener('input',renderDistanceEditor);
+  $('lp-dist-'+end+'-slider').addEventListener('input',()=>{
+    // Both tracks share an axis. Keep the exact-input bounds and use integer steps.
+    const values=distanceEnds.map(side=>Math.round(Number($('lp-dist-'+side+'-slider').value)*100));
+    const min=Math.round(Number(input.min)*100);
+    const max=Math.round(Number(input.max)*100);
+    const lower=index===0?min:Math.max(min,values[0]+1);
+    const upper=index===0?Math.min(max,values[1]-1):max;
+    values[index]=Math.max(lower,Math.min(upper,values[index]));
+    distanceEnds.forEach((side,i)=>{$('lp-dist-'+side).value=(values[i]/100).toFixed(2);});
+    renderDistanceEditor();
+  });
+});
 ['lp-pace-lo','lp-pace-hi'].forEach(id=>$(id).addEventListener('input',renderPaceEditor));
 ['lp-pace-fast-slider','lp-pace-slow-slider'].forEach((id,index)=>$(id).addEventListener('input',()=>{
   const values=['lp-pace-fast-slider','lp-pace-slow-slider'].map(key=>Number($(key).value));
@@ -726,7 +757,13 @@ $('lptiyu-form').addEventListener('submit',async event=>{
     auto_renew:$('lp-auto-renew').checked,lab_dir:$('lp-lab').value.trim(),
     zone_id:$('lp-zone-select').value,
     zone_name:(state.lptiyu?.zones||[]).find(z=>z.id===$('lp-zone-select').value)?.name||''};
-  if(payload.dist_lo>=payload.dist_hi){notify('距离下限要小于上限，暂不支持倒序范围。',true);return;}
+  if(payload.dist_lo>=payload.dist_hi){
+    $('lp-dist-panel').open=true;
+    $('lp-dist-exact').open=true;
+    $('lp-dist-lo').focus();
+    notify('最短距离须小于最长距离。',true);
+    return;
+  }
   const member=activeMember(),draft=termLimitDraft;
   if(member){
     if(!requireLptiyuSync())return;
@@ -921,11 +958,10 @@ function renderRunStatus(lp,s){
   if($('lp-message').textContent!==message)$('lp-message').textContent=message;
   renderLpSteps(lp);
   $('lp-details').hidden=!s.run_time;
+  // 名称以 zone 区块为准，只有拿不到名字才退到 id。
+  const zone=lp.zone?.name||lp.zone?.id||s.zone_name||s.zone_id||'未指定';
+  $('lp-zone').textContent=zone;
   if(s.run_time){
-    // 名称以zone区块为准(它按跑区目录校正过); 只有拿不到名字才退到 id。
-    const zone=(lp.zone&&lp.zone.name)
-      ||(lp.zone&&lp.zone.id)||s.zone_name||s.zone_id||'未指定';
-    $('lp-zone').textContent=zone;
     $('lp-distance').textContent=`${s.dist_lo}–${s.dist_hi} km`;
     $('lp-pace-detail').textContent=paceRangeLabel(...paceWindow(lp));
     const last=lp.last;
@@ -1023,6 +1059,7 @@ function renderRunSettings(lp,s){
   $('lp-run-time').value=s.run_time||'06:30';
   $('lp-dist-lo').value=s.dist_lo??2.03;
   $('lp-dist-hi').value=s.dist_hi??2.35;
+  renderDistanceEditor();
   const [paceLo,paceHi]=paceWindow(lp);
   $('lp-pace-lo').value=paceLo?paceLabel(paceLo):'';
   $('lp-pace-hi').value=paceHi?paceLabel(paceHi):'';

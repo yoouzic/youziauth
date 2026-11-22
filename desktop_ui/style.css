@@ -54,6 +54,7 @@
 .map-points select,.map-point-edit input{width:100%}
 .map-points .field-hint{grid-column:1/-1;margin:0}
 .map-point-edit button{padding:7px 11px;font-size:12px}
+.map-point-edit input,.map-point-edit button{min-height:44px}
 .map-point-edit .field-hint{grid-column:1/-1;margin:0}
 .map-frame{position:relative;margin-top:12px}
 .map-frame canvas{display:block;width:100%;height:auto;border:1px solid var(--border);border-radius:9px;background:#eef1f4;cursor:grab;touch-action:none}
@@ -64,8 +65,8 @@
 .map-controls button{padding:7px 11px;font-size:12px}
 .map-toggle{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}
 .map-toggle input{margin:0}
-.map-card .form-footer{margin-top:14px;border-top:1px solid var(--border);padding-top:14px}
-.map-card .text-button{margin-top:10px}
+.map-card .form-footer{justify-content:flex-end;flex-wrap:wrap;margin-top:14px;padding-top:14px}
+.map-card .form-footer button{min-height:44px}
 .map-card #map-basemap-note{color:var(--muted)}
 .map-card #map-basemap-note.warn{color:var(--red)}
 
@@ -73,7 +74,9 @@
 .account-bar label{margin:0;font-size:12px}
 .account-bar select{flex:1 1 190px}
 .account-bar input{flex:1 1 140px}
-.account-bar button{padding:7px 12px;min-height:38px;font-size:12px}
+.account-bar select,.account-bar input,.account-bar button{min-height:44px}
+.account-actions{display:flex;flex-wrap:wrap;gap:8px 10px;max-width:100%}
+.account-bar button{padding:7px 12px;font-size:12px}
 .account-bar .danger{margin-top:0}
 .account-bar #account-state{font-size:11px;color:var(--muted);overflow-wrap:anywhere}
 /* 学校登录：页面级卡片，紧贴「打卡账号」，让「账号 → 登录 → 打卡」连成一条线。

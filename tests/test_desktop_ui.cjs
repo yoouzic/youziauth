@@ -31,7 +31,7 @@ function harness(source='windows',extras={}){
     const classes=new Set((attributes.class||'').split(/\s+/));
     if(!id&&!action&&!classes.has('nav-link'))continue;
     const element={
-      id,tagName:match[1].toUpperCase(),value:attributes.value||'',
+      id,tagName:match[1].toUpperCase(),value:attributes.value||'',min:attributes.min||'',max:attributes.max||'',
       // Read the attribute, not a bare default: index.html ships 在线底图 already checked.
       checked:/\schecked(?:\s|$)/.test(match[2]),
       hidden:/\shidden(?:\s|$)/.test(match[2]),disabled:/\sdisabled(?:\s|$)/.test(match[2]),open:false,
@@ -2734,6 +2734,40 @@ test('an inverted distance range is refused before reaching the bridge',async()=
   await new Promise(resolve=>setTimeout(resolve,0));
   assert.equal(h.calls.filter(call=>call.action==='lptiyu_save').length,0,
     '下限大于上限的设置不发往后台');
+  assert.equal(h.el('lp-dist-panel').open,true);
+  assert.equal(h.el('lp-dist-exact').open,true);
+});
+
+test('lptiyu distance sliders and exact inputs stay in sync without crossing',async()=>{
+  const h=await lptiyuPage({settings:{run_time:'06:30',dist_lo:2.76,dist_hi:3.05}});
+  const form=h.el('lptiyu-form');
+  const low=h.el('lp-dist-lo'),high=h.el('lp-dist-hi');
+  const lowSlider=h.el('lp-dist-lo-slider'),highSlider=h.el('lp-dist-hi-slider');
+  assert.equal(h.el('lp-dist-hint').textContent,'2.76–3.05 公里');
+  assert.equal(lowSlider.value,'2.76');
+  assert.equal(lowSlider.min,highSlider.min);
+  assert.equal(lowSlider.max,highSlider.max);
+
+  lowSlider.value='3.1';
+  lowSlider.fire('input');form.fire('input',lowSlider);
+  assert.equal(low.value,'3.04');
+  assert.equal(high.value,'3.05');
+  assert.equal(lowSlider.attributes['aria-valuetext'],'3.04 公里');
+
+  low.value='2.81';
+  low.fire('input');form.fire('input',low);
+  assert.equal(lowSlider.value,'2.81');
+  highSlider.value='2.80';
+  highSlider.fire('input');form.fire('input',highSlider);
+  assert.equal(high.value,'2.82');
+  assert.equal(h.el('lp-dist-hint').textContent,'2.81–2.82 公里');
+
+  await h.refresh();
+  assert.equal(h.el('lp-dist-hint').textContent,'2.81–2.82 公里');
+  form.fire('submit');
+  await settle();
+  const {dist_lo,dist_hi}=h.calls.at(-1).payload;
+  assert.deepEqual([dist_lo,dist_hi],[2.81,2.82]);
 });
 
 test('lptiyu folds the routine probes and repeated lines',async()=>{
