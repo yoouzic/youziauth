@@ -303,6 +303,25 @@ class DryRunTests(unittest.TestCase):
 
 
 class TermRunLimitTests(unittest.TestCase):
+    def test_term_count_query_uses_the_school_aggregate_without_zone_data(self):
+        client = FakeClient({'before_run': {'term_id': '13103', 'total_num': '24'}})
+
+        self.assertEqual(lptiyu_flow.query_term_count(client, threading.Event()), 24)
+        self.assertEqual(client.calls, ['term_list', 'before_run'])
+
+    def test_term_count_query_falls_back_to_confirmed_records(self):
+        client = FakeClient({
+            'before_run': {'term_id': '13103', 'total_num': None},
+            ('term_records', 1): {'list': [
+                {'id': 1, 'record_status': '1', 'distance': '2.3'},
+                {'id': 2, 'record_status': 2, 'distance': '2.3'},
+            ]},
+        })
+
+        self.assertEqual(lptiyu_flow.query_term_count(client, threading.Event()), 1)
+        self.assertEqual(client.calls, ['term_list', 'before_run',
+                                        ('term_records', 1), ('term_records', 2)])
+
     def test_reaching_the_limit_uses_the_schools_aggregate_before_writes(self):
         slot = FakeSlot()
         slot.client = TermTotalClient('28')

@@ -2140,6 +2140,65 @@ function lptiyuTermMembers(){
     {id:'m2',name:'李四',active:false,has_token:true,term_run_limit:12}]};
 }
 
+test('lptiyu displays school-confirmed zero and an optional member limit',async()=>{
+  const h=await lptiyuPage({members:lptiyuTermMembers(),settings:{term_run_limit:28},
+    term_progress:{member_id:'m1',state:'ready',count:0,limit:28,checked_at:'2026-11-22T10:00:00'}});
+  assert.equal(h.el('lp-term-count').textContent,'0');
+  assert.equal(h.el('lp-term-limit').textContent,'上限 28 次');
+  assert.equal(h.el('lp-term-progress').max,28);
+  assert.equal(h.el('lp-term-progress').value,0);
+  assert.equal(h.el('lp-term-progress').hidden,false);
+
+  h.data.lptiyu.settings.term_run_limit=null;
+  h.data.lptiyu.term_progress={member_id:'m1',state:'ready',count:34,limit:null};
+  await h.refresh();
+  assert.equal(h.el('lp-term-count').textContent,'34');
+  assert.equal(h.el('lp-term-limit').hidden,true);
+  assert.equal(h.el('lp-term-progress').hidden,true);
+});
+
+test('lptiyu never shows a previous member’s count after switching',async()=>{
+  const h=await lptiyuPage({members:lptiyuTermMembers(),settings:{term_run_limit:28},
+    term_progress:{member_id:'m1',state:'ready',count:24,limit:28}});
+  assert.equal(h.el('lp-term-count').textContent,'24');
+
+  await h.api.dispatch('lptiyu_member_switch',{id:'m2'});
+  await h.refresh();
+  assert.equal(h.el('lp-term-count').textContent,'—');
+  assert.equal(h.el('lp-term-limit').textContent,'上限 12 次');
+  assert.equal(h.el('lp-term-progress').hidden,true);
+});
+
+test('lptiyu only queries term progress on entry, a settled run or explicit refresh',async()=>{
+  const h=harness('windows',{lptiyu:{has_token:true,members:lptiyuTermMembers(),
+    term_progress:{member_id:'m1',state:'idle',count:null,limit:28}}});
+  const queries=()=>h.calls.filter(call=>call.action==='lptiyu_term_count');
+  await settle();
+  assert.equal(queries().length,0);
+  h.navigate('lptiyu');
+  await settle();
+  await h.refresh();
+  assert.equal(queries().length,1);
+  assert.equal(queries()[0].payload.member_id,'m1');
+
+  h.data.lptiyu.busy=true;
+  h.data.lptiyu.today_done=1;
+  await h.refresh();
+  assert.equal(queries().length,1);
+  h.data.lptiyu.busy=false;
+  await h.refresh();
+  await settle();
+  assert.equal(queries().length,2);
+  h.el('lp-term-refresh').fire('click');
+  await settle();
+  assert.equal(queries().length,3);
+
+  h.data.lptiyu.token_synced_at='2026-11-22T10:00:00';
+  await h.refresh();
+  await settle();
+  assert.equal(queries().length,4);
+});
+
 test('a snapshot without the lptiyu layer still renders every page',async()=>{
   const h=harness('windows',{lptiyu:false});
   h.navigate('lptiyu');

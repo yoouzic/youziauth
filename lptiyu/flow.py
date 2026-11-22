@@ -53,6 +53,104 @@ def pace_text(seconds_per_km):
     return f"{s // 60}'{s % 60:02d}\""
 
 
+def _term_fields(cfg):
+    if not isinstance(cfg, dict):
+        raise ApiError(TERM_COUNT_UNAVAILABLE, "无法读取学期信息")
+    if str(cfg.get("status")) == "101":
+        raise ApiError(101, "读取学期信息时凭证失效")
+    total_num = str(cfg.get("total_num", "")).strip()
+    try:
+        # 真机 beforeRun 的 total_num 是本学期有效次数；term_num 是目标次数。
+        term_count = int(total_num) if total_num.isdecimal() else None
+    except ValueError:
+        term_count = None
+    return str(cfg.get("term_id") or "0"), term_count
+
+
+def _term_record(record):
+    """学期列表以已确认状态为准，失效记录也可能有里程。"""
+    if not isinstance(record, dict):
+        raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录格式异常")
+    raw_id = record.get("id")
+    record_id = str(raw_id or "").strip()
+    status = str(record.get("record_status")).strip()
+    if type(raw_id) not in (int, str) or not record_id or not status.isdecimal():
+        raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录缺少编号或有效状态")
+    if status != "1":
+        return record_id, False
+
+    reason = record.get("record_failed_reason")
+    try:
+        distance = float(record.get("distance"))
+    except (TypeError, ValueError, OverflowError):
+        raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录里程异常") from None
+    if not math.isfinite(distance) or distance < 0:
+        raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录里程异常")
+    if reason is not None and not isinstance(reason, str):
+        raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录判定格式异常")
+    return record_id, distance > 0 and _positive_reason(reason)
+
+
+def _count_term_records(client, term_id, check_cancelled):
+    records = {}
+    for page in range(1, _MAX_TERM_RECORD_PAGES + 1):
+        check_cancelled()
+        try:
+            reply = client.term_records(term_id, page)
+        except (ApiError, OSError) as error:
+            if isinstance(error, ApiError) and error.code in (9, 101):
+                raise
+            check_cancelled()
+            raise ApiError(TERM_COUNT_UNAVAILABLE, f"无法读取学期记录第 {page} 页") from error
+        check_cancelled()
+        if not isinstance(reply, dict):
+            raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录列表格式异常")
+        status = str(reply.get("status", ""))
+        if status == "101":
+            raise ApiError(101, "读取学期记录时凭证失效")
+        items = reply.get("list")
+        if status not in ("", "0", "1") or not isinstance(items, list):
+            raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录列表格式异常")
+        if not items:
+            return sum(records.values())
+        previous_size = len(records)
+        for item in items:
+            record_id, valid = _term_record(item)
+            if records.setdefault(record_id, valid) != valid:
+                raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录判定在查询中发生变化")
+        if len(records) == previous_size:
+            raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录分页没有返回新记录")
+    raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录分页超出查询范围")
+
+
+def _term_count(client, term_id, aggregate, check_cancelled):
+    check_cancelled()
+    if not term_id.isdecimal() or not term_id.strip("0"):
+        raise ApiError(TERM_COUNT_UNAVAILABLE, "无法确认当前学期")
+    if aggregate is not None:
+        return aggregate
+    return _count_term_records(client, term_id, check_cancelled)
+
+
+def query_term_count(client, stop_event):
+    """只读取账号本学期的有效次数，和提交前检查使用同一口径。"""
+    def check_cancelled():
+        if stop_event.is_set():
+            raise ApiError(9, "interrupted (user stop)")
+
+    check_cancelled()
+    terms = client.term_list()
+    check_cancelled()
+    if isinstance(terms, dict):
+        status = str(terms.get("status", ""))
+        if status == "101":
+            raise ApiError(101, "读取学期信息时凭证失效")
+        if status not in ("", "0", "1"):
+            raise ApiError(TERM_COUNT_UNAVAILABLE, "无法确认当前学期")
+    term_id, aggregate = _term_fields(client.before_run())
+    return _term_count(client, term_id, aggregate, check_cancelled)
+
+
 class DailyFlow:
     def __init__(self, slot, policy=None, verbose=True, stop_event=None,
                  log_fn=None, template_path="", zone_profile=None, zone_tuning=None,
@@ -163,16 +261,11 @@ class DailyFlow:
                      f"方向={self.zone_profile.get('direction')} "
                      f"跑道={self.zone_profile.get('lane_m')}m "
                      f"贴点={self.zone_profile.get('anchor_m')}m")
-        total_num = str(cfg.get("total_num", "")).strip()
-        try:
-            # 真机 beforeRun 的 total_num 是本学期有效次数；term_num 是目标次数。
-            term_count = int(total_num) if total_num.isdecimal() else None
-        except ValueError:
-            term_count = None
+        term_id, term_count = _term_fields(cfg)
         rule = {
             "zone": str(cfg.get("run_zone_id") or ""),
             "zone_name": str(cfg.get("run_zone_name") or ""),
-            "term_id": str(cfg.get("term_id") or "0"),
+            "term_id": term_id,
             "term_count": term_count,
             "pts": pts,
             "min_d": float(rule0.get("min_distance") or 2.0),
@@ -218,70 +311,11 @@ class DailyFlow:
             raise ApiError(3, "当日额度已满, 不提交")
         return done
 
-    @staticmethod
-    def _term_record(record):
-        """学期列表以已确认状态为准，失效记录也可能有里程。"""
-        if not isinstance(record, dict):
-            raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录格式异常")
-        raw_id = record.get("id")
-        record_id = str(raw_id or "").strip()
-        status = str(record.get("record_status")).strip()
-        if type(raw_id) not in (int, str) or not record_id or not status.isdecimal():
-            raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录缺少编号或有效状态")
-        if status != "1":
-            return record_id, False
-
-        reason = record.get("record_failed_reason")
-        try:
-            distance = float(record.get("distance"))
-        except (TypeError, ValueError, OverflowError):
-            raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录里程异常") from None
-        if not math.isfinite(distance) or distance < 0:
-            raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录里程异常")
-        if reason is not None and not isinstance(reason, str):
-            raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录判定格式异常")
-        return record_id, distance > 0 and _positive_reason(reason)
-
-    def _count_term_records(self, client, term_id):
-        records = {}
-        for page in range(1, _MAX_TERM_RECORD_PAGES + 1):
-            self._check_cancelled()
-            try:
-                reply = client.term_records(term_id, page)
-            except (ApiError, OSError) as error:
-                if isinstance(error, ApiError) and error.code in (9, 101):
-                    raise
-                self._check_cancelled()
-                raise ApiError(TERM_COUNT_UNAVAILABLE, f"无法读取学期记录第 {page} 页") from error
-            self._check_cancelled()
-            if not isinstance(reply, dict):
-                raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录列表格式异常")
-            status = str(reply.get("status", ""))
-            if status == "101":
-                raise ApiError(101, "读取学期记录时凭证失效")
-            items = reply.get("list")
-            if status not in ("", "0", "1") or not isinstance(items, list):
-                raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录列表格式异常")
-            if not items:
-                return sum(records.values())
-            previous_size = len(records)
-            for item in items:
-                record_id, valid = self._term_record(item)
-                if records.setdefault(record_id, valid) != valid:
-                    raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录判定在查询中发生变化")
-            if len(records) == previous_size:
-                raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录分页没有返回新记录")
-        raise ApiError(TERM_COUNT_UNAVAILABLE, "学期记录分页超出查询范围")
-
     def _term_quota(self, client, rule, limit):
-        self._check_cancelled()
-        term_id = rule["term_id"]
-        if not term_id.isdecimal() or not term_id.strip("0"):
-            raise ApiError(TERM_COUNT_UNAVAILABLE, "无法确认当前学期")
-        count = rule["term_count"]
-        if count is None:
+        term_id, aggregate = rule["term_id"], rule["term_count"]
+        if aggregate is None:
             self._report(2, "正在读取本学期有效跑步次数…")
-            count = self._count_term_records(client, term_id)
+        count = _term_count(client, term_id, aggregate, self._check_cancelled)
         self.log(f"[1b] 本学期已完成 {count} 次 (上限 {limit})")
         if count >= limit:
             return {"term_id": term_id, "term_count": count, "term_run_limit": limit}

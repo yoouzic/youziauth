@@ -184,6 +184,11 @@ def _active_lptiyu_member(members):
     return next((item for item in members['items'] if item['id'] == members['active']), {})
 
 
+def _lptiyu_term_progress(member_id='', limit=None, **fields):
+    return {'member_id': member_id, 'limit': limit, 'state': 'idle', 'count': None,
+            'message': '', 'checked_at': '', **fields}
+
+
 def _check_lptiyu_limit_member(payload, active_id):
     if 'term_run_limit' not in payload:
         return
@@ -416,7 +421,8 @@ class DesktopBridge(LocationProbe):
         """乐跑区块：独立降级，绝不拖垮整个快照；**绝不包含 token 本身**。"""
         empty = {'state': 'idle', 'message': '尚未开始今天的跑步', 'busy': False,
                  'available': False, 'settings': None, 'schedule': '',
-                 'identity': {}, 'has_token': False, 'token_age_hours': None,
+                  'term_progress': _lptiyu_term_progress(),
+                 'identity': {}, 'has_token': False, 'token_age_hours': None, 'token_synced_at': '',
                  'zone': {'id': '', 'name': ''}, 'today_done': 0, 'today_max': 1,
                  'last': None, 'progress': None,
                  'pace_range': {'lo': 0, 'hi': 0},
@@ -498,15 +504,19 @@ class DesktopBridge(LocationProbe):
             members = self._lptiyu_members_snapshot(store)
             settings_data = dataclasses.asdict(settings)
             settings_data['term_run_limit'] = _active_lptiyu_member(members).get('term_run_limit')
+            member_id = members['active']
             return {
                 'state': state, 'message': message, 'busy': busy,
                 'available': True, 'progress': progress,
                 'settings': settings_data,
+                'term_progress': _lptiyu_term_progress(
+                    member_id, settings_data['term_run_limit'], **controller.term_progress(member_id)),
                 'schedule': controller.schedule_text(),
                 'identity': {'name': identity.get('name', ''),
                              'student_num': identity.get('student_num', '')},
                 'has_token': store.has_token(),
                 'token_age_hours': age,
+                'token_synced_at': synced,
                 'members': members,
                 'today_done': int(daily.get('run', 0)),
                 'today_max': settings.max_per_day,
@@ -987,6 +997,16 @@ class DesktopBridge(LocationProbe):
             except Exception as exc:  # noqa: BLE001 —— 文案已经写好了, 原样带给界面
                 raise RuntimeError(str(getattr(exc, 'message', exc))) from None
             return str(result.get('detail') or '完成')
+        if action == 'lptiyu_term_count':
+            controller = self._lptiyu
+            if controller is None:
+                raise RuntimeError('乐跑功能在本机暂不可用')
+            member_id = controller.store.active_member_id()
+            if not member_id or payload.get('member_id') != member_id:
+                raise RuntimeError('请确认当前乐跑成员后再查询学期跑步次数。')
+            if not controller.start_term_count(member_id):
+                raise RuntimeError('学期次数暂时无法刷新，请稍后重试。')
+            return '正在查询本学期有效跑步次数'
         if action in ('lptiyu_run', 'lptiyu_dry', 'lptiyu_sync', 'lptiyu_renew',
                       'lptiyu_zones', 'lptiyu_zone_apply'):
             controller = self._lptiyu
@@ -1463,6 +1483,9 @@ class PreviewBridge(LocationProbe):
         self._real_location = real_location
         self._window_action = lambda action: None
         self._update_started = None
+        self._demo_term_counts = {'demo-m1': 24, 'demo-m2': 17}
+        self._demo_term_checked_at = dict.fromkeys(
+            self._demo_term_counts, dt.datetime.now().isoformat(timespec='seconds'))
         self._data = {
             'preview': True,
             'update': dict(state='idle', current_version=read_current_version(gui.resource_path('VERSION')),
@@ -1633,7 +1656,13 @@ class PreviewBridge(LocationProbe):
                               message='正在演示签名校验，未运行系统校验程序。')
         data = copy.deepcopy(self._data)
         lp = data['lptiyu']
+        member_id = lp['members']['active']
         lp['settings']['term_run_limit'] = _active_lptiyu_member(lp['members']).get('term_run_limit')
+        count = self._demo_term_counts.get(member_id)
+        lp['term_progress'] = _lptiyu_term_progress(
+            member_id, lp['settings']['term_run_limit'], count=count,
+            state='ready' if count is not None else 'idle',
+            checked_at=self._demo_term_checked_at.get(member_id, ''))
         return dict(data,
                     location=self._location_snapshot(self._data['dorm']['settings']['location_source']),
                     location_diagnostic=self._real_location)
@@ -1750,6 +1779,12 @@ class PreviewBridge(LocationProbe):
                                          'anchor_m': float(payload.get('zone_anchor_m') or 0.0),
                                          'start_deg': 0.0},
                               'summary': None}
+            elif action == 'lptiyu_term_count':
+                member_id = self._data['lptiyu']['members']['active']
+                if not member_id or payload.get('member_id') != member_id:
+                    return {'ok': False, 'message': '请确认当前乐跑成员后再查询学期跑步次数。'}
+                self._demo_term_checked_at[member_id] = dt.datetime.now().isoformat(timespec='seconds')
+                return {'ok': True, 'message': '已刷新本学期有效跑步次数（演示）'}
             elif action == 'lptiyu_run':
                 lp = self._data['lptiyu']
                 lp.update(state='signed', message="今日跑步已完成 · 2.98km · 配速 4'02\"/km（演示）",

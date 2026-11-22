@@ -274,6 +274,127 @@ class ExecuteTests(PanelTestCase):
         self.assertTrue(self.store.has_token())
 
 
+class TermProgressTests(PanelTestCase):
+    def test_query_reads_only_the_selected_members_school_count(self):
+        controller = self.make_controller()
+        first = self.store.active_member_id()
+        second = self.store.file_captured_credential({
+            'token': 'OTHER', 'uid': 17980009, 'student_num': '2025009',
+            'school_id': '837', 'source': 'fixture',
+        })['id']
+        first_started, allow_first = threading.Event(), threading.Event()
+        self.addCleanup(allow_first.set)
+        query = controller._query_member_term_count
+
+        def wait_to_query(member_id, stop):
+            if member_id == first:
+                first_started.set()
+                allow_first.wait(2)
+            return query(member_id, stop)
+
+        class CountClient:
+            def __init__(self, *, uid, **kwargs):
+                self.count = '24' if uid == 17987537 else '17'
+
+            def term_list(self):
+                return [{'id': '13103'}]
+
+            def before_run(self):
+                return {'term_id': '13103', 'total_num': self.count}
+
+        with patch('lptiyu_panel.ApiClient', CountClient), \
+                patch.object(controller, '_query_member_term_count', side_effect=wait_to_query):
+            self.assertTrue(controller.start_term_count(first))
+            self.assertTrue(first_started.wait(1))
+            self.assertFalse(controller.start_term_count(second))
+            self.store.switch_member(second)
+            self.assertEqual(controller.term_progress(second), {})
+            self.assertTrue(controller.start_term_count(second))
+            self.assertEqual(self._result(controller, second)['count'], 17)
+            allow_first.set()
+            self.assertEqual(self._result(controller, first)['count'], 24)
+            self.assertEqual(controller.term_progress(second)['count'], 17)
+        self.assertEqual(self.renewer.calls, [])
+        self.assertEqual(self.flows, [])
+        self.assertIsNone(self.store.signed_record().get('date'))
+
+    def test_count_timeout_deduplicates_requests_and_ignores_late_results(self):
+        controller = self.make_controller()
+        member_id = self.store.active_member_id()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def stalled(_member, stop):
+            entered.set()
+            release.wait(2)
+            self.assertTrue(stop.is_set())
+            return 24
+
+        with patch.object(controller, '_query_member_term_count', side_effect=stalled) as query, \
+                patch('lptiyu_panel.TERM_COUNT_TIMEOUT_SECONDS', 0.2):
+            self.assertTrue(controller.start_term_count(member_id))
+            self.assertTrue(entered.wait(1))
+            self.assertTrue(controller.start_term_count(member_id))
+            self.assertEqual(controller.term_progress(member_id)['state'], 'loading')
+            result = self._result(controller, member_id)
+            self.assertEqual(result['state'], 'error')
+            self.assertIn('超时', result['message'])
+            self.assertIsNone(result['count'])
+            self.assertFalse(controller.start_term_count(member_id))
+            query.assert_called_once()
+            release.set()
+            deadline = time.monotonic() + 1
+            while member_id in controller._term_count_workers and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertNotIn(member_id, controller._term_count_workers)
+        self.assertEqual(controller.term_progress(member_id)['state'], 'error')
+
+    def test_missing_credentials_returns_need_token_without_a_request(self):
+        controller = self.make_controller()
+        self.store.clear_token()
+        member_id = self.store.active_member_id()
+        with patch('lptiyu_panel.ApiClient') as client:
+            self.assertTrue(controller.start_term_count(member_id))
+            self.assertEqual(self._result(controller, member_id)['state'], 'need_token')
+            client.assert_not_called()
+        self.assertEqual(self.renewer.calls, [])
+
+    def test_refresh_keeps_last_confirmed_count_while_loading_and_after_expiry(self):
+        controller = self.make_controller()
+        member_id = self.store.active_member_id()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def expired(_member, _stop):
+            entered.set()
+            release.wait(2)
+            raise ApiError(101, 'expired')
+
+        with patch.object(controller, '_query_member_term_count', return_value=24):
+            self.assertTrue(controller.start_term_count(member_id))
+            last = self._result(controller, member_id)
+        with patch.object(controller, '_query_member_term_count', side_effect=expired):
+            self.assertTrue(controller.start_term_count(member_id))
+            self.assertTrue(entered.wait(1))
+            loading = controller.term_progress(member_id)
+            self.assertEqual(loading['state'], 'loading')
+            self.assertEqual((loading['count'], loading['checked_at']), (24, last['checked_at']))
+            release.set()
+            result = self._result(controller, member_id)
+        self.assertEqual(result['state'], 'need_token')
+        self.assertEqual((result['count'], result['checked_at']), (24, last['checked_at']))
+        self.assertTrue(self.store.has_token())
+
+    def _result(self, controller, member_id):
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            value = controller.term_progress(member_id)
+            if value.get('state') in ('ready', 'error', 'need_token'):
+                return value
+            time.sleep(0.005)
+        self.fail(f'学期次数查询未结束：{controller.term_progress(member_id)}')
+
+
 class GateTests(PanelTestCase):
     def test_busy_rejects_second_action(self):
         controller = self.make_controller()

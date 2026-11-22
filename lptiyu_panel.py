@@ -115,6 +115,8 @@ def open_mini_program(uri=OFFICIAL_MINI_PROGRAM_URI, timeout=6.0):
 
 MAX_DAILY_AUTO_ATTEMPTS = 3
 VERIFY_PROBE_TIMEOUT_SECONDS = 15
+TERM_COUNT_TIMEOUT_SECONDS = 25
+MAX_TERM_COUNT_WORKERS = 3
 MAX_ZONE_SYNC = 8                # 同步跑区时最多切几次场地(服务端一般就 4 个)
 
 # 续期结果 → 界面状态词(与前端 LP_NAMES 对齐)。
@@ -233,6 +235,9 @@ class LptiyuController:
         self.cancel = threading.Event()
         self._capture_interrupted = threading.Event()
         self._verification_probe = None
+        self._term_count_lock = threading.Lock()
+        self._term_count_workers = {}
+        self._term_count_results = {}
         self.latest = None
         # 多成员轮跑: 前缀贴到每个进度文案上, 告诉界面现在跑的是谁。
         self._run_member_prefix = ''
@@ -280,6 +285,78 @@ class LptiyuController:
             return f'自动跑步：开启 · 每天 {s.run_time}（有效时段 {s.time_lo}–{s.time_hi}）'
         except Exception:  # noqa: BLE001
             return '自动跑步：配置无效'
+
+    def term_progress(self, member_id):
+        with self._term_count_lock:
+            return self._term_count_results.get(member_id, {}).copy()
+
+    def _query_member_term_count(self, member_id, stop):
+        # 按成员 ID 读档。后台轮跑或用户换档后，读取仍属于发起时的成员。
+        record = self.store.member_token_record(member_id)
+        identity = self.store.member_identity(member_id)
+        try:
+            uid = int(identity.get('uid') or 0)
+            school_id = int(identity.get('school_id') or 0)
+        except (ValueError, TypeError):
+            uid = school_id = 0
+        if not record or not record.get('token') or not uid or not school_id:
+            raise LptiyuError('need_token', '当前成员缺少可用凭证，请先同步或采集凭证')
+        student_num = str(identity.get('student_num') or '')
+        client = ApiClient(uid=uid, token=record['token'], school_id=school_id,
+                           student_num=student_num,
+                           card_id=str(identity.get('card_id') or student_num),
+                           proxy=self.store.settings().api_proxy or None, pace=0.8)
+        client.stop_event = stop
+        return lptiyu_flow.query_term_count(client, stop)
+
+    def start_term_count(self, member_id):
+        """刷新一位成员的学期次数，不占用跑步和采集的操作闸。"""
+        if not member_id or member_id != self.store.active_member_id():
+            return False
+        stop = threading.Event()
+        with self._term_count_lock:
+            if self.closed:
+                return False
+            if member_id in self._term_count_workers:
+                return self._term_count_results[member_id]['state'] == 'loading'
+            if len(self._term_count_workers) >= MAX_TERM_COUNT_WORKERS:
+                return False
+            self._term_count_workers[member_id] = stop
+            progress = self._term_count_results.setdefault(member_id, {'count': None, 'checked_at': ''})
+            progress.update(state='loading', message='')
+
+        def expire():
+            with self._term_count_lock:
+                if self._term_count_workers.get(member_id) is stop and not stop.is_set():
+                    stop.set()
+                    progress.update(state='error', message='查询学期跑步次数超时，请稍后重试')
+
+        timeout = threading.Timer(TERM_COUNT_TIMEOUT_SECONDS, expire)
+        timeout.daemon = True
+
+        def work():
+            result = {'state': 'error', 'message': '未能读取学期跑步次数，请稍后重试'}
+            try:
+                count = self._query_member_term_count(member_id, stop)
+                result = {'state': 'ready', 'count': count, 'message': '',
+                          'checked_at': self._clock().isoformat(timespec='seconds')}
+            except LptiyuError as exc:
+                result = {'state': exc.state, 'message': exc.message}
+            except ApiError as exc:
+                if exc.code == 101:
+                    result = {'state': 'need_token', 'message': '当前成员的凭证已失效，请先更新凭证'}
+            except Exception:  # noqa: BLE001 —— 探测失败只影响学期次数
+                pass
+            finally:
+                timeout.cancel()
+                with self._term_count_lock:
+                    if not stop.is_set():
+                        progress.update(result)
+                    del self._term_count_workers[member_id]
+
+        threading.Thread(target=work, name='youziauth-lptiyu-term-count', daemon=True).start()
+        timeout.start()
+        return True
 
     # ------------------------------------------------------------- 入口
     def start(self, action):
@@ -411,6 +488,9 @@ class LptiyuController:
         with self._gate:
             self.closed = True
         self.cancel_work()
+        with self._term_count_lock:
+            for stop in self._term_count_workers.values():
+                stop.set()
         try:
             self.capture.stop('idle', '')
         except Exception:  # noqa: BLE001 —— 退出流程不该被采集卡住

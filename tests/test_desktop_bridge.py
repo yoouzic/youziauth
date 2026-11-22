@@ -1351,6 +1351,31 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertEqual(state['identity']['name'], '陈同学')
         self.assertIn('自动跑步', state['schedule'])
 
+    def test_lptiyu_term_count_binds_the_requested_member(self):
+        member_id = self.store.active_member_id()
+        with patch.object(self.controller, 'start_term_count', create=True, return_value=True) as start:
+            self.assertFalse(self.bridge.dispatch('lptiyu_term_count', {'member_id': 'wrong'})['ok'])
+            start.assert_not_called()
+            self.assertTrue(self.bridge.dispatch('lptiyu_term_count', {'member_id': member_id})['ok'])
+            start.assert_called_once_with(member_id)
+
+    def test_lptiyu_term_progress_snapshot_uses_active_members_limit_and_cached_answer(self):
+        member_id = self.store.active_member_id()
+        self.assertTrue(self._save_term_limit(28)['ok'])
+        self.store.record_sync('fixture')
+        with patch.object(self.controller, 'term_progress', create=True,
+                          return_value={'state': 'ready', 'count': 24,
+                                        'checked_at': '2026-11-11T07:00:00'}) as cached, \
+                patch.object(self.controller, 'start_term_count', create=True) as start:
+            state = self.bridge.snapshot()['lptiyu']
+            cached.assert_called_once_with(member_id)
+            start.assert_not_called()
+        self.assertEqual(state['term_progress'], {
+            'member_id': member_id, 'state': 'ready', 'count': 24, 'limit': 28,
+            'message': '', 'checked_at': '2026-11-11T07:00:00',
+        })
+        self.assertEqual(state['token_synced_at'], self.store.sync_record()['at'])
+
     def test_run_all_members_setting_round_trips(self):
         result = self.bridge.dispatch('lptiyu_save', {'enabled': True,
                                                       'run_time': '06:30',
@@ -1902,6 +1927,18 @@ class LptiyuBridgeTests(unittest.TestCase):
             'member_id': 'demo-m2', 'term_run_limit': 32})['ok'])
         self.assertTrue(preview.dispatch('lptiyu_member_switch', {'id': 'demo-m1'})['ok'])
         self.assertEqual(preview.snapshot()['lptiyu']['settings']['term_run_limit'], 28)
+
+    def test_preview_bridge_shows_a_distinct_term_count_for_each_member(self):
+        preview = PreviewBridge()
+        first = preview.snapshot()['lptiyu']['term_progress']
+        self.assertEqual((first['member_id'], first['state'], first['count']),
+                         ('demo-m1', 'ready', 24))
+        self.assertTrue(preview.dispatch('lptiyu_member_switch', {'id': 'demo-m2'})['ok'])
+        self.assertFalse(preview.dispatch('lptiyu_term_count', {'member_id': 'demo-m1'})['ok'])
+        self.assertTrue(preview.dispatch('lptiyu_term_count', {'member_id': 'demo-m2'})['ok'])
+        second = preview.snapshot()['lptiyu']['term_progress']
+        self.assertEqual((second['member_id'], second['state'], second['count']),
+                         ('demo-m2', 'ready', 17))
 
     def test_preview_bridge_has_a_self_consistent_lptiyu_block(self):
         preview = PreviewBridge()

@@ -11,6 +11,7 @@ let mapState = null;
 let mapDrag = null, mapSuppressPick = false, mapNameFor = null, accountNameFor = null, memberNameFor = null;
 let lpMemberShown = null, lpMemberFlip = false;   // 主卡成员标记: 换人时闪一下
 let termLimitDraft = null;
+let termCountKey = '', termCountRequest = '';
 const MAP_TILE = 256, MAP_MIN_ZOOM = 13, MAP_MAX_ZOOM = 19;
 const MAP_TILE_TRIES = 3, MAP_TILE_BACKOFF = [1200, 4000];  // ms before each retry of one tile
 const MAP_TILE_STALL = 8000;   // ms with nothing drawn before the next provider takes the frame
@@ -335,6 +336,9 @@ function navigate() {
   $('page-context').textContent = titles[page];
   // 从别处进「运行记录」时直接落在最新一行：这是这一页最常见的来意，翻旧记录靠往上滚。
   if(page === 'records') logView.showNewest = true;
+  if(page === 'lptiyu'){
+    if(state)renderLptiyu();
+  }else termCountKey='';
   window.scrollTo(0,0);
 }
 window.addEventListener('hashchange', navigate);
@@ -875,18 +879,83 @@ function renderRunStatus(lp,s){
   $('lp-details').hidden=!s.run_time;
   if(s.run_time){
     // 名称以zone区块为准(它按跑区目录校正过); 只有拿不到名字才退到 id。
-    $('lp-zone').textContent=(lp.zone&&lp.zone.name)
+    const zone=(lp.zone&&lp.zone.name)
       ||(lp.zone&&lp.zone.id)||s.zone_name||s.zone_id||'未指定';
+    $('lp-zone').textContent=zone;
     $('lp-distance').textContent=`${s.dist_lo}–${s.dist_hi} km`;
     $('lp-pace-detail').textContent=paceRangeLabel(...paceWindow(lp));
-    $('lp-last').textContent=lp.last
-      ?`${lp.last.date} · ${lp.last.distance||''}${lp.last.zone?' · '+lp.last.zone:''}`:'—';
+    const last=lp.last;
+    $('lp-last').textContent=last
+      ?[last.date,last.distance,last.zone!==zone?last.zone:''].filter(Boolean).join(' · ')||'—':'—';
   }
   $('lp-auto-summary').textContent=s.enabled?`${s.run_time||'06:30'} 自动`:'未开启';
   $('lp-submit').disabled=pending||syncedEpoch!==epoch||lp.busy||['signed','quota'].includes(lp.state);
+  $('lp-cancel').hidden=!lp.busy;
   $('lp-cancel').disabled=interruptPending.has('lptiyu_cancel')||!lp.busy;
   $('lp-dry').disabled=pending||lp.busy;
+  $('lp-zone-refresh').disabled=pending||lp.busy;
 }
+function termCountContext(lp,member){
+  // 进入页面、切换成员和新增跑步记录时读取一次。普通快照轮询只读取缓存。
+  return JSON.stringify([member.id,lp.last?.date,lp.today_done,lp.token_synced_at,lp.renewal?.last_success]);
+}
+function canRefreshTermCount(lp,member){
+  return !!(api&&lp?.term_progress&&lp.available!==false&&member&&lp.has_token
+    &&!lp.busy&&!pending&&syncedEpoch===epoch&&!termCountRequest
+    &&!(lp.term_progress.member_id===member.id&&lp.term_progress.state==='loading'));
+}
+async function refreshTermCount(announce=false){
+  const lp=state?.lptiyu,member=activeMember();
+  if(!canRefreshTermCount(lp,member))return;
+  termCountKey=termCountContext(lp,member);
+  termCountRequest=member.id;
+  renderTermProgress(lp,lp.settings||{});
+  try{
+    const result=await api.dispatch('lptiyu_term_count',{member_id:member.id});
+    if(announce&&!result.ok)notify(result.message,true);
+  }catch(error){
+    if(announce)notify('无法刷新跑步次数，请稍后重试。',true);
+  }finally{
+    termCountRequest='';
+    await refresh();
+  }
+}
+function renderTermProgress(lp,s){
+  const countNode=$('lp-term-count');
+  if(!countNode)return;
+  const member=activeMember();
+  const progress=member&&lp.term_progress?.member_id===member.id?lp.term_progress:null;
+  const count=Number.isSafeInteger(progress?.count)&&progress.count>=0?progress.count:null;
+  const limit=member&&Number.isSafeInteger(s.term_run_limit)&&s.term_run_limit>0?s.term_run_limit:null;
+  const loading=Boolean(member&&(progress?.state==='loading'||termCountRequest===member.id));
+  const canRefresh=canRefreshTermCount(lp,member);
+  const cap=$('lp-term-limit'),meter=$('lp-term-progress');
+  countNode.textContent=count===null?'—':String(count);
+  cap.textContent=limit===null?'':`上限 ${limit} 次`;
+  cap.hidden=limit===null;
+  meter.hidden=count===null||limit===null;
+  if(!meter.hidden){
+    meter.max=limit;
+    meter.value=Math.min(count,limit);
+    meter.setAttribute('aria-label',`本学期已有效跑步 ${count} 次，上限 ${limit} 次`);
+  }
+  let hint='尚未查询';
+  if(!member)hint='添加成员后可查询';
+  else if(loading)hint=count===null?'正在读取校方记录…':'正在更新次数…';
+  else if(progress?.state==='error')hint=count===null?(progress.message||'读取失败，可重试'):'更新失败，显示上次记录';
+  else if(progress?.state==='need_token'||!lp.has_token)hint=count===null?'更新凭证后可查询':'显示上次记录 · 凭证待更新';
+  else if(count!==null){
+    const last=clockText(progress.checked_at);
+    const at=new Date(progress.checked_at);
+    const day=last&&at.toDateString()!==new Date().toDateString()?`${at.getMonth()+1}月${at.getDate()}日 `:'';
+    hint=last?`校方记录 · ${day}${last} 更新`:'校方记录';
+  }
+  const meta=$('lp-term-meta');
+  if(meta.textContent!==hint)meta.textContent=hint;
+  $('lp-term-refresh').disabled=!canRefresh;
+}
+$('lp-term-refresh')?.addEventListener('click',()=>refreshTermCount(true));
+
 function renderTermLimit(lp,s){
   const member=activeMember(),input=$('lp-term-run-limit');
   input.disabled=!member||pending||syncedEpoch!==epoch||lp.busy||lp.available===false;
@@ -994,6 +1063,12 @@ function renderLptiyu(){
   renderMembers(lp);
   renderActiveMemberChip(lp);
   renderRunSettings(lp,settings);
+  renderTermProgress(lp,settings);
+  if(!$('lptiyu').hidden){
+    const member=activeMember();
+    if(!lp.has_token)termCountKey='';
+    if(canRefreshTermCount(lp,member)&&termCountKey!==termCountContext(lp,member))refreshTermCount();
+  }
 }
 /* 跑步进度: 后端在 busy 期间给 progress={step,total,labels,text}, 这里画成分段
    进度条 —— 每段是固定阶段(准备凭证/生成轨迹/提交成绩/等待判定), 做完的填实,
@@ -1072,12 +1147,17 @@ function renderMembers(lp){
   $('lp-identity-line').hidden=!bar.hidden;
   if(bar.hidden)return;
   const select=$('lp-member');
-  select.replaceChildren(...items.map(member=>{
-    const option=document.createElement('option');
-    option.value=member.id;
-    option.textContent=memberLabel(member);
-    return option;
-  }));
+  const options=items.map(member=>[member.id,memberLabel(member)]);
+  const signature=JSON.stringify(options);
+  if(select.dataset.signature!==signature){
+    select.dataset.signature=signature;
+    select.replaceChildren(...options.map(([id,text])=>{
+      const option=document.createElement('option');
+      option.value=id;
+      option.textContent=text;
+      return option;
+    }));
+  }
   const active=activeMember(),activeId=active?active.id:'';
   if(syncedEpoch===epoch)select.value=activeId;   // 状态没同步时不覆盖用户正在做的选择
   const blocked=Boolean(pending||error||lp.busy),max=members.max||0,full=max>0&&items.length>=max;
