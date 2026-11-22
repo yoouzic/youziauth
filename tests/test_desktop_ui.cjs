@@ -2422,6 +2422,23 @@ test('lptiyu shows a distinct status when the semester run limit is reached',asy
   assert.match(h.el('lp-message').textContent,/28 次/);
 });
 
+test('lptiyu member instructions are inside management and directory errors stay visible',async()=>{
+  const html=fs.readFileSync(path.join(__dirname,'../desktop_ui/index.html'),'utf8');
+  assert.match(html,/<details\b[^>]*lp-member-tools[^>]*>(?:(?!<\/details>).)*id="lp-member-state"/s);
+  const h=await lptiyuPage({members:{active:'',items:[],error:'成员清单损坏'}});
+  assert.equal(h.el('lp-member-error').textContent,'成员清单损坏');
+  assert.equal(h.el('lp-member-state').textContent,'');
+});
+
+test('lptiyu avoids repeating an already visible term count in the task status',async()=>{
+  const h=await lptiyuPage({state:'term_quota',message:'本学期有效跑步已达上限（28/28 次），本次跳过',
+    members:lptiyuTermMembers(),settings:{term_run_limit:28},
+    term_progress:{member_id:'m1',state:'ready',count:28,limit:28}});
+  assert.equal(h.el('lp-task-badge').textContent,'已达学期上限');
+  assert.equal(h.el('lp-term-count').textContent,'28');
+  assert.equal(h.el('lp-message').textContent,'本次已跳过');
+});
+
 test('lptiyu displays the saved zone as a read-only summary',async()=>{
   const h=await lptiyuPage({settings:{run_time:'06:30',zone_id:'1873',zone_name:'第二运动场'}});
   assert.equal(h.el('lp-zone').tagName,'STRONG');
@@ -2623,6 +2640,8 @@ test('lptiyu pace accepts minutes and seconds, and refuses nonsense',async()=>{
   await new Promise(resolve=>setTimeout(resolve,0));
   assert.equal(bad.calls.filter(call=>call.action==='lptiyu_save').length,0,
     '看不懂的写法不发往后台');
+  assert.equal(bad.el('lp-pace-panel').open,true);
+  assert.equal(bad.el('lp-pace-exact').open,true);
   const inverted=await lptiyuPage({});
   inverted.el('lp-pace-lo').value="5'00\"";
   inverted.el('lp-pace-hi').value="4'30\"";
@@ -2630,6 +2649,59 @@ test('lptiyu pace accepts minutes and seconds, and refuses nonsense',async()=>{
   await new Promise(resolve=>setTimeout(resolve,0));
   assert.equal(inverted.calls.filter(call=>call.action==='lptiyu_save').length,0,
     '下限比上限慢时不发往后台');
+});
+
+test('lptiyu pace sliders preserve auto until edited and can restore it',async()=>{
+  const h=await lptiyuPage({pace_range:{lo:0,hi:0}});
+  const form=h.el('lptiyu-form'),fast=h.el('lp-pace-fast-slider'),slow=h.el('lp-pace-slow-slider');
+  assert.equal(h.el('lp-pace-hint').textContent,'自动');
+  assert.equal(h.el('lp-pace-lo').value,'');
+  fast.value='267';
+  fast.fire('input');form.fire('input',fast);
+  assert.equal(h.el('lp-pace-hint').textContent,`4'27"–5'00"`);
+  assert.equal(fast.attributes['aria-valuetext'],'4 分 27 秒每公里');
+  slow.value='250';
+  slow.fire('input');form.fire('input',slow);
+  form.fire('submit');
+  await settle();
+  assert.equal(h.calls.at(-1).payload.pace_lo,267);
+  assert.equal(h.calls.at(-1).payload.pace_hi,267);
+
+  h.data.lptiyu.pace_range={lo:267,hi:267};
+  await h.refresh();
+  h.el('lp-pace-auto').fire('click');
+  assert.equal(h.el('lp-pace-hint').textContent,'自动');
+  assert.equal(h.el('lptiyu-save-state').textContent,'有未保存的修改');
+  form.fire('submit');
+  await settle();
+  assert.equal(h.calls.at(-1).payload.pace_lo,0);
+  assert.equal(h.calls.at(-1).payload.pace_hi,0);
+});
+
+test('lptiyu quick zone save does not discard an unsaved pace adjustment',async()=>{
+  const h=await lptiyuPage({zones:[{id:'1873',name:'第二运动场'}],pace_range:{lo:246,hi:301}});
+  const fast=h.el('lp-pace-fast-slider'),form=h.el('lptiyu-form'),zone=h.el('lp-zone-select');
+  assert.equal(fast.value,'246');
+  fast.value='255';
+  fast.fire('input');form.fire('input',fast);
+  zone.value='1873';
+  zone.fire('change');
+  await settle();
+  assert.equal(h.calls.at(-1).payload.zone_id,'1873');
+  assert.equal(h.calls.at(-1).payload.pace_lo,undefined);
+  assert.equal(h.el('lp-pace-hint').textContent,`4'15"–5'01"`);
+  assert.equal(h.el('lptiyu-save-state').textContent,'有未保存的修改');
+});
+
+test('lptiyu native zone selection leaves a clean form synced after the quick save',async()=>{
+  const h=await lptiyuPage({zones:[{id:'1873',name:'第二运动场'}]});
+  const form=h.el('lptiyu-form'),zone=h.el('lp-zone-select');
+  zone.value='1873';
+  form.fire('input',zone);
+  zone.fire('change');
+  await settle();
+  assert.equal(h.calls.at(-1).payload.zone_id,'1873');
+  assert.equal(h.el('lptiyu-save-state').textContent,'设置已同步');
 });
 
 test('lptiyu auto renew reads as its own line under the credential card',async()=>{

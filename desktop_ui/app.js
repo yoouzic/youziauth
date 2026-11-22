@@ -358,6 +358,7 @@ function markDirty(kind, value) {
   renderSaveState(kind);
 }
 ['network','dorm','lptiyu'].forEach(kind=>$(kind+'-form').addEventListener('input',event=>{
+  if(kind==='lptiyu'&&event?.target?.id==='lp-zone-select')return;
   if(event?.target?.id==='lp-term-run-limit'){
     const member=activeMember();
     if(member&&!event.target.disabled){
@@ -416,6 +417,27 @@ function paceRangeLabel(lo,hi){
   if(!a&&!b)return '自动';
   if(!a||!b||a===b)return paceLabel(a||b);
   return `${paceLabel(a)}–${paceLabel(b)}`;
+}
+function paceBoundsError(lo,hi){
+  if(Number.isNaN(lo)||Number.isNaN(hi))return '配速格式示例为 4′05″，留空为自动。';
+  if((lo>0)!==(hi>0))return '请填写两端配速，或都留空使用自动配速。';
+  if(lo&&(lo<120||hi>700||hi<120||lo>700))return '配速需在每公里 2′00″–11′40″ 之间。';
+  if(lo>hi)return '最快配速需快于或等于最慢配速。';
+  return '';
+}
+function renderPaceEditor(){
+  const lo=parsePace($('lp-pace-lo').value),hi=parsePace($('lp-pace-hi').value);
+  const invalid=paceBoundsError(lo,hi),automatic=!invalid&&!lo&&!hi;
+  const values=invalid||automatic?[270,300]:[lo,hi];
+  $('lp-pace-panel').dataset.mode=automatic?'auto':'custom';
+  $('lp-pace-hint').textContent=invalid?'配速待修正':paceRangeLabel(lo,hi);
+  $('lp-pace-auto').disabled=automatic;
+  ['fast','slow'].forEach((end,index)=>{
+    const seconds=values[index],slider=$(`lp-pace-${end}-slider`);
+    slider.value=String(seconds);
+    slider.setAttribute('aria-valuetext',`${Math.floor(seconds/60)} 分 ${seconds%60} 秒每公里`);
+    $(`lp-pace-${end}-value`).textContent=paceLabel(seconds);
+  });
 }
 /* 快照里的区间是后端算好的(含旧版单点配速的迁移); 老快照才退回字段自己拼。 */
 function paceWindow(lp){
@@ -657,29 +679,47 @@ $('network-form').addEventListener('submit',async event=>{
   if(await act('network_save',payload)){if(revision===revisions.network){markDirty('network',false);$('password').value='';}render();}
 });
 $('location-source').addEventListener('change',()=>{sourceRevision++;sourceDirty=true;markDirty('dorm',true);});
-['lp-pace-lo','lp-pace-hi'].forEach(id=>$(id).addEventListener('input',()=>{
-  const lo=parsePace($('lp-pace-lo').value),hi=parsePace($('lp-pace-hi').value);
-  $('lp-pace-hint').textContent=Number.isNaN(lo)||Number.isNaN(hi)?'格式 4\'05"':paceRangeLabel(lo,hi);
+['lp-pace-lo','lp-pace-hi'].forEach(id=>$(id).addEventListener('input',renderPaceEditor));
+['lp-pace-fast-slider','lp-pace-slow-slider'].forEach((id,index)=>$(id).addEventListener('input',()=>{
+  const values=['lp-pace-fast-slider','lp-pace-slow-slider'].map(key=>Number($(key).value));
+  if(values[0]>values[1])values[index]=values[1-index];
+  $('lp-pace-lo').value=paceLabel(values[0]);
+  $('lp-pace-hi').value=paceLabel(values[1]);
+  renderPaceEditor();
 }));
+$('lp-pace-auto').addEventListener('click',()=>{
+  $('lp-pace-lo').value='';
+  $('lp-pace-hi').value='';
+  revisions.lptiyu++;
+  markDirty('lptiyu',true);
+  renderPaceEditor();
+});
 const zoneSelect=$('lp-zone-select');
 if(zoneSelect)zoneSelect.addEventListener('change',async ()=>{
   const zoneId=$('lp-zone-select').value;
   const zone=(state.lptiyu?.zones||[]).find(item=>item.id===zoneId);
+  const hadDraft=dirty.lptiyu;
   markDirty('lptiyu',true);
-  const revision=revisions.lptiyu;
+  const revision=++revisions.lptiyu;
   if(await act('lptiyu_save',{zone_id:zoneId,zone_name:zone?.name||''})){
-    if(revision===revisions.lptiyu)markDirty('lptiyu',false);
+    if(!hadDraft&&revision===revisions.lptiyu)markDirty('lptiyu',false);
     render();
   }
 });
+$('lptiyu-form').addEventListener('invalid',event=>{
+  for(let panel=event.target.closest('details');panel;panel=panel.parentElement?.closest('details'))panel.open=true;
+},true);
 $('lptiyu-form').addEventListener('submit',async event=>{
   event.preventDefault();
   if(state.lptiyu?.busy){notify('请等待当前跑步操作完成后再保存设置。',true);return;}
   const paceLo=parsePace($('lp-pace-lo').value),paceHi=parsePace($('lp-pace-hi').value);
-  if(Number.isNaN(paceLo)||Number.isNaN(paceHi)){
-    notify('配速请写成 4\'05" 这样（分钟\'秒"），留空为自动。',true);return;}
-  if((paceLo>0)!==(paceHi>0)){notify('配速区间要么上下限都填，要么都留空。',true);return;}
-  if(paceLo&&paceLo>paceHi){notify('配速下限要比上限快（4\'05" 在 4\'30" 前面）。',true);return;}
+  const paceError=paceBoundsError(paceLo,paceHi);
+  if(paceError){
+    $('lp-pace-panel').open=true;
+    $('lp-pace-exact').open=true;
+    notify(paceError,true);
+    return;
+  }
   const payload={enabled:$('lp-enabled').checked,run_all_members:$('lp-run-all').checked,run_time:$('lp-run-time').value,
     dist_lo:Number($('lp-dist-lo').value),dist_hi:Number($('lp-dist-hi').value),
     pace_lo:paceLo,pace_hi:paceHi,anchor_max_m:Number($('lp-anchor').value),
@@ -873,7 +913,11 @@ function renderRunStatus(lp,s){
   $('lp-summary').textContent=(who?who+' · ':'')+lp.message;
   // busy 时状态行跟着当前阶段的文案走: 后端把阶段文案放在 message 里,
   // 有 progress 就直接用它; 老后端没有 progress, 退回通用文案。
-  const message=lp.busy?(lp.progress?lp.message:'正在处理，请稍候。'):lp.message;
+  const term=lp.term_progress,limit=s.term_run_limit;
+  const showsTermLimit=lp.state==='term_quota'&&term?.state==='ready'&&term.member_id===member?.id
+    &&Number.isSafeInteger(term.count)&&Number.isSafeInteger(limit)&&limit>0&&term.count>=limit;
+  const message=lp.busy?(lp.progress?lp.message:'正在处理，请稍候。')
+    :showsTermLimit?'本次已跳过':lp.message;
   if($('lp-message').textContent!==message)$('lp-message').textContent=message;
   renderLpSteps(lp);
   $('lp-details').hidden=!s.run_time;
@@ -982,8 +1026,8 @@ function renderRunSettings(lp,s){
   const [paceLo,paceHi]=paceWindow(lp);
   $('lp-pace-lo').value=paceLo?paceLabel(paceLo):'';
   $('lp-pace-hi').value=paceHi?paceLabel(paceHi):'';
+  renderPaceEditor();
   $('lp-anchor').value=s.anchor_max_m??20;
-  $('lp-pace-hint').textContent=paceRangeLabel(paceLo,paceHi);
   $('lp-auto-renew').checked=s.auto_renew!==false;
   const zones=Array.isArray(lp.zones)?lp.zones:[];
   const select=$('lp-zone-select');
@@ -1010,6 +1054,7 @@ function renderRunSettings(lp,s){
     :(lab.reason==='missing_lpctl'?'这个目录里没有 lpctl.py，检查路径是否正确'
       :'未找到研究库。');
   $('lp-schedule').textContent=lp.schedule||'自动跑步：关闭';
+  $('lp-schedule').hidden=!s.enabled;
 }
 function captureText(cap){
   const state=cap.state||'idle';
@@ -1169,8 +1214,9 @@ function renderMembers(lp){
   $('lp-member-rename').disabled=blocked||!items.length;
   $('lp-member-delete').disabled=blocked||!items.length;
   const dead = items.filter(member=>member.alive===false).map(member=>member.name);
-  $('lp-member-state').textContent=error
-    ||(full?`最多 ${max} 个成员。`
+  $('lp-member-error').textContent=error;
+  $('lp-member-state').textContent=error?''
+    :(full?`最多 ${max} 个成员。`
       :captureEnabled?'「添加成员」会打开微信小程序采集凭证。':'可通过「导入凭证」添加成员。')
     +(dead.length?` 「${dead.join('、')}」的凭证已失效，可导入新的凭证文件。`:'');
   // 名字框只在真的换了活动成员时回写：它同时是重命名的输入框, 不能被后台重绘冲掉。
