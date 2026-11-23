@@ -1435,6 +1435,77 @@ class LptiyuBridgeTests(unittest.TestCase):
         self.assertEqual(state['state'], 'term_quota')
         self.assertEqual(state['message'], '第一位成员本学期有效跑步 28 次')
 
+    def test_run_status_describes_the_active_member_after_a_sweep(self):
+        """轮跑把上一个人的结果留在 latest: 换回自己后两张卡片必须是同一次跑步。
+
+        实测(v1.9.35): 21:53 轮跑完「222025321102107」, latest 停在
+        「今日跑步已完成 · 2.51km」, 21:55 切回小王 —— 今日卡片写着别人的 2.51km,
+        而「最近成绩」读的是小王自己的 2.27km。
+        """
+        day = dt.date.today().isoformat()
+        first_id = self.store.active_member_id()
+        self.store.mark_signed(day, {'distance': '2.27km', 'pace': "6'19\"",
+                                     'zone': '西南大学-第一运动场跑区'})
+        self.controller._set_latest('signed', "今日跑步已完成 · 2.27km · 配速 6'19\"/km")
+        second = self.store.file_captured_credential({
+            'token': 'STRANGER-TOKEN', 'uid': 17980009, 'student_num': '2025009',
+            'school_id': '837', 'card_id': '2025009', 'source': 'capture'})
+        self.store.switch_member(second['id'])
+        self.store.mark_signed(day, {'distance': '2.51km', 'pace': "6'13\"",
+                                     'zone': '西南大学第四运动场跑区'})
+        self.controller._set_latest('signed', "今日跑步已完成 · 2.51km · 配速 6'13\"/km")
+        self.store.switch_member(first_id)
+
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertEqual(state['state'], 'signed')
+        self.assertEqual(state['last']['distance'], '2.27km')
+        self.assertIn('2.27km', state['message'])
+        self.assertNotIn('2.51', state['message'],
+                         '今日卡片不能挂着另一位成员的跑步距离')
+
+    def test_today_message_and_last_record_read_the_same_run(self):
+        """正文与「最近成绩」必须同源: 换谁算都只该有一个公里数。"""
+        day = dt.date.today().isoformat()
+        self.store.mark_signed(day, {'distance': '2.27km', 'pace': "6'19\"",
+                                     'zone': '西南大学-第一运动场跑区'})
+        # 内存里的收尾文案与落盘记录不一致时(例如老版本/别的成员留下的),
+        # 卡片只认今天这条记录。
+        self.controller._set_latest('signed', "今日跑步已完成 · 2.51km · 配速 6'13\"/km")
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertEqual(state['state'], 'signed')
+        self.assertEqual(state['message'], "今日跑步已完成 · 2.27km · 配速 6'19\"/km")
+        self.assertEqual(state['last']['distance'], '2.27km',
+                         '最近成绩与正文必须指向同一条跑步记录')
+
+    def test_a_foreign_run_is_not_reported_on_the_active_members_card(self):
+        first_id = self.store.active_member_id()
+        second = self.store.file_captured_credential({
+            'token': 'STRANGER-TOKEN', 'uid': 17980009, 'student_num': '2025009',
+            'school_id': '837', 'card_id': '2025009', 'source': 'capture'})
+        self.store.switch_member(second['id'])
+        self.store.mark_signed(dt.date.today().isoformat(), {'distance': '2.51km'})
+        self.controller._set_latest('signed', '今日跑步已完成 · 2.51km')
+        self.store.switch_member(first_id)
+
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertEqual(state['state'], 'idle', '自己今天还没跑, 不能显示「今日已完成」')
+        self.assertNotIn('2.51', state['message'], '别人的跑步结果不能挂在今天卡片上')
+        self.assertIsNone(state['last'], '最近成绩只看当前成员自己的记录')
+
+    def test_yesterdays_signed_status_is_not_shown_as_today(self):
+        yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+        self.store._m_write('status.json', {'state': 'signed',
+                                            'message': '今日跑步已完成 · 2.27km',
+                                            'detail': ''})
+        self.store._m_write('signed.json', {'date': yesterday, 'distance': '2.27km',
+                                            'pace': "6'19\"", 'zone': '第一运动场'})
+        self.controller.latest = None                 # 重启后内存态是空的
+
+        state = self.bridge.snapshot()['lptiyu']
+        self.assertEqual(state['state'], 'idle', '跨零点后「今日」不能继续用昨天的结论')
+        self.assertNotIn('今日跑步已完成', state['message'])
+        self.assertEqual(state['last']['date'], yesterday, '最近成绩照实写昨天的日期')
+
     def test_lptiyu_term_status_is_historical_when_limit_cleared(self):
         self.assertTrue(self._save_term_limit(28)['ok'])
         self.controller._set_latest('term_quota', '本学期有效跑步 28 次')

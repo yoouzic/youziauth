@@ -307,9 +307,23 @@ class LptiyuController:
         self._set_latest('idle', '尚未开始今天的跑步', record=False)
 
     # ------------------------------------------------------------- 状态
+    def _member_scope(self):
+        """这条状态属于哪个成员。
+
+        轮跑会临时把活动指针切到别人身上再切回来, 而 latest 是内存里的
+        「最后一次操作」—— 不贴成员标签, 界面换回自己之后就会把上一个人的
+        跑步结果当成自己的, 今日卡片的公里数和「最近成绩」对不上。
+        登记表读不动时退化成空串(界面按「不知道属于谁」处理), 不带崩状态。
+        """
+        try:
+            return str(self.store.active_member_id() or '')
+        except Exception:            # noqa: BLE001 —— 成员层坏了不拖垮状态行
+            return ''
+
     def _set_latest(self, state, message, detail='', record=True, progress=None, *,
                     term_run_limit=None):
         result = {'state': state, 'message': message, 'detail': detail,
+                  'member_id': self._member_scope(),
                   'at': self._clock().isoformat(timespec='seconds'),
                   'progress': progress if isinstance(progress, dict) else None}
         self.latest = result

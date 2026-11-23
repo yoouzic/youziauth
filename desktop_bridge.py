@@ -189,6 +189,20 @@ def _lptiyu_term_progress(member_id='', limit=None, **fields):
             'message': '', 'checked_at': '', **fields}
 
 
+def _lptiyu_done_message(signed):
+    """「今日跑步已完成」这行字的唯一出处: 距离与配速都跟 signed.json 走。
+
+    卡片正文和下面「最近成绩」必须读同一次跑步 —— 距离分两处各算一遍, 迟早
+    对不上(轮跑后 latest 还挂着上一个人的结果时就会)。
+    """
+    if signed.get('quota'):
+        return '今日额度已完成，无需再跑'
+    distance = str(signed.get('distance') or '')
+    pace = str(signed.get('pace') or '')
+    text = '今日跑步已完成' + (f' · {distance}' if distance else '')
+    return text + (f' · 配速 {pace}/km' if distance and pace else '')
+
+
 def _check_lptiyu_limit_member(payload, active_id):
     if 'term_run_limit' not in payload:
         return
@@ -443,7 +457,17 @@ class DesktopBridge(LocationProbe):
             daily = store.daily()
             latest = controller.latest or {}
             status = store.status()
+            members = self._lptiyu_members_snapshot(store)
             busy = bool(controller.busy)
+            # latest 只描述「最后一次操作的那个成员」: 轮跑或手动换号之后, 它可能
+            # 属于另一个账号。今日卡片只讲活动成员自己的事 —— 否则正文写着别人的
+            # 公里数, 下面「最近成绩」却是自己的, 两张卡片各说了一次跑步。
+            active_member = str(members.get('active') or '')
+            latest_member = str(latest.get('member_id') or '')
+            foreign_latest = bool(latest_member and active_member
+                                  and latest_member != active_member)
+            if foreign_latest:
+                latest = {}
             state = latest.get('state') or 'idle'
             message = latest.get('message') or ''
             # 跑步进行中的一拍进度(step/total/labels): 原样透传, 界面画分段进度条。
@@ -452,6 +476,9 @@ class DesktopBridge(LocationProbe):
             if not isinstance(progress, dict):
                 progress = None
             status_state = status.get('state')
+            if status_state in ('signed', 'quota') and not store.is_signed_today():
+                # 昨天落盘的结果不能冒充今天: 「今日」两个字只能由今天的记录支撑。
+                status_state = None
             term_states = ('term_quota', 'term_count_unavailable')
             if not busy and (state in term_states or status_state in term_states):
                 # 轮跑收尾后的 latest 可能属于其他成员，学期结果跟当前成员走。
@@ -465,12 +492,19 @@ class DesktopBridge(LocationProbe):
             elif state == 'idle' and status_state:
                 state = status_state
                 message = status.get('message') or message
-            if (state in ('idle', 'running') and not (busy and progress is not None)
-                    and store.is_signed_today()):
-                signed = store.signed_record()
-                state = 'signed'
-                message = '今日跑步已完成' + (
-                    f" · {signed.get('distance')}" if signed.get('distance') else '')
+            signed = store.signed_record()
+            signed_today = store.is_signed_today()
+            if not (busy and progress is not None):
+                if signed_today and (state in ('idle', 'running', 'signed')
+                                     or foreign_latest):
+                    # 「今日跑步已完成」的距离/配速只由今天的 signed.json 说话:
+                    # 正文与「最近成绩」读同一次跑步, 两处不可能各算各的。
+                    state = 'signed'
+                    message = _lptiyu_done_message(signed)
+                elif state in ('signed', 'quota') and not signed_today:
+                    # 跨零点还挂着昨天的结果: 今天还没跑, 不能替昨天说「今日已完成」。
+                    state = 'idle'
+                    message = empty['message']
             synced = store.sync_record().get('at') or ''
             age = None
             if store.has_token() and synced:
@@ -479,7 +513,6 @@ class DesktopBridge(LocationProbe):
                     age = round((dt.datetime.now() - synced_at).total_seconds() / 3600.0, 1)
                 except ValueError:
                     age = None
-            signed = store.signed_record()
             last = None
             if signed.get('date'):
                 last = {'date': signed.get('date'), 'distance': signed.get('distance', ''),
@@ -501,7 +534,6 @@ class DesktopBridge(LocationProbe):
             zones.sort(key=lambda zone: (not zone['default'], zone['name'] or zone['id']))
             selected = str(settings.zone_id or '')
             default_name = next((z['name'] for z in zones if z['default']), '')
-            members = self._lptiyu_members_snapshot(store)
             settings_data = dataclasses.asdict(settings)
             settings_data['term_run_limit'] = _active_lptiyu_member(members).get('term_run_limit')
             member_id = members['active']

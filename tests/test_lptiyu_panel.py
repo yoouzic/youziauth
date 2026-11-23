@@ -119,6 +119,19 @@ class ExecuteTests(PanelTestCase):
         self.assertTrue(controller.store.has_token(), '提交成功后凭证必须保留给下一次')
         self.assertEqual(controller.store.daily().get('run'), 1)
 
+    def test_latest_carries_the_member_it_describes(self):
+        """状态行要能说清「这条消息属于谁」: 轮跑临时切号, 换回来不能张冠李戴。"""
+        controller = self.make_controller()
+        first = self.store.active_member_id()
+        self.assertEqual(controller.latest['member_id'], first)
+        second = self.store.file_captured_credential({
+            'token': 'TOKEN-2', 'uid': 17980002, 'student_num': '2025002',
+            'school_id': '837', 'card_id': '2025002', 'source': 'capture'})
+        self.store.switch_member(second['id'])
+        controller._set_latest('signed', '第二位成员今日跑步已完成')
+        self.assertEqual(controller.latest['member_id'], second['id'])
+        self.assertEqual(controller.store.active_member_id(), second['id'])
+
     def test_run_reports_stage_progress_and_clears_it_at_the_end(self):
         controller = self.make_controller(code=0)
         seen = []
